@@ -1,0 +1,40 @@
+<!-- managed-by: harness-lite v1 -->
+# {{PROJECT_NAME}} 全局进度与决策记录
+
+## 记录协议
+
+- 本文件是跨迭代的追加式审计档案。当前状态与读取路由先看 [`README.md`](README.md)，再用事件 ID、迭代 ID 或日期定向读取本文件。
+- 历史事件只追加；需要纠错时追加新事件，不把旧记录改成仿佛当时已经知道。
+- 只记录有助恢复协作上下文的结论、公开依据、执行、验证和下一步；不记录隐藏推理、逐字聊天、token、密钥或工具噪声。
+- 会话 ID 使用 `S-YYYYMMDD-NN`；事件类型使用 `OPEN`、`DECISION`、`CHECKPOINT`、`MERGE`、`CLOSE`。
+
+## 当前迭代索引
+
+| 迭代 | PRD 状态 | SPEC 状态 | 下一步 |
+|---|---|---|---|
+<!-- project-harness:progress-index:start -->
+<!-- project-harness:progress-index:end -->
+
+## 事件
+
+## {{SESSION_ID}} / OPEN / {{TIMESTAMP}}
+
+- 关联：Harness bootstrap
+- 会话背景：目标项目尚未建立本 Harness。
+- 用户目标：初始化轻量、可追溯的项目治理结构。
+- 决策与依据：创建全局路由、原则、追加式日志与迭代目录；不虚构产品迭代或项目原则。目标无 Git 时允许初始化并创建一次 bootstrap baseline commit；已有 Git 时初始化不提交。
+- 执行与变更：初始化 `AGENTS.md` managed block 与 `harness/` 基础结构。
+- 验证证据：由初始化后的结构校验记录。
+- 关联偏差：无。
+- 未决问题与下一步：确认项目原则；出现明确产品目标时创建首轮迭代。
+
+## {{SESSION_ID}} / CLOSE / {{TIMESTAMP}}
+
+- 关联：Harness bootstrap
+- 会话背景：完成基础结构初始化。
+- 用户目标：同 OPEN。
+- 决策与依据：未创建虚假的产品迭代；Git 仅使用适用的 bootstrap 例外，产品迭代只在用户明确验收后创建一个最终提交。
+- 执行与变更：完成基础文档与控制入口。
+- 验证证据：运行 `project_harness.py validate`。
+- 关联偏差：无。
+- 未决问题与下一步：定义原则或创建首轮 PRD/SPEC 四件套。

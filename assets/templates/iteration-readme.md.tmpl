@@ -1,0 +1,42 @@
+<!-- managed-by: harness-lite v1 -->
+# 迭代 {{NUMBER}}：{{TITLE}}
+
+> 本页是 L1 派生摘要，只用于路由与状态恢复；PRD、SPEC、deviation 和 progress 事件才承载相应事实。
+
+## 状态卡
+
+- 迭代：`{{NUMBER}}`
+- PRD 状态：`草案`
+- SPEC 状态：`受 PRD 阻塞`
+- 开放偏差：`0`
+- 摘要更新时间：`{{DATE}}`
+
+## 本轮目标
+
+围绕“{{TITLE}}”明确产品问题、范围、验收与实施基线。
+
+## 当前结果
+
+已创建治理四件套；产品需求仍待完整起草与批准，尚未授权实施。
+
+## 最近进展
+
+| 日期 | 事件 | 摘要 |
+|---|---|---|
+| {{DATE}} | `{{SESSION_ID}} / OPEN` | 创建迭代 {{NUMBER}} 四件套，进入 PRD 起草 |
+
+## 开放事项与下一步
+
+- 开放偏差：无。
+- 下一步：完成并批准 [`prd-{{NUMBER}}.md`](prd-{{NUMBER}}.md)。
+
+## 文档地图与按需阅读
+
+| 任务 | 必读文档 |
+|---|---|
+| 目标、范围、验收 | [`prd-{{NUMBER}}.md`](prd-{{NUMBER}}.md) |
+| 架构、实现、测试、迁移 | PRD + [`spec-{{NUMBER}}.md`](spec-{{NUMBER}}.md) |
+| 风险、批准或实现前已知变化 | PRD + SPEC；变化先修订并重新批准基线 |
+| 实现后的事实偏差或验收阻塞 | [`deviation-{{NUMBER}}.md`](deviation-{{NUMBER}}.md) + 被引用条款 |
+| 长期取舍 | [`../../principle.md`](../../principle.md) + PRD |
+| 决策证据 | 在 [`../../progress.md`](../../progress.md) 中搜索 `{{SESSION_ID}}` 或 `{{NUMBER}}` |

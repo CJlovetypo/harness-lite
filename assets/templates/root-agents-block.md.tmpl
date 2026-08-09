@@ -1,0 +1,41 @@
+<!-- project-harness:start v1 -->
+## Harness Lite governance
+
+Treat `harness/` as the only editable source of project-governance truth.
+
+Before authorized project writes:
+
+1. Read `harness/README.md` (L0) and select the relevant iteration.
+2. Read that iteration's `README.md` (L1). For writable product/governance work, also read `harness/principle.md`.
+3. Read by intent: scope/acceptance -> PRD; design/implementation/test/migration or a known change -> PRD + SPEC; a completed as-built difference -> deviation + cited clauses; decision history -> targeted events in `harness/progress.md`.
+4. Classify the request as a new iteration, continuation of an approved iteration, or read-only work. Read-only work does not create governance logs.
+5. Preserve user changes and check the existing diff before editing when Git is present.
+
+Authority and divergence:
+
+- Baseline authority is approved principles > approved PRD > approved SPEC.
+- A deviation records a factual difference between completed as-built work and the approved PRD/SPEC. It is never a baseline, approval source, or implementation authorization.
+- `harness/progress.md` is historical evidence. Root and iteration READMEs are derived routing, not approval sources.
+- Revise and reapprove the affected PRD/SPEC when a change is known before implementation. After implementation, record every material difference and obtain an explicit disposition before acceptance.
+
+Iteration rules:
+
+- Store each iteration at `harness/iterations/NNN/` with exactly `README.md`, `prd-NNN.md`, `spec-NNN.md`, and `deviation-NNN.md`.
+- Use a monotonic ID padded to at least three digits. Repair incomplete existing bundles before allocating `max + 1`; never reuse gaps or retired IDs.
+- Create a new iteration only for a new goal, scope, user-visible behavior, public contract, workflow, or acceptance target. A new chat alone is not a new iteration.
+- Keep implementation details out of PRD. Do not let SPEC add product scope absent from PRD.
+- Do not implement before the required approval. A current instruction supplies that approval only when it explicitly approves the current PRD/SPEC baseline.
+
+Evidence and synchronization:
+
+- Use progress events `OPEN`, `DECISION`, `CHECKPOINT`, `MERGE`, and `CLOSE` with IDs `S-YYYYMMDD-NN`; append corrections rather than rewriting historical events.
+- Record completed as-built differences as `DEV-NNN-SSS` in the owning iteration. Preserve resolved/closed entries and link cross-iteration transfers instead of copying them.
+- Update L1 when status, decisions, evidence, deviations, results, or next steps change. Update L0 only when global routing, focus, registry, or open-deviation facts change.
+- Only the coordinating agent allocates IDs or updates shared progress, deviation, and routing files; subagents report results to it.
+
+Completion and Git boundary:
+
+- Move work to `待验收` only when every acceptance ID has evidence, every material as-built difference is recorded and explicitly disposed, progress is closed, and summaries are current. Unresolved differences keep the iteration blocked. Only explicit user acceptance sets `已验收`.
+- Do not initialize nested Git or edit `.gitignore`. If the target has no Git repository, Harness bootstrap may initialize Git and create exactly one initial baseline commit only from the exact `BASELINE_PLAN_TOKEN` returned by a reviewed dry run; if Git already exists, initialization makes no commit.
+- Keep Git `HEAD` on the independently anchored PRD branch/baseline throughout the iteration. Work serially: finalize the current iteration before allocating another. Give each iteration exactly one final commit, and only after explicit user acceptance of the completed result; implementation approval is not acceptance, and any intermediate commit blocks automated finalization. Explicitly scope every dirty shared control file, run required checks before the deterministic no-hook finalizer, and preserve its base/final refs under `refs/project-harness/iterations/NNN/`. Do not push, create a PR, rewrite history, or perform destructive Git operations without separate authorization.
+<!-- project-harness:end -->

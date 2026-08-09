@@ -1,0 +1,4 @@
+interface:
+  display_name: "Harness Lite"
+  short_description: "Lightweight PRD/SPEC project governance"
+  default_prompt: "Use $harness-lite to initialize a lightweight PRD/SPEC governance harness in the current project."
