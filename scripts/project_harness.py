@@ -73,10 +73,10 @@ PRD_TEMPLATE_PLACEHOLDERS = (
     "给出可观察、可验证、能映射到需求的完成条件。",
     "明确本轮不解决的相邻问题，防止范围静默扩大。",
     "记录产品、安全、兼容、时间、成本或合规约束；不要写代码步骤。",
-    "列出会改变范围、验收或重要取舍且仍需用户决定的问题。",
+    "列出会改变范围、验收、约束或重要取舍且仍需用户决定的问题；先 grill 用户并解决，或由用户明确移出本轮范围并记录影响与下一道门禁，再把 PRD 提交批准。",
 )
 SPEC_TEMPLATE_PLACEHOLDERS = (
-    "在 PRD 获批后，定义组件职责、边界与关键取舍。不得在 SPEC 中新增 PRD 未授权的产品范围。",
+    "需求较小且明确时，可在 PRD 同轮起草本节并把 SPEC 状态改为 `草案`；需求明确但不小时，等待 PRD 获批后再起草；存在决策性歧义时保持 `受 PRD 阻塞`，先 grill 用户完善 PRD。不得在 SPEC 中新增 PRD 未授权的产品范围，未获批准的联合草案不授权实施。",
     "列出会创建或修改的责任路径、公共接口、输入输出、Schema 与不变量。",
     "把实施拆成可验证切片或工作包；每个切片说明依赖、输出与停止条件。",
     "说明向后兼容、数据迁移、部署顺序和用户资产保护。",
@@ -1083,13 +1083,39 @@ def explicit_user_acceptance_evidence(value: str | None) -> bool:
     return bool(actor and acceptance)
 
 
+def explicit_user_baseline_approval(value: str | None, identity: str) -> bool:
+    if not meaningful_value(value):
+        return False
+    normalized = value.strip().casefold()  # type: ignore[union-attr]
+    if re.search(
+        r"(?:尚未|未曾|未明确|未(?:予|同意|批准|确认)|没有|拒绝|不(?:予|同意|批准|确认)|"
+        r"待(?:用户|批准|确认)|等待|可能|也许|拟|计划|默认|推断|假定)",
+        normalized,
+    ):
+        return False
+    if re.search(
+        r"\b(?:not|never|without|rejected|declined|pending|awaiting|maybe|may|might|possibly|"
+        r"planned|assumed|inferred)\b|\bnot yet\b|\bno explicit\b",
+        normalized,
+    ):
+        return False
+    actor = "用户" in normalized or re.search(r"\buser\b", normalized)
+    approval = re.search(
+        r"批准|同意.{0,8}(?:基线|规格|prd|spec)|确认.{0,8}(?:批准|基线|规格)|"
+        r"\bapprov(?:e|ed|al)\b|\bconfirm(?:ed|s)?\b.{0,16}\b(?:baseline|specification)\b",
+        normalized,
+    )
+    return bool(actor and approval and identity.casefold() in normalized)
+
+
 def explicit_user_implementation_authorization(value: str | None) -> bool:
     if not meaningful_value(value):
         return False
     normalized = value.strip().casefold()  # type: ignore[union-attr]
     if re.search(
-        r"(?:尚未|未曾|未明确|没有|拒绝|不(?:予|同意|授权|批准|实施)|"
-        r"待(?:用户|批准|授权|确认)|等待|可能|也许|拟|计划|默认|推断|假定)",
+        r"(?:尚未|未曾|未明确|未(?:予|同意|授权|批准|允许|要求|指示|实施|实现|开发|执行)|"
+        r"没有|拒绝|不(?:予|同意|授权|批准|允许|要求|指示|实施|实现|开发|执行)|"
+        r"待(?:用户|批准|授权|确认|实施)|等待|可能|也许|拟|计划|默认|推断|假定)",
         normalized,
     ):
         return False
@@ -1101,7 +1127,11 @@ def explicit_user_implementation_authorization(value: str | None) -> bool:
         return False
     actor = "用户" in normalized or re.search(r"\buser\b", normalized)
     authorization = re.search(
-        r"授权|批准|同意|要求实现|允许实施|\bauthori[sz](?:e|ed|ation)\b|\bapprov(?:e|ed|al)\b|\bgo ahead\b",
+        r"(?:授权|允许|要求|指示|批准).{0,12}(?:开始|实施|实现|开发|执行)|"
+        r"(?:开始|实施|实现|开发|执行).{0,12}(?:获准|授权|允许|要求|批准)|"
+        r"\bauthori[sz](?:e|ed|ation)\b.{0,32}\b(?:begin|start|proceed|implement(?:ation)?|execute|develop(?:ment)?)\b|"
+        r"\b(?:begin|start|proceed|implement(?:ation)?|execute|develop(?:ment)?)\b.{0,32}\bauthori[sz](?:e|ed|ation)\b|"
+        r"\bgo ahead\b.{0,24}\b(?:implement(?:ation)?|execute|develop(?:ment)?)\b",
         normalized,
     )
     return bool(actor and authorization)
@@ -1479,7 +1509,7 @@ def collect_validation(root: Path) -> ValidationReport:
         ):
             report.add("error", "implementation-authorization", paths["spec"], f"SPEC {spec_status} lacks explicit implementation authorization")
         if prd_status in {"已批准", "实施中", "待验收", "已验收"}:
-            if not explicit_user_implementation_authorization(bullet_value(texts["prd"], "批准依据")):
+            if not explicit_user_baseline_approval(bullet_value(texts["prd"], "批准依据"), f"PRD-{number}"):
                 report.add(
                     "error",
                     "prd-approval-evidence",
@@ -1495,7 +1525,7 @@ def collect_validation(root: Path) -> ValidationReport:
                     paths["prd"],
                     "Approved/implemented PRD still contains bundled template placeholders",
                 )
-        if spec_status in {"实施中", "已完成"}:
+        if spec_status in {"待批准", "已批准", "实施中", "已完成"}:
             approved_baseline = bullet_value(texts["spec"], "当前批准基线")
             if not meaningful_value(approved_baseline) or f"PRD-{number}" not in (approved_baseline or ""):
                 report.add(
@@ -1504,6 +1534,15 @@ def collect_validation(root: Path) -> ValidationReport:
                     paths["spec"],
                     f"SPEC {spec_status} must identify the approved PRD-{number} baseline",
                 )
+        if spec_status in {"已批准", "实施中", "已完成"}:
+            if not explicit_user_baseline_approval(bullet_value(texts["spec"], "批准依据"), f"SPEC-{number}"):
+                report.add(
+                    "error",
+                    "spec-approval-evidence",
+                    paths["spec"],
+                    f"SPEC {spec_status} lacks explicit user approval of the implementation baseline",
+                )
+        if spec_status in {"实施中", "已完成"}:
             clean_spec = strip_html_comments(texts["spec"])
             remaining = [fragment for fragment in SPEC_TEMPLATE_PLACEHOLDERS if fragment in clean_spec]
             if "待定义" in clean_spec or remaining:
@@ -1595,8 +1634,9 @@ def collect_validation(root: Path) -> ValidationReport:
                 if not meaningful_timestamp(bullet_value(entry.body, "关闭或转交时间")):
                     report.add("error", "deviation-closure", paths["deviation"], f"{deviation_id} lacks an ISO closure or transfer date/time")
                 disposition_evidence = bullet_value(entry.body, "处置依据")
-                if status == "基线已重批" and not explicit_user_implementation_authorization(
-                    disposition_evidence
+                if status == "基线已重批" and not (
+                    explicit_user_baseline_approval(disposition_evidence, f"PRD-{number}")
+                    or explicit_user_baseline_approval(disposition_evidence, f"SPEC-{number}")
                 ):
                     report.add(
                         "error",
@@ -1769,7 +1809,7 @@ def build_new_iteration_operations(
     table_title = title.replace("|", "\\|")
     registry_row = (
         f"| [{number}](iterations/{number}/README.md) | {table_title} | 草案 | 受 PRD 阻塞 | 0 | "
-        f"已创建治理四件套 | 完成并批准 PRD | [进入](iterations/{number}/README.md) |"
+        f"已创建治理四件套 | 评估后选择 grill、联合起草或 PRD 先行 | [进入](iterations/{number}/README.md) |"
     )
     registry = add_row(
         section_body(root_readme.text, ITERATIONS_START, ITERATIONS_END),
@@ -1785,7 +1825,7 @@ def build_new_iteration_operations(
     )
     focus = (
         f"- 当前迭代：[{number}](iterations/{number}/README.md) — {title}。{root_readme.newline}"
-        f"- 下一步：完成并批准 PRD-{number}；在批准前不进入实现。"
+        f"- 下一步：先解决决策性歧义；小且明确可同轮起草 PRD-{number}/SPEC-{number}，明确但不小则 PRD 先行，有歧义才 grill 用户；在批准前不进入实现。"
     )
     updated_readme = replace_section(updated_readme, FOCUS_START, FOCUS_END, focus, root_readme.newline)
     append_operation(
@@ -1794,7 +1834,7 @@ def build_new_iteration_operations(
         encode_document(updated_readme, bom=root_readme.bom),
     )
 
-    progress_row = f"| [{number}](iterations/{number}/README.md) | 草案 | 受 PRD 阻塞 | 完成并批准 PRD |"
+    progress_row = f"| [{number}](iterations/{number}/README.md) | 草案 | 受 PRD 阻塞 | 评估后选择 grill、联合起草或 PRD 先行 |"
     progress_index = add_row(
         section_body(progress.text, PROGRESS_INDEX_START, PROGRESS_INDEX_END),
         progress_row,
@@ -1813,11 +1853,11 @@ def build_new_iteration_operations(
 - 关联：PRD-{number} / SPEC-{number}
 - 会话背景：出现新的产品目标“{title}”。
 - 用户目标：建立本轮产品范围、验收与实施基线。
-- 决策与依据：分配下一单调编号 {number}，一次性创建同号四件套；当前仅为草案，不自动授权实施。
+- 决策与依据：分配下一单调编号 {number}，一次性创建同号四件套；先按清晰度与规模选择 grill、联合起草或 PRD 先行路径，当前仅为草案，不自动授权实施。
 - 执行与变更：创建 `harness/iterations/{number}/` 并更新 L0 与全局索引。
 - 验证证据：运行 `project_harness.py validate`。
 - 关联偏差：无。
-- 未决问题与下一步：完成并批准 PRD-{number}。
+- 未决问题与下一步：先解决决策性歧义；小且明确可同轮起草 PRD-{number}/SPEC-{number}，明确但不小则 PRD 先行，有歧义才 grill 用户。
 """
     event = normalize_newlines(event.strip("\r\n"), progress.newline)
     separator = progress.newline if updated_progress.endswith(("\n", "\r")) else progress.newline * 2

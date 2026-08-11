@@ -1,0 +1,41 @@
+{
+  "skill_name": "harness-lite",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Use $harness-lite for a new iteration in an already managed CLI repository. Add a --no-color flag only to the report command. Default behavior must remain unchanged; with the flag, report output contains no ANSI escapes on Windows or Linux. There are no persistence, public API, schema, permission, security, privacy, migration, or cross-system changes, and rollback is removing the isolated flag path. Do not implement yet; prepare the governance documents for review.",
+      "expected_output": "The agent recognizes a small-and-clear change and prepares the PRD and SPEC drafts together without inferring approval or implementation authorization.",
+      "files": [],
+      "expectations": [
+        "Classifies the request as small and clear based on localized impact, low risk, and straightforward rollback rather than code size alone.",
+        "Prepares both the PRD and same-number SPEC in the same pass, with requirement and acceptance IDs traced between them.",
+        "Keeps the filled pre-approval SPEC at 草案 and leaves its approved baseline and implementation authorization empty.",
+        "Does not grill the user for already supplied decisions and does not imply that drafting authorizes implementation."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Use $harness-lite for a new iteration in an already managed customer-dashboard repository. Add an Export button to the dashboard and make it convenient for account teams. The repository shows the existing dashboard fields and role model, but product decisions about export format, included records, active-filter behavior, PII visibility, large-export handling, and failure behavior have not been made. Do not implement yet; prepare the iteration.",
+      "expected_output": "The agent inspects discoverable repository context, then grills the user on the unresolved product decisions before treating the PRD as ready and keeps the SPEC blocked.",
+      "files": [],
+      "expectations": [
+        "Uses the grill path because unresolved choices materially affect scope, acceptance, permissions, privacy, and failure behavior.",
+        "Does not ask the user for dashboard fields or roles that the repository can answer.",
+        "Asks a concise, context-specific set of decision questions covering format, record/filter scope, PII permissions, large exports, and failures instead of dumping a generic questionnaire.",
+        "Keeps the PRD not ready and the SPEC at 受 PRD 阻塞 until the choices are resolved or explicitly removed from this iteration as non-goals."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Use $harness-lite for a new iteration in an already managed platform repository. Replace the public REST v1 surface with v2 across the server, generated SDKs, documentation, and mobile clients. The complete endpoint/schema mapping is already in docs/api-v2-mapping.md. Product decisions are final: run v1 and v2 together for 90 days, emit deprecation headers on v1, preserve authentication and authorization semantics, migrate no stored user data, publish migration examples for every endpoint, monitor adoption and error parity, and roll back by routing clients to v1. Acceptance requires contract tests for every mapping, SDK compatibility tests, mobile end-to-end tests, and a verified rollback drill. Do not implement yet; prepare the governance documents.",
+      "expected_output": "The agent recognizes a clear but non-small, high-impact public-contract migration and follows the PRD-first standard path without unnecessary grilling or co-drafting the SPEC.",
+      "files": [],
+      "expectations": [
+        "Classifies the work as clear but non-small because it changes a public API and coordinates multiple systems, even though the requirements are decision-complete.",
+        "Completes and presents the PRD first while keeping the SPEC blocked until PRD approval.",
+        "Does not co-draft the SPEC and does not grill merely because the work is large.",
+        "Keeps PRD approval, SPEC approval, and implementation authorization as separate explicit gates."
+      ]
+    }
+  ]
+}

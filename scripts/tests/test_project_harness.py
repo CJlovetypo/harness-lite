@@ -128,7 +128,7 @@ class HarnessCliTests(unittest.TestCase):
                 1,
             )
             .replace(
-                "- 列出会改变范围、验收或重要取舍且仍需用户决定的问题。",
+                "- 列出会改变范围、验收、约束或重要取舍且仍需用户决定的问题；先 grill 用户并解决，或由用户明确移出本轮范围并记录影响与下一道门禁，再把 PRD 提交批准。",
                 "- 无开放问题。",
                 1,
             ),
@@ -142,9 +142,10 @@ class HarnessCliTests(unittest.TestCase):
                 f"- 当前批准基线：用户已批准的 PRD-{number}（R-{number}-01 / AC-{number}-01）。",
                 1,
             )
+            .replace("- 批准依据：尚无；当前仅建立规格草案。", f"- 批准依据：用户明确批准 SPEC-{number} 实施规格。", 1)
             .replace("- 实施授权：尚无。", "- 实施授权：用户明确批准当前 PRD/SPEC 并要求实现。", 1)
             .replace(
-                "在 PRD 获批后，定义组件职责、边界与关键取舍。不得在 SPEC 中新增 PRD 未授权的产品范围。",
+                "需求较小且明确时，可在 PRD 同轮起草本节并把 SPEC 状态改为 `草案`；需求明确但不小时，等待 PRD 获批后再起草；存在决策性歧义时保持 `受 PRD 阻塞`，先 grill 用户完善 PRD。不得在 SPEC 中新增 PRD 未授权的产品范围，未获批准的联合草案不授权实施。",
                 "实现限定在批准需求的责任边界内，不新增产品范围。",
                 1,
             )
@@ -198,7 +199,7 @@ class HarnessCliTests(unittest.TestCase):
         )
         progress.write_text(
             progress.read_text(encoding="utf-8").replace(
-                "| 草案 | 受 PRD 阻塞 | 完成并批准 PRD |",
+                "| 草案 | 受 PRD 阻塞 | 评估后选择 grill、联合起草或 PRD 先行 |",
                 "| 已验收 | 已完成 | 已完成并验收 |",
                 1,
             )
@@ -292,6 +293,11 @@ class HarnessCliTests(unittest.TestCase):
         self.assertTrue((self.root / "harness" / "iterations" / ".gitkeep").is_file())
         self.assertFalse((self.root / "harness" / "iterations" / "001").exists())
         self.assertIn("示例项目", (self.root / "harness" / "README.md").read_text(encoding="utf-8"))
+        agents = (self.root / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("grill the user", agents)
+        self.assertIn("Small-and-clear", agents)
+        self.assertIn("For clear but non-small work", agents)
+        self.assertIn("treat approval as implementation authorization", agents)
         self.assertTrue((self.root / ".git").is_dir())
         self.assertEqual("main", self.git("branch", "--show-current").stdout.strip())
         self.assertEqual("1", self.git("rev-list", "--count", "HEAD").stdout.strip())
@@ -867,9 +873,56 @@ class HarnessCliTests(unittest.TestCase):
         )
         root_readme = (self.root / "harness" / "README.md").read_text(encoding="utf-8")
         self.assertIn("[001](iterations/001/README.md)", root_readme)
+        self.assertIn("评估后选择 grill、联合起草或 PRD 先行", root_readme)
         progress = (self.root / "harness" / "progress.md").read_text(encoding="utf-8")
         self.assertRegex(progress, r"S-\d{8}-02 / OPEN")
+        self.assertIn("选择 grill、联合起草或 PRD 先行路径", progress)
+        l1 = (bundle / "README.md").read_text(encoding="utf-8")
+        self.assertIn("明确但不小则 PRD 先行，有歧义才 grill 用户", l1)
+        spec = (bundle / "spec-001.md").read_text(encoding="utf-8")
+        self.assertIn("需求明确但不小时，等待 PRD 获批后再起草", spec)
         self.assertIn("VALID:", stdout)
+
+    def test_validator_allows_preapproval_spec_draft_without_authorization(self) -> None:
+        self.assertEqual(0, self.init()[0])
+        self.assertEqual(
+            0,
+            self.run_cli("new-iteration", "--project-root", str(self.root), "--title", "Small clear change")[0],
+        )
+        bundle = self.root / "harness" / "iterations" / "001"
+        spec = bundle / "spec-001.md"
+        l1 = bundle / "README.md"
+        root_readme = self.root / "harness" / "README.md"
+        progress = self.root / "harness" / "progress.md"
+        spec.write_text(
+            spec.read_text(encoding="utf-8").replace("- 状态：`受 PRD 阻塞`", "- 状态：`草案`", 1),
+            encoding="utf-8",
+        )
+        l1.write_text(
+            l1.read_text(encoding="utf-8").replace("- SPEC 状态：`受 PRD 阻塞`", "- SPEC 状态：`草案`", 1),
+            encoding="utf-8",
+        )
+        root_readme.write_text(
+            root_readme.read_text(encoding="utf-8").replace("| 草案 | 受 PRD 阻塞 | 0 |", "| 草案 | 草案 | 0 |", 1),
+            encoding="utf-8",
+        )
+        progress.write_text(
+            progress.read_text(encoding="utf-8").replace(
+                "| 草案 | 受 PRD 阻塞 | 评估后选择 grill、联合起草或 PRD 先行 |",
+                "| 草案 | 草案 | PRD/SPEC 联合草案待评审 |",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        result, stdout, stderr = self.run_cli("validate", "--project-root", str(self.root))
+
+        self.assertEqual(0, result, stderr)
+        self.assertIn("VALID:", stdout)
+        spec_text = spec.read_text(encoding="utf-8")
+        self.assertIn("- 当前批准基线：尚无；等待 PRD-001 批准。", spec_text)
+        self.assertIn("- 批准依据：尚无；当前仅建立规格草案。", spec_text)
+        self.assertIn("- 实施授权：尚无。", spec_text)
 
     def test_new_iteration_rejects_detached_head(self) -> None:
         self.assertEqual(0, self.init()[0])
@@ -1020,6 +1073,57 @@ class HarnessCliTests(unittest.TestCase):
                 self.assertIn("acceptance-evidence", stdout)
         prd.write_text(accepted, encoding="utf-8")
 
+    def test_implementation_authorization_rejects_approval_only_evidence(self) -> None:
+        self.assertEqual(0, self.init()[0])
+        self.assertEqual(
+            0,
+            self.run_cli("new-iteration", "--project-root", str(self.root), "--title", "One")[0],
+        )
+        self.accept_iteration()
+        spec = self.root / "harness" / "iterations" / "001" / "spec-001.md"
+        completed = spec.read_text(encoding="utf-8")
+        approval_only_values = (
+            "用户明确批准 PRD-001/SPEC-001 当前基线。",
+            "用户同意当前 PRD-001/SPEC-001 草案。",
+            "用户未授权实施 PRD-001/SPEC-001。",
+            "用户不允许实施 PRD-001/SPEC-001。",
+            "User approved PRD-001 and SPEC-001.",
+        )
+        for evidence in approval_only_values:
+            with self.subTest(evidence=evidence):
+                spec.write_text(
+                    completed.replace("用户明确批准当前 PRD/SPEC 并要求实现。", evidence, 1),
+                    encoding="utf-8",
+                )
+                result, stdout, _ = self.run_cli("validate", "--project-root", str(self.root))
+                self.assertEqual(1, result)
+                self.assertIn("implementation-authorization", stdout)
+        spec.write_text(completed, encoding="utf-8")
+
+    def test_approved_spec_requires_its_own_targeted_approval_evidence(self) -> None:
+        self.assertEqual(0, self.init()[0])
+        self.assertEqual(
+            0,
+            self.run_cli("new-iteration", "--project-root", str(self.root), "--title", "One")[0],
+        )
+        self.accept_iteration()
+        spec = self.root / "harness" / "iterations" / "001" / "spec-001.md"
+        completed = spec.read_text(encoding="utf-8")
+        for evidence in (
+            "尚无；当前仅建立规格草案。",
+            "用户未批准 SPEC-001 实施规格。",
+            "用户明确批准 PRD-001 产品基线。",
+        ):
+            with self.subTest(evidence=evidence):
+                spec.write_text(
+                    completed.replace("用户明确批准 SPEC-001 实施规格。", evidence, 1),
+                    encoding="utf-8",
+                )
+                result, stdout, _ = self.run_cli("validate", "--project-root", str(self.root))
+                self.assertEqual(1, result)
+                self.assertIn("spec-approval-evidence", stdout)
+        spec.write_text(completed, encoding="utf-8")
+
     def test_completed_iteration_rejects_template_placeholders_and_missing_baseline_approval(self) -> None:
         self.assertEqual(0, self.init()[0])
         self.assertEqual(
@@ -1050,6 +1154,33 @@ class HarnessCliTests(unittest.TestCase):
         self.assertIn("prd-approval-evidence", stdout)
         self.assertIn("prd-template-placeholder", stdout)
         self.assertIn("spec-approved-baseline", stdout)
+
+    def test_updated_drafting_prompts_remain_validator_placeholders(self) -> None:
+        self.assertEqual(0, self.init()[0])
+        self.assertEqual(
+            0,
+            self.run_cli("new-iteration", "--project-root", str(self.root), "--title", "One")[0],
+        )
+        self.accept_iteration()
+        bundle = self.root / "harness" / "iterations" / "001"
+        prd = bundle / "prd-001.md"
+        spec = bundle / "spec-001.md"
+        prd.write_text(
+            prd.read_text(encoding="utf-8")
+            + "\n列出会改变范围、验收、约束或重要取舍且仍需用户决定的问题；先 grill 用户并解决，或由用户明确移出本轮范围并记录影响与下一道门禁，再把 PRD 提交批准。\n",
+            encoding="utf-8",
+        )
+        spec.write_text(
+            spec.read_text(encoding="utf-8")
+            + "\n需求较小且明确时，可在 PRD 同轮起草本节并把 SPEC 状态改为 `草案`；需求明确但不小时，等待 PRD 获批后再起草；存在决策性歧义时保持 `受 PRD 阻塞`，先 grill 用户完善 PRD。不得在 SPEC 中新增 PRD 未授权的产品范围，未获批准的联合草案不授权实施。\n",
+            encoding="utf-8",
+        )
+
+        result, stdout, _ = self.run_cli("validate", "--project-root", str(self.root))
+
+        self.assertEqual(1, result)
+        self.assertIn("prd-template-placeholder", stdout)
+        self.assertIn("spec-template-placeholder", stdout)
 
     def test_close_event_requires_exact_association_and_completed_verification(self) -> None:
         self.assertEqual(0, self.init()[0])

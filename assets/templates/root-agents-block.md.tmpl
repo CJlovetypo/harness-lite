@@ -18,13 +18,20 @@ Authority and divergence:
 - `harness/progress.md` is historical evidence. Root and iteration READMEs are derived routing, not approval sources.
 - Revise and reapprove the affected PRD/SPEC when a change is known before implementation. After implementation, record every material difference and obtain an explicit disposition before acceptance.
 
+Requirement discovery gate:
+
+- Inspect available project context before asking the user. Resolve clarity first, then assess size by product blast radius and risk rather than lines of code.
+- If a decision-bearing ambiguity remains, grill the user before treating the PRD as ready. Ask pointed, context-specific questions and challenge assumptions about the problem/users, scope/non-goals, acceptance/failure cases, constraints, compatibility/data/security/migration concerns, and meaningful trade-offs. Do not ask what the repository can answer. Resolve each ambiguity or have the user explicitly remove it from this iteration as a non-goal with its impact and next gate recorded; anything still affecting in-scope acceptance remains blocking, and the SPEC stays `受 PRD 阻塞`.
+- Small-and-clear additionally requires localized impact, low risk, straightforward rollback, and no material cross-system coordination. Public API/schema changes, data migration, permissions, security/privacy/compliance, irreversible behavior, and substantial compatibility impact are normally not small. Only this class is eligible for co-drafting; prefer completing and presenting both drafts together unless staged review has a concrete benefit. A filled pre-approval SPEC is `草案`, has no approved baseline, SPEC approval evidence, or implementation authorization, and traces the proposed PRD IDs.
+- For clear but non-small work, use the standard PRD-first path without grilling merely because it is large. Co-drafting changes timing, not authority: do not turn guesses into requirements, put implementation details in the PRD, infer approval, or treat approval as implementation authorization.
+
 Iteration rules:
 
 - Store each iteration at `harness/iterations/NNN/` with exactly `README.md`, `prd-NNN.md`, `spec-NNN.md`, and `deviation-NNN.md`.
 - Use a monotonic ID padded to at least three digits. Repair incomplete existing bundles before allocating `max + 1`; never reuse gaps or retired IDs.
 - Create a new iteration only for a new goal, scope, user-visible behavior, public contract, workflow, or acceptance target. A new chat alone is not a new iteration.
 - Keep implementation details out of PRD. Do not let SPEC add product scope absent from PRD.
-- Do not implement before the required approval. A current instruction supplies that approval only when it explicitly approves the current PRD/SPEC baseline.
+- Do not implement before explicit PRD approval, explicit SPEC approval, and separate implementation authorization. A single user response may supply all three, but generic approval of the drafts does not authorize implementation.
 
 Evidence and synchronization:
 

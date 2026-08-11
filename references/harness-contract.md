@@ -94,6 +94,14 @@ Record the current full Git `HEAD` and attached `refs/heads/...` branch in the P
 
 Create a new iteration for a new product goal, scope, user-visible behavior, public contract, workflow, or acceptance target. Continue the current iteration for approved implementation, a defect within approved scope, verification, or documentation repair. A new chat alone creates neither a session record nor an iteration unless work is authorized.
 
+Before making a PRD ready for approval, inspect the relevant project context, resolve clarity first, and then choose one drafting path:
+
+1. **Grill path**: use whenever a decision-bearing ambiguity remains, regardless of apparent size. Inspect the repository first, then ask pointed, context-specific questions and challenge assumptions that affect the problem/users, scope/non-goals, acceptance/failure cases, constraints, compatibility/data/security/migration concerns, or meaningful trade-offs. Do not ask questions that local evidence can answer. Do not treat the PRD as ready until every material ambiguity is resolved or the user explicitly removes it from the iteration as a non-goal with its impact and next gate recorded. Anything still affecting in-scope acceptance remains blocking; keep the SPEC `受 PRD 阻塞` until then.
+2. **Small-and-clear fast path**: use only after clarity is established and the change has localized product impact, low risk, straightforward rollback, no material cross-system coordination, and no unresolved product or architecture choice. Judge size by impact rather than code volume. Public API/schema changes, data migration, permissions, security/privacy/compliance, irreversible behavior, and substantial compatibility impact are normally not small. The PRD and SPEC may be completed as drafts in the same pass and presented together. Mark the filled pre-approval SPEC `草案`, trace the proposed PRD IDs, and leave its approved baseline, SPEC approval evidence, and implementation authorization empty.
+3. **Clear-but-not-small standard path**: when the product baseline is decision-complete but the change is not small, complete and approve the PRD before completing and approving the SPEC. Size alone is not a reason to grill the user.
+
+Co-drafting changes timing, not authority. A draft SPEC based on a draft PRD is a review aid, not an approved baseline or implementation authorization. PRD authority still precedes SPEC authority, implementation details remain outside the PRD, and explicit approval is still required for the identified baselines. Implementation authorization is a separate explicit decision; it may accompany approval but is never inferred from it.
+
 Use these PRD statuses:
 
 `草案`, `待批准`, `已批准`, `实施中`, `待验收`, `已验收`, `已取代`, `已取消`.
@@ -101,6 +109,8 @@ Use these PRD statuses:
 Use these SPEC statuses:
 
 `受 PRD 阻塞`, `草案`, `待批准`, `已批准`, `实施中`, `已完成`, `已取代`, `已取消`.
+
+Use `受 PRD 阻塞` while material product ambiguity prevents a decision-complete PRD. Use `草案` when a small-and-clear request has a filled SPEC co-drafted against the proposed same-number PRD but no approved PRD baseline yet.
 
 Use these deviation statuses:
 
@@ -122,7 +132,7 @@ Describe what and why. Exclude functions, classes, algorithms, shell commands, d
 
 ### spec-NNN.md
 
-Reference the same-number PRD and its approved baseline. Include architecture/responsibility boundaries, requirement traceability, file/interface/data contracts, execution plan, compatibility/migration, rollback, risks, and verification.
+Always reference the same-number PRD. A co-drafted pre-approval SPEC in `草案` may trace proposed PRD IDs while its approved-baseline field remains empty. Before the SPEC moves to `待批准` or any later active state, identify the approved PRD baseline; before it moves to `已批准` or later, record explicit user approval of the SPEC itself. Include architecture/responsibility boundaries, requirement traceability, file/interface/data contracts, execution plan, compatibility/migration, rollback, risks, and verification.
 
 Do not introduce product scope or acceptance requirements that the PRD did not authorize. Return new product needs to the PRD approval gate.
 

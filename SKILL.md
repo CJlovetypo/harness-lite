@@ -29,7 +29,7 @@ Read [references/harness-contract.md](references/harness-contract.md) before cha
 ## Classify the project before applying
 
 - **Fresh**: no `harness/` exists. Initialize normally.
-- **Managed**: `harness/README.md` contains a recognized Harness Lite ownership marker. Re-run initialization only to add missing managed files; never overwrite non-empty files. Continue to recognize the legacy marker in projects initialized before the Skill rename.
+- **Managed**: `harness/README.md` contains a recognized Harness Lite ownership marker. Re-run initialization only to add missing managed files; never overwrite non-empty files. Continue to recognize the legacy marker in projects initialized before the Skill rename. Existing managed `AGENTS.md` blocks are not silently upgraded: the current Skill rules govern the active invocation, and a user-requested durable block upgrade must preview and replace only the bounded managed block while preserving all surrounding content.
 - **Partial or foreign**: `harness/` contains content without the ownership marker, managed markers are malformed, or legacy governance files may conflict. Stop before writing. Follow the adoption reference and request a choice only when source-of-truth ownership or file movement is genuinely ambiguous.
 - **Already valid**: run validation and report the result. Do not manufacture changes.
 
@@ -81,15 +81,26 @@ If the invoking request contains a concrete new product change, initialize the b
 
 After reviewing the plan, apply without `--dry-run`. The command requires an attached Git branch with an existing baseline commit, records both the baseline commit and branch in the PRD, and independently anchors them at `refs/project-harness/iterations/NNN/base/refs/heads/...`. It allocates the next monotonic ID, creates all four files together, verifies that none is ignored, updates the L0/index routing, and appends an OPEN event. This version is serial: do not allocate another iteration until every existing iteration has a reachable final marker and governance is clean.
 
+## Choose the drafting path
+
+Before treating a PRD as ready for approval, inspect the relevant project context and classify the request by both size and clarity. Resolve clarity first: any material ambiguity takes precedence over apparent size.
+
+- Use the **grill path** whenever a decision-bearing ambiguity remains, regardless of apparent size. Inspect the repository and supplied context first, then challenge assumptions and ask pointed questions only where the answers could change the product baseline. Cover the problem and users, observable outcome, scope and non-goals, acceptance and failure/edge cases, constraints, compatibility/data/security/migration concerns, and meaningful trade-offs as relevant; do not dump a generic questionnaire or ask for facts that can be discovered locally. Continue until each material ambiguity is resolved or the user explicitly removes it from the iteration as a non-goal with its impact and next gate recorded. An issue that still affects in-scope acceptance remains blocking. Keep the SPEC `受 PRD 阻塞` while the PRD is not decision-complete.
+- Use the **small-and-clear fast path** only after clarity is established and the change has a localized product blast radius, low risk, straightforward rollback, no material cross-system coordination, and no unresolved choice that could change scope, acceptance, compatibility, risk, or an important product/architecture trade-off. Judge size by impact, not lines of code; public API or schema changes, user-data migration, permissions, security/privacy/compliance, irreversible behavior, and substantial compatibility impact are normally not small. This class of request may have its PRD and same-number SPEC completed in the same pass and presented together for review; prefer that efficient path unless the user requests staged review or a concrete dependency makes PRD-first review useful. Set a filled pre-approval SPEC to `草案`, trace it to the proposed PRD IDs, and keep its approved-baseline, SPEC-approval-evidence, and implementation-authorization fields explicitly empty until the corresponding decisions occur.
+- Use the **clear-but-not-small standard path** when the product baseline is decision-complete but the change does not qualify as small. Complete and obtain approval for the PRD first, then complete and obtain approval for the SPEC. Do not grill merely because the work is large when no user decision is missing.
+- Do not silently convert guesses into requirements or hide unresolved product decisions in the SPEC. “Detailed PRD design” means a thoroughly evaluated product baseline, not implementation detail in the PRD.
+- Co-drafting changes timing, not authority. The PRD remains authoritative before the SPEC, and neither draft authorizes implementation. An explicit user response may approve both identified drafts together. Implementation authorization is a separate explicit decision; it may appear in the same response but must not be inferred from approval.
+
 Then:
 
 1. Replace template prompts in the PRD with the actual background, goals, stable requirement IDs, acceptance IDs, non-goals, constraints, and open questions.
 2. Keep implementation details out of the PRD.
-3. Obtain the required product approval before implementation unless the user's current request already explicitly authorizes it.
-4. Complete the same-number SPEC with requirement traceability, architecture, contracts, execution, migration/rollback, risks, and verification.
-5. When a different requirement or implementation approach is known before it is built, revise and re-approve the affected PRD/SPEC; do not pre-authorize it through deviation.
-6. Only after the SPEC implementation is complete, reconcile the actual result against the exact approved PRD/SPEC baseline. Record every material factual difference in the same-number deviation ledger with discovery time, exact requirement/acceptance and SPEC references, cause, impact, acceptance impact, explicit disposition, verification, and closure evidence. A deviation is factual evidence, not an approval source or implementation authorization. Preserve the compared baseline and never rewrite it to erase that history.
-7. Append CHECKPOINT/DECISION/CLOSE evidence and keep L1/L0 reconciliation status and unresolved-actual-deviation counts synchronized when their routing facts change.
+3. Follow the selected drafting path: grill unresolved product decisions, co-draft the same-number SPEC only for a small-and-clear change, or keep the clear-but-not-small change PRD-first.
+4. Obtain explicit PRD approval, SPEC approval, and separate implementation authorization before implementation unless the user's current request already explicitly supplies all three for the identified baselines.
+5. Complete or revise the same-number SPEC with requirement traceability, architecture, contracts, execution, migration/rollback, risks, and verification.
+6. When a different requirement or implementation approach is known before it is built, revise and re-approve the affected PRD/SPEC; do not pre-authorize it through deviation.
+7. Only after the SPEC implementation is complete, reconcile the actual result against the exact approved PRD/SPEC baseline. Record every material factual difference in the same-number deviation ledger with discovery time, exact requirement/acceptance and SPEC references, cause, impact, acceptance impact, explicit disposition, verification, and closure evidence. A deviation is factual evidence, not an approval source or implementation authorization. Preserve the compared baseline and never rewrite it to erase that history.
+8. Append CHECKPOINT/DECISION/CLOSE evidence and keep L1/L0 reconciliation status and unresolved-actual-deviation counts synchronized when their routing facts change.
 
 Only the coordinating agent allocates iteration, session, or deviation IDs and updates shared routing/log files. Subagents return findings and implementation results without independently editing those shared governance files.
 
