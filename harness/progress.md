@@ -13,7 +13,7 @@
 | 迭代 | PRD 状态 | SPEC 状态 | 下一步 |
 |---|---|---|---|
 <!-- project-harness:progress-index:start -->
-| [001](iterations/001/README.md) | 实施中 | 实施中 | 确认首切片 checkpoint 后收束 validator/anchor compatibility |
+| [001](iterations/001/README.md) | 实施中 | 实施中 | 收束 validator/anchor compatibility 与并行编排切片 |
 <!-- project-harness:progress-index:end -->
 
 ## 事件
@@ -111,3 +111,15 @@
 - 验证证据：新增并发/恢复黑盒 18/18 通过（106.864 秒，反方复跑 112.2 秒）；legacy 回归 70/70 通过（367.668 秒）；本地与安装版 validator 均为 0 errors / 0 warnings；无落盘语法编译与 `git diff --check` 通过。marker-only 损坏 main、caller-only 实现差异、source-ref 漂移均有固定回归。
 - 关联偏差：无；当前是非 candidate 的实现 checkpoint，不改变已批准产品范围或验收标准。
 - 未决问题与下一步：提交前需用户确认 exact scope/message；下一切片统一 worktree/commit-tree validator 纯语义核心，补齐 v2/legacy anchor compatibility，并让 status 重算 governance object 一致性后再进入 Local/worktree 编排。
+
+## S-20260812-05 / DECISION / 2026-08-12T10:44:32+08:00
+
+- 关联：PRD-001 / SPEC-001 / Git checkpoint authorization
+- 会话背景：v2 identity/reservation 首切片已由用户确认并提交为本地 checkpoint `ca8223bbe9d214b8c05d294b70d852e3dc57ddec`，后续仍有多个可独立验证的实现切片。
+- 用户目标：继续实施；checkpoint 由 Harness 自行提交，用户只校核最终完成产物。
+- 决策与依据：协调器获得本轮后续非最终 WIP checkpoint 的 standing authorization。每次 checkpoint 仍必须先完成精确路径、staged tree、验证与排除项复核，提交后报告 hash、范围和 `pushed=false`；checkpoint 只提供恢复点，不成为 candidate/integrated/final 或验收权威。
+- 执行与变更：更新项目内 bounded AGENTS transition、L0/L1、SPEC 修订记录与 progress 控制面；并行启动 validator/anchor compatibility、Local/worktree orchestrator、principle/progress/README reconciler 三个隔离切片。
+- Git 透明：standing authorization 不包含 push、main integration、merge/rebase/cherry-pick、历史改写、破坏性 Git、candidate/final ref 或最终验收。任何新 worktree 仍须在执行前后明确通知。
+- 验证证据：上一 checkpoint `ca8223b` 为 7 条路径、4069 additions / 127 deletions；新增 18/18 与 legacy 70/70 通过，两套 validator 0 errors / 0 warnings；该 commit 未 push，旧 base anchor 未改变。
+- 关联偏差：无；仅调整本轮 checkpoint 交互门禁，不改变 PRD 产品范围、验收标准或全局 principle。
+- 未决问题与下一步：各隔离切片完成后统一集成测试并自主创建非最终 checkpoint；最终 candidate/integrated 证据包提交用户校核。

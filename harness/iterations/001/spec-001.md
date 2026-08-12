@@ -416,3 +416,4 @@ iteration 元数据增加 `depends_on`、`conflicts_with`、integration target�
 - 2026-08-12：将新 refs 修正到 `refs/project-harness/v2/...` 独立 namespace，避免与 legacy nested base ref 冲突；不改变产品范围或授权门禁。
 - 2026-08-12：完成首个 v2 实现切片：只读 `status` / `plan reserve-iteration`、显式 plan digest 接受、Git common-dir operation journal、allocation/base 原子 CAS、legacy/v2 状态识别与旧写入口阻断；该切片不创建 branch/worktree/governance bundle，不 commit、不 push。
 - 2026-08-12：独立实现基线与全局治理基线；任意 worktree 发起时，base 只能来自显式允许 ref，governance 固定读取并校验 committed `refs/heads/main` tree，同时把 governance commit/tree 与 principle 内容哈希绑定到 plan、journal、allocation metadata 和 status。提交树校验与 worktree 校验的共享纯语义核心将在下一切片收束，当前 checkpoint 不构成 candidate/final。
+- 2026-08-12：用户授权协调器在后续非最终 WIP 切片完成精确范围与验证复核后自主创建本地 checkpoint，并在完成后报告 hash、范围与 `pushed=false`；最终 candidate/integrated 产物仍由用户校核。该 standing authorization 不包含 push、main integration、历史改写、破坏性 Git、candidate/final 权威或最终验收。

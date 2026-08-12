@@ -17,7 +17,7 @@
 
 ## 当前结果
 
-已批准 14 项需求、16 项验收标准、P-001～P-003 全局原则和 SPEC 技术基线；6 个开放问题均已裁决。Checkpoint 1 `6cc0104` 与治理 checkpoint 2 `2d1be71` 均已本地创建且未 push。v2 identity/ref/journal/status 首切片已完成只读 plan/status、显式 digest 接受、原子 reservation、崩溃恢复、legacy 阻断和 committed-main 治理树校验，尚未形成 candidate/final。
+已批准 14 项需求、16 项验收标准、P-001～P-003 全局原则和 SPEC 技术基线；6 个开放问题均已裁决。Checkpoint 1 `6cc0104`、治理 checkpoint 2 `2d1be71` 与 v2 identity/reservation checkpoint `ca8223b` 均已本地创建且未 push。首切片已完成只读 plan/status、显式 digest 接受、原子 reservation、崩溃恢复、legacy 阻断和 committed-main 治理树校验，尚未形成 candidate/final。
 
 仓库在本轮创建前已有 11 个已跟踪修改文件和未跟踪 `evals/`。用户裁决这些三路起草分类改动先形成独立本地提交；提交完成后才开始 PRD-001 新实现。
 
@@ -30,13 +30,14 @@
 | 2026-08-12 | `S-20260812-01 / DECISION` | 批准原则与 PRD/SPEC，裁决开放问题并授权实施 |
 | 2026-08-12 | `S-20260812-02 / CHECKPOINT` | 前序 drafting-path 改动已提交；记录 lifecycle-v2 bootstrap 过渡 |
 | 2026-08-12 | `S-20260812-03 / CHECKPOINT` | 治理 checkpoint 已发布；开始 v2 identity/ref/journal/status 实现 |
-| 2026-08-12 | `S-20260812-04 / CHECKPOINT` | v2 identity/reservation 首切片验证通过；等待明确本地提交 |
+| 2026-08-12 | `S-20260812-04 / CHECKPOINT` | v2 identity/reservation 首切片已提交；后续 checkpoint 获 standing authorization |
+| 2026-08-12 | `S-20260812-05 / DECISION` | 非最终 WIP checkpoint 可在精确复核后自主提交并报告；最终产物仍由用户校核 |
 
 ## 开放事项与下一步
 
 - 开放偏差：无。
-- 明确确认并提交 v2 identity/ref/journal/status 首切片；提交不包含 pycache，且不 push。
-- 下一切片统一 worktree/commit-tree validator 语义核心，补齐 v2/legacy anchor compatibility 与 governance status 重算，再进入 Local/worktree 编排。
+- 下一切片统一 worktree/commit-tree validator 语义核心，补齐 v2/legacy anchor compatibility 与 governance status 重算。
+- 并行实现 Local/worktree orchestrator 与 principle/progress/README reconciler 的隔离模块；各切片验证后自主 checkpoint 并报告，均不 push。
 - 当前只有一个活跃 PRD，保持 Local；不创建 worktree，不 push。
 
 ## 文档地图与按需阅读
