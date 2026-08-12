@@ -11,8 +11,8 @@
 
 <!-- project-harness:focus:start -->
 - 当前迭代：[001](iterations/001/README.md) — 并行 PRD 编排与全局治理无感化。
-- 当前门禁：PRD-001 / SPEC-001 实施中；治理/candidate/upgrade/UX checkpoint `91c92a4` 已提交且未 push。validator/workspace/authority/v2 bundle/governance apply 已通过交叉回归，正在形成下一非最终 checkpoint。
-- 下一步：提交 validator/workspace 执行底座；完成真实 candidate ref、integration worktree/no-ff 与 main CAS train adapter。
+- 当前门禁：PRD-001 / SPEC-001 实施中；本地 WIP checkpoint `c515bfc` 已提交且未 push。candidate dependency/principle evidence、lifecycle 通知恢复与 public integrated evidence registry 已形成可恢复底座，但 registry 尚未接入 main advance/coordinator。
+- 下一步：接通 integrated evidence、integration/main progress 与统一 lifecycle facade，再运行完整多 PRD merge-train E2E。
 <!-- project-harness:focus:end -->
 
 ## 迭代索引
@@ -20,7 +20,7 @@
 | 迭代 | 标题 | PRD | SPEC | 开放偏差 | 一句话结果 | 下一步 | 入口 |
 |---|---|---|---|---:|---|---|---|
 <!-- project-harness:iterations:start -->
-| [001](iterations/001/README.md) | 并行 PRD 编排与全局治理无感化 | 实施中 | 实施中 | 0 | `91c92a4` 已提交；validator/workspace/authority/reconcile 执行底座已验证 | 提交执行底座，完成 merge train | [进入](iterations/001/README.md) |
+| [001](iterations/001/README.md) | 并行 PRD 编排与全局治理无感化 | 实施中 | 实施中 | 0 | `c515bfc` 已提交；候选、train 与 evidence registry 底座已验证 | 接通 evidence/progress/facade 并跑全链 E2E | [进入](iterations/001/README.md) |
 <!-- project-harness:iterations:end -->
 
 ## 渐进阅读路由

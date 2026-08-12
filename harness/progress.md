@@ -13,7 +13,7 @@
 | 迭代 | PRD 状态 | SPEC 状态 | 下一步 |
 |---|---|---|---|
 <!-- project-harness:progress-index:start -->
-| [001](iterations/001/README.md) | 实施中 | 实施中 | 收束 validator/anchor compatibility 与并行编排切片 |
+| [001](iterations/001/README.md) | 实施中 | 实施中 | 接通 integrated evidence、progress 与统一 lifecycle facade |
 <!-- project-harness:progress-index:end -->
 
 ## 事件
@@ -147,3 +147,18 @@
 - 验证证据：workspace 13/13（164.517 秒）；validator views 4/4、parallel 18/18、reconcile apply 8/8、coordinator 6/6、v2 bundle 4/4 的交叉回归共 40/40（187.633 秒）；validator-core 另有 legacy 70/70（406 秒）与当前项目 0 errors / 0 warnings；所有目标 diff-check 通过。
 - 关联偏差：无；本切片落实 AC-001-01～AC-001-12、AC-001-15～AC-001-16 的底层门禁，不改变批准范围。真实 candidate ref/merge train/main CAS 尚在下一独立切片，不能把本 checkpoint 声称为 AC-001-13 完成。
 - 未决问题与下一步：完成并验证 `harness_train.py` 的 candidate/ref、integration worktree、默认 no-ff、显式 commit/main advance；随后接入主 CLI，补 upgrade apply、Skill/contract/templates/README/evals 与端到端验收。
+
+## EV-I001-implementation-2c50898f8f61091c6d5e0b59d20e43c9a96fb5918bcab723981638562d7ae960 / CHECKPOINT / 2026-08-12T18:12:18+08:00
+
+- schema_version: `harness-lite.progress-event/v2`
+- session_id: `S-20260812-08`
+- iteration: `001`
+- scope: `implementation`
+- operation_id: `OP-c515bfcd415ba835b3a10d35047fe213`
+- event_key: `checkpoint:c515bfc`
+- source_ref: `refs/heads/main`
+- source_commit: `c515bfcd415ba835b3a10d35047fe21354a92dda`
+- causal_parent: `S-20260812-07/CHECKPOINT`
+- evidence_refs: ["git:commit:c515bfcd415ba835b3a10d35047fe21354a92dda","validator:project-harness:0-errors","test:candidate-dependency-generation","test:lifecycle-notification-recovery","test:integrated-evidence-registry"]
+- corrects: `none`
+- summary: "Created a local non-authoritative WIP checkpoint for lifecycle, progress, principle audit, candidate/train, integrated evidence, upgrade, UX, and workspace code; no worktree or v2 ref was created and nothing was pushed."

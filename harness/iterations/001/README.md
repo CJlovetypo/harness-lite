@@ -17,7 +17,7 @@
 
 ## 当前结果
 
-已批准 14 项需求、16 项验收标准、P-001～P-003 全局原则和 SPEC 技术基线；6 个开放问题均已裁决。Checkpoint `6cc0104`、`2d1be71`、`ca8223b`、`721c291` 与 `91c92a4` 均已本地创建且未 push。现已完成 validator 单一语义核心、authority coordinator、v2 bundle、Local/Worktree/B-first 编排、governance durable apply，以及候选/集成纯 evidence gate；尚未完成真实 merge train 与最终 candidate/final。
+已批准 14 项需求、16 项验收标准、P-001～P-003 全局原则和 SPEC 技术基线；6 个开放问题均已裁决。Checkpoint `6cc0104`、`2d1be71`、`ca8223b`、`721c291`、`91c92a4`、`5dcec69` 与 `c515bfc` 均已本地创建且未 push。现已完成 validator、authority/v2 bundle、Local/Worktree/B-first、governance durable apply、两阶段 candidate seal、依赖/原则 evidence、默认 no-ff train、通知恢复和 public integrated evidence registry；registry 与 progress 尚未完整接入 main advance/coordinator/lifecycle facade，因此尚未形成最终 candidate/final。
 
 仓库在本轮创建前已有 11 个已跟踪修改文件和未跟踪 `evals/`。用户裁决这些三路起草分类改动先形成独立本地提交；提交完成后才开始 PRD-001 新实现。
 
@@ -34,12 +34,13 @@
 | 2026-08-12 | `S-20260812-05 / DECISION` | 非最终 WIP checkpoint 可在精确复核后自主提交并报告；最终产物仍由用户校核 |
 | 2026-08-12 | `S-20260812-06 / CHECKPOINT` | 治理/candidate/upgrade/UX 纯门禁 81 项回归通过，形成自主非最终 checkpoint |
 | 2026-08-12 | `S-20260812-07 / CHECKPOINT` | validator/workspace/authority/v2 bundle/reconcile apply 交叉回归通过，形成执行底座 checkpoint |
+| 2026-08-12 | `EV-I001-implementation-2c50898f8f61091c6d5e0b59d20e43c9a96fb5918bcab723981638562d7ae960` | lifecycle、progress、principle audit、candidate/train 与 integrated evidence registry 形成非最终 checkpoint `c515bfc` |
 
 ## 开放事项与下一步
 
 - 开放偏差：无。
-- 提交已验证的 validator/workspace/authority/v2 bundle/governance apply 执行底座；排除 train 中间态和 pycache。
-- 完成真实 candidate ref、integration worktree/default no-ff、显式 commit/main CAS 的 train adapter，并接入主 CLI。
+- 将 public integrated evidence registry 接入 main CAS 与 coordinator，补齐 integration/main progress 事件的 materialization gate。
+- 扩展统一 lifecycle facade，并运行 0→1→2→3→candidate→integration→accept→main 全链 E2E。
 - 当前只有一个活跃 PRD，保持 Local；不创建 worktree，不 push。
 
 ## 文档地图与按需阅读
