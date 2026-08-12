@@ -313,6 +313,17 @@ class IterationRefState:
 
 
 @dataclass(frozen=True)
+class IterationBaseEvidence:
+    """Pre-resolved Git authority consumed by the pure governance validator."""
+
+    format: str | None = None
+    reference: str | None = None
+    commit: str | None = None
+    branch: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class StatusSnapshot:
     project_root: str
     git_common_dir: str
@@ -1013,6 +1024,8 @@ def read_iteration_base_compat(
 ) -> dict[str, str] | None:
     normalized = normalize_iteration_number(number)
     inventory = dict(records) if records is not None else git_ref_records(git, root)
+    allocation_reference = v2_allocation_ref(normalized)
+    allocation_value = inventory.get(allocation_reference)
     v2_reference = v2_iteration_base_ref(normalized)
     v2_value = inventory.get(v2_reference)
     legacy_prefix = f"refs/project-harness/iterations/{normalized}/base/"
@@ -1021,19 +1034,41 @@ def read_iteration_base_compat(
         object_name, object_type = v2_value
         if object_type != "commit":
             raise HarnessError(f"V2 base ref does not point to a commit: {v2_reference}")
+        if allocation_value is None:
+            raise HarnessError(f"V2 base ref lacks its matching allocation metadata ref: {allocation_reference}")
+        allocation_object, allocation_type = allocation_value
+        if allocation_type != "blob":
+            raise HarnessError(f"V2 allocation ref does not point to metadata: {allocation_reference}")
+        metadata = read_allocation_metadata(git, root, allocation_object)
+        if metadata.get("iteration") != normalized:
+            raise HarnessError(f"V2 allocation metadata names a different iteration: {allocation_reference}")
+        if metadata.get("base_commit") != object_name:
+            raise HarnessError(f"V2 allocation metadata base differs from {v2_reference}")
+        metadata_branch = str(metadata["base_branch"])
         result = {
             "format": "v2",
             "reference": v2_reference,
             "commit": object_name,
-            "branch": "",
+            "branch": metadata_branch,
+            "allocation_ref": allocation_reference,
+            "allocation_object": allocation_object,
         }
         if legacy:
             legacy_commits = {value[0] for _, value in legacy}
             if len(legacy) != 1 or legacy_commits != {object_name}:
                 raise HarnessError(f"Iteration {normalized} has conflicting legacy and v2 base refs")
+            legacy_reference, (_, legacy_type) = legacy[0]
+            legacy_branch = legacy_reference[len(legacy_prefix) :]
+            if legacy_type != "commit" or not legacy_branch.startswith("refs/heads/"):
+                raise HarnessError(f"Iteration {normalized} has an invalid legacy base ref")
+            if legacy_branch != metadata_branch:
+                raise HarnessError(
+                    f"Iteration {normalized} legacy branch differs from v2 allocation metadata"
+                )
             result["format"] = "legacy+v2"
-            result["branch"] = legacy[0][0][len(legacy_prefix) :]
         return result
+    if allocation_value is not None:
+        raise HarnessError(f"V2 allocation ref lacks its matching base ref: {v2_reference}")
     if not legacy:
         return None
     if len(legacy) != 1:
@@ -2019,482 +2054,18 @@ def validate_git_tracking(report: ValidationReport, root: Path) -> None:
             report.add("warning", "git-untracked", root / relative, "Governance file is not yet tracked by Git")
 
 
-def collect_validation(root: Path) -> ValidationReport:
-    report = ValidationReport(root)
-    harness = root / "harness"
-    agents = root / "AGENTS.md"
-    anchor_git = shutil.which("git")
-    exact_git_repository = False
-    if anchor_git:
-        discovery = run_git(
-            anchor_git,
-            root,
-            ["rev-parse", "--show-toplevel"],
-            check=False,
-            safe_directory=False,
-        )
-        exact_git_repository = (
-            discovery.returncode == 0
-            and Path(decode_output(discovery.stdout)).resolve() == root
-        )
-
-    try:
-        ensure_inside_root(harness, root)
-    except HarnessError as exc:
-        report.add("error", "unsafe-path", harness, str(exc))
-        validate_git_tracking(report, root)
-        return report
-    if not harness.is_dir():
-        report.add("error", "missing-harness", harness, "Missing harness/ directory")
-        validate_git_tracking(report, root)
-        return report
-    ensure_paths = [agents, harness / "README.md", harness / "principle.md", harness / "progress.md"]
-    unsafe_paths: set[Path] = set()
-    for path in ensure_paths:
-        try:
-            ensure_inside_root(path, root)
-        except HarnessError as exc:
-            report.add("error", "unsafe-path", path, str(exc))
-            unsafe_paths.add(path)
-
-    required = [harness / "README.md", harness / "principle.md", harness / "progress.md"]
-    documents: dict[Path, Document] = {}
-    for path in required:
-        if path in unsafe_paths:
-            continue
-        if not path.is_file():
-            report.add("error", "missing-global", path, "Missing required Harness document")
-            continue
-        try:
-            documents[path] = read_document(path)
-        except HarnessError as exc:
-            report.add("error", "encoding", path, str(exc))
-            continue
-        if not has_owner_marker(documents[path].text):
-            report.add("error", "owner-marker", path, "Missing harness-lite ownership marker")
-
-    if agents in unsafe_paths:
-        pass
-    elif not agents.is_file():
-        report.add("error", "missing-agents", agents, "Missing root AGENTS.md control file")
-    else:
-        try:
-            agents_text = read_document(agents).text
-            validate_markers(report, agents, agents_text, AGENTS_START, AGENTS_END)
-        except HarnessError as exc:
-            report.add("error", "encoding", agents, str(exc))
-
-    root_readme = documents.get(harness / "README.md")
-    progress = documents.get(harness / "progress.md")
-    if root_readme:
-        validate_markers(report, harness / "README.md", root_readme.text, FOCUS_START, FOCUS_END)
-        validate_markers(report, harness / "README.md", root_readme.text, ITERATIONS_START, ITERATIONS_END)
-    if progress:
-        validate_markers(report, harness / "progress.md", progress.text, PROGRESS_INDEX_START, PROGRESS_INDEX_END)
-
-    for pattern in ("prd-*.md", "spec-*.md"):
-        for path in harness.glob(pattern):
-            report.add("error", "flat-governance-file", path, "Numbered PRD/SPEC must live in iterations/NNN/")
-    legacy_deviation = harness / "deviation.md"
-    if legacy_deviation.exists():
-        report.add("error", "flat-deviation", legacy_deviation, "Use one deviation-NNN.md per iteration")
-
-    iterations = harness / "iterations"
-    try:
-        ensure_inside_root(iterations, root)
-    except HarnessError as exc:
-        report.add("error", "unsafe-path", iterations, str(exc))
-        validate_git_tracking(report, root)
-        return report
-    if not iterations.is_dir():
-        report.add("error", "missing-iterations", iterations, "Missing harness/iterations/ directory")
-        validate_local_links(report, harness)
-        validate_git_tracking(report, root)
-        return report
-
-    numbers: list[str] = []
-    all_deviation_ids: dict[str, Path] = {}
-    for child in sorted(iterations.iterdir(), key=lambda item: item.name):
-        try:
-            ensure_inside_root(child, root)
-        except HarnessError as exc:
-            report.add("error", "unsafe-path", child, str(exc))
-            continue
-        if child.name == ".gitkeep":
-            if not child.is_file():
-                report.add("error", "invalid-gitkeep", child, "iterations/.gitkeep must be a regular file")
-            continue
-        if not child.is_dir() or not re.fullmatch(r"\d{3,}", child.name):
-            report.add("error", "invalid-iteration-entry", child, "Iteration entries must be NNN directories")
-            continue
-        number = child.name
-        numbers.append(number)
-        expected_names = {"README.md", f"prd-{number}.md", f"spec-{number}.md", f"deviation-{number}.md"}
-        actual_entries = list(child.iterdir())
-        unsafe_bundle = False
-        for entry in actual_entries:
-            try:
-                ensure_inside_root(entry, root)
-            except HarnessError as exc:
-                report.add("error", "unsafe-path", entry, str(exc))
-                unsafe_bundle = True
-        actual_names = {path.name for path in actual_entries}
-        for missing in sorted(expected_names - actual_names):
-            report.add("error", "incomplete-bundle", child / missing, "Missing iteration bundle file")
-        for extra in sorted(actual_names - expected_names):
-            report.add("error", "extra-bundle-file", child / extra, "Iteration directory must contain exactly the four governance files")
-        if expected_names - actual_names or unsafe_bundle:
-            continue
-
-        paths = {
-            "readme": child / "README.md",
-            "prd": child / f"prd-{number}.md",
-            "spec": child / f"spec-{number}.md",
-            "deviation": child / f"deviation-{number}.md",
-        }
-        invalid_bundle_file = False
-        for path in paths.values():
-            try:
-                ensure_inside_root(path, root)
-            except HarnessError as exc:
-                report.add("error", "unsafe-path", path, str(exc))
-                invalid_bundle_file = True
-                continue
-            if not path.is_file():
-                report.add("error", "invalid-bundle-file", path, "Iteration governance entries must be regular files")
-                invalid_bundle_file = True
-        if invalid_bundle_file:
-            continue
-        try:
-            texts = {key: read_document(path).text for key, path in paths.items()}
-        except HarnessError as exc:
-            report.add("error", "encoding", child, str(exc))
-            continue
-        for key, path in paths.items():
-            if not has_owner_marker(texts[key]):
-                report.add("error", "owner-marker", path, "Missing harness-lite ownership marker")
-
-        if f"PRD-{number}" not in texts["prd"]:
-            report.add("error", "prd-id", paths["prd"], f"Missing PRD-{number} identity")
-        git_baseline = bullet_value(texts["prd"], "Git 基线")
-        if not git_baseline or not re.fullmatch(r"[0-9a-fA-F]{40,64}", git_baseline):
-            report.add("error", "prd-git-baseline", paths["prd"], "Missing or invalid immutable Git baseline")
-        git_branch = bullet_value(texts["prd"], "Git 分支")
-        if not git_branch or not re.fullmatch(r"refs/heads/[^\s`]+", git_branch):
-            report.add("error", "prd-git-branch", paths["prd"], "Missing or invalid immutable Git branch")
-        if exact_git_repository and anchor_git:
-            try:
-                _, anchored_commit, anchored_branch = read_iteration_base_anchor(
-                    anchor_git,
-                    root,
-                    number,
-                )
-            except HarnessError as exc:
-                report.add("error", "iteration-base-anchor", paths["prd"], str(exc))
-            else:
-                if git_baseline and git_baseline.lower() != anchored_commit.lower():
-                    report.add(
-                        "error",
-                        "iteration-base-anchor-drift",
-                        paths["prd"],
-                        f"PRD Git baseline {git_baseline} differs from immutable anchor {anchored_commit}",
-                    )
-                if git_branch != anchored_branch:
-                    report.add(
-                        "error",
-                        "iteration-branch-anchor-drift",
-                        paths["prd"],
-                        f"PRD Git branch {git_branch!r} differs from immutable anchor {anchored_branch!r}",
-                    )
-            for bundle_path in paths.values():
-                relative = bundle_path.relative_to(root).as_posix()
-                ignored = run_git(
-                    anchor_git,
-                    root,
-                    ["check-ignore", "--no-index", "--quiet", "--", relative],
-                    check=False,
-                )
-                if ignored.returncode == 0:
-                    report.add(
-                        "error",
-                        "git-ignored-iteration-file",
-                        bundle_path,
-                        "Iteration governance file is ignored by Git",
-                    )
-                elif ignored.returncode != 1:
-                    report.add(
-                        "error",
-                        "git-ignore-check",
-                        bundle_path,
-                        decode_output(ignored.stderr) or f"Git check-ignore exited {ignored.returncode}",
-                    )
-        if f"SPEC-{number}" not in texts["spec"]:
-            report.add("error", "spec-id", paths["spec"], f"Missing SPEC-{number} identity")
-        if f"PRD-{number}" not in texts["deviation"] or f"SPEC-{number}" not in texts["deviation"]:
-            report.add("error", "deviation-owner", paths["deviation"], "Deviation ledger does not identify its same-number PRD/SPEC")
-
-        prd_status = parse_status(texts["prd"], "状态")
-        spec_status = parse_status(texts["spec"], "状态")
-        l1_prd_status = parse_status(texts["readme"], "PRD 状态")
-        l1_spec_status = parse_status(texts["readme"], "SPEC 状态")
-        l1_open = parse_status(texts["readme"], "开放偏差")
-        if prd_status not in PRD_STATUSES:
-            report.add("error", "prd-status", paths["prd"], f"Invalid or missing PRD status: {prd_status}")
-        if spec_status not in SPEC_STATUSES:
-            report.add("error", "spec-status", paths["spec"], f"Invalid or missing SPEC status: {spec_status}")
-        if spec_status in {"实施中", "已完成"} and not explicit_user_implementation_authorization(
-            bullet_value(texts["spec"], "实施授权")
-        ):
-            report.add("error", "implementation-authorization", paths["spec"], f"SPEC {spec_status} lacks explicit implementation authorization")
-        if prd_status in {"已批准", "实施中", "待验收", "已验收"}:
-            if not explicit_user_baseline_approval(bullet_value(texts["prd"], "批准依据"), f"PRD-{number}"):
-                report.add(
-                    "error",
-                    "prd-approval-evidence",
-                    paths["prd"],
-                    f"PRD {prd_status} lacks explicit user approval of the product baseline",
-                )
-            clean_prd = strip_html_comments(texts["prd"])
-            remaining = [fragment for fragment in PRD_TEMPLATE_PLACEHOLDERS if fragment in clean_prd]
-            if "待定义" in clean_prd or remaining:
-                report.add(
-                    "error",
-                    "prd-template-placeholder",
-                    paths["prd"],
-                    "Approved/implemented PRD still contains bundled template placeholders",
-                )
-        if spec_status in {"待批准", "已批准", "实施中", "已完成"}:
-            approved_baseline = bullet_value(texts["spec"], "当前批准基线")
-            if not meaningful_value(approved_baseline) or f"PRD-{number}" not in (approved_baseline or ""):
-                report.add(
-                    "error",
-                    "spec-approved-baseline",
-                    paths["spec"],
-                    f"SPEC {spec_status} must identify the approved PRD-{number} baseline",
-                )
-        if spec_status in {"已批准", "实施中", "已完成"}:
-            if not explicit_user_baseline_approval(bullet_value(texts["spec"], "批准依据"), f"SPEC-{number}"):
-                report.add(
-                    "error",
-                    "spec-approval-evidence",
-                    paths["spec"],
-                    f"SPEC {spec_status} lacks explicit user approval of the implementation baseline",
-                )
-        if spec_status in {"实施中", "已完成"}:
-            clean_spec = strip_html_comments(texts["spec"])
-            remaining = [fragment for fragment in SPEC_TEMPLATE_PLACEHOLDERS if fragment in clean_spec]
-            if "待定义" in clean_spec or remaining:
-                report.add(
-                    "error",
-                    "spec-template-placeholder",
-                    paths["spec"],
-                    "Implemented SPEC still contains bundled template placeholders",
-                )
-        if "PRD 当前状态" in texts["spec"]:
-            report.add("error", "duplicate-status-owner", paths["spec"], "SPEC must not duplicate PRD status; derive it from the PRD")
-        if l1_prd_status != prd_status:
-            report.add("error", "l1-prd-drift", paths["readme"], f"L1 PRD status {l1_prd_status!r} differs from PRD {prd_status!r}")
-        if l1_spec_status != spec_status:
-            report.add("error", "l1-spec-drift", paths["readme"], f"L1 SPEC status {l1_spec_status!r} differs from SPEC {spec_status!r}")
-
-        for heading in malformed_deviation_headings(texts["deviation"]):
-            report.add(
-                "error",
-                "malformed-deviation-heading",
-                paths["deviation"],
-                f"Deviation heading must use canonical '### DEV-NNN-SSS：title' syntax: {heading}",
-            )
-        entries = deviation_entries(texts["deviation"])
-        if entries and spec_status != "已完成":
-            report.add(
-                "error",
-                "deviation-before-completion",
-                paths["deviation"],
-                "As-built deviations may be recorded only after the SPEC implementation is completed",
-            )
-        open_count = 0
-        for entry in entries:
-            deviation_id = entry.identity
-            status = entry.status
-            if not deviation_id.startswith(f"DEV-{number}-"):
-                report.add("error", "deviation-prefix", paths["deviation"], f"Wrong iteration prefix: {deviation_id}")
-            if deviation_id in all_deviation_ids:
-                report.add("error", "duplicate-deviation", paths["deviation"], f"Duplicate {deviation_id}; first seen in {all_deviation_ids[deviation_id]}")
-            all_deviation_ids[deviation_id] = paths["deviation"]
-            if status is None:
-                report.add("error", "deviation-status", paths["deviation"], f"Missing status for {deviation_id}")
-            elif status not in DEVIATION_STATUSES:
-                report.add("error", "deviation-status", paths["deviation"], f"Invalid status {status!r} for {deviation_id}")
-            elif status in UNRESOLVED_DEVIATION_STATUSES:
-                open_count += 1
-            required_facts = (
-                ("原批准内容", "deviation-baseline", "the original approved promise"),
-                ("as-built 事实", "deviation-as-built", "an as-built fact"),
-                ("原因", "deviation-cause", "a factual cause or current investigation result"),
-                ("影响", "deviation-impact", "impact analysis"),
-                ("验收影响", "deviation-acceptance-impact", "acceptance impact"),
-            )
-            if not meaningful_timestamp(bullet_value(entry.body, "发现时间")):
-                report.add("error", "deviation-discovered-at", paths["deviation"], f"{deviation_id} lacks an ISO discovery date/time")
-            association = bullet_value(entry.body, "关联需求/验收")
-            if not (
-                meaningful_value(association)
-                and re.search(rf"(?<![A-Z0-9])R-{re.escape(number)}-\d+(?!\d)", association or "")
-                and re.search(rf"(?<![A-Z0-9])AC-{re.escape(number)}-\d+(?!\d)", association or "")
-            ):
-                report.add(
-                    "error",
-                    "deviation-requirement-reference",
-                    paths["deviation"],
-                    f"{deviation_id} must cite same-iteration R-{number}-... and AC-{number}-... IDs",
-                )
-            spec_reference = bullet_value(entry.body, "SPEC 章节")
-            if not (
-                meaningful_value(spec_reference)
-                and ("§" in (spec_reference or "") or f"SPEC-{number}" in (spec_reference or ""))
-            ):
-                report.add(
-                    "error",
-                    "deviation-spec-reference",
-                    paths["deviation"],
-                    f"{deviation_id} must cite an exact SPEC-{number} section",
-                )
-            for label, code, description in required_facts:
-                if not meaningful_value(bullet_value(entry.body, label)):
-                    report.add("error", code, paths["deviation"], f"{deviation_id} lacks {description}")
-            if status and status not in UNRESOLVED_DEVIATION_STATUSES:
-                if not meaningful_value(bullet_value(entry.body, "明确处置")):
-                    report.add("error", "deviation-disposition", paths["deviation"], f"{deviation_id} lacks an explicit disposition")
-                if not meaningful_value(bullet_value(entry.body, "处置依据")):
-                    report.add("error", "deviation-disposition-evidence", paths["deviation"], f"{deviation_id} lacks disposition evidence")
-                if not meaningful_verification_evidence(bullet_value(entry.body, "验证")):
-                    report.add("error", "deviation-verification", paths["deviation"], f"{deviation_id} lacks concrete verification evidence")
-                if not meaningful_timestamp(bullet_value(entry.body, "关闭或转交时间")):
-                    report.add("error", "deviation-closure", paths["deviation"], f"{deviation_id} lacks an ISO closure or transfer date/time")
-                disposition_evidence = bullet_value(entry.body, "处置依据")
-                if status == "基线已重批" and not (
-                    explicit_user_baseline_approval(disposition_evidence, f"PRD-{number}")
-                    or explicit_user_baseline_approval(disposition_evidence, f"SPEC-{number}")
-                ):
-                    report.add(
-                        "error",
-                        "deviation-reapproval-evidence",
-                        paths["deviation"],
-                        f"{deviation_id} claims a reapproved baseline without explicit user approval evidence",
-                    )
-                if status == "已接受残余" and not explicit_user_acceptance_evidence(
-                    disposition_evidence
-                ):
-                    report.add(
-                        "error",
-                        "deviation-residual-acceptance",
-                        paths["deviation"],
-                        f"{deviation_id} claims accepted residual behavior without explicit user acceptance evidence",
-                    )
-                if status == "已转后续迭代":
-                    transfer_text = " ".join(
-                        filter(
-                            None,
-                            (
-                                bullet_value(entry.body, "明确处置"),
-                                disposition_evidence,
-                            ),
-                        )
-                    )
-                    targets = re.findall(r"(?<![A-Z0-9])PRD-(\d{3,})(?!\d)", transfer_text)
-                    if not targets or all(target == number for target in targets):
-                        report.add(
-                            "error",
-                            "deviation-transfer-target",
-                            paths["deviation"],
-                            f"{deviation_id} must identify a different receiving PRD-NNN iteration",
-                        )
-        declared_match = re.search(r"当前开放偏差：`(\d+)`", texts["deviation"])
-        declared_open = int(declared_match.group(1)) if declared_match else None
-        if declared_open != open_count:
-            report.add(
-                "error",
-                "deviation-open-count-drift",
-                paths["deviation"],
-                f"Ledger summary says {declared_open!r} open deviations; entries have {open_count}",
-            )
-        if l1_open != str(open_count):
-            report.add("error", "l1-deviation-drift", paths["readme"], f"L1 says {l1_open!r} open deviations; ledger has {open_count}")
-        if prd_status in {"待验收", "已验收"}:
-            if spec_status != "已完成":
-                report.add("error", "acceptance-spec-status", paths["spec"], f"PRD {prd_status} requires SPEC status 已完成")
-            if open_count:
-                report.add("error", "acceptance-open-deviation", paths["deviation"], f"PRD {prd_status} cannot have unresolved as-built deviations")
-        if prd_status == "已验收" and not explicit_user_acceptance_evidence(
-            bullet_value(texts["prd"], "验收依据")
-        ):
-            report.add("error", "acceptance-evidence", paths["prd"], "Accepted PRD lacks explicit user acceptance evidence")
-
-        if root_readme:
-            registry_matches = 0
-            for line in section_body(root_readme.text, ITERATIONS_START, ITERATIONS_END).splitlines():
-                if not line.lstrip().startswith("|"):
-                    continue
-                first_cell = line.strip().strip("|").split("|", 1)[0]
-                if re.search(rf"(?<!\d){re.escape(number)}(?!\d)", first_cell):
-                    registry_matches += 1
-            if registry_matches != 1:
-                report.add("error", "l0-registration-count", harness / "README.md", f"Expected one registry row for {number}; found {registry_matches}")
-            row = parse_table_row(root_readme.text, number)
-            if row is None or len(row) < 8:
-                report.add("error", "l0-registration", harness / "README.md", f"Missing or malformed registry row for {number}")
-            else:
-                if row[2] != prd_status:
-                    report.add("error", "l0-prd-drift", harness / "README.md", f"Registry PRD status for {number} differs from PRD")
-                if row[3] != spec_status:
-                    report.add("error", "l0-spec-drift", harness / "README.md", f"Registry SPEC status for {number} differs from SPEC")
-                if row[4] != str(open_count):
-                    report.add("error", "l0-deviation-drift", harness / "README.md", f"Registry open deviation count for {number} differs from ledger")
-        if progress:
-            row = parse_table_row(section_body(progress.text, PROGRESS_INDEX_START, PROGRESS_INDEX_END), number)
-            if row is None or len(row) < 4:
-                report.add("error", "progress-index", harness / "progress.md", f"Missing or malformed progress index row for {number}")
-            elif row[1] != prd_status or row[2] != spec_status:
-                report.add("error", "progress-index-drift", harness / "progress.md", f"Progress index status for {number} differs from authoritative PRD/SPEC")
-
-    if not numbers:
-        report.add("warning", "no-iterations", iterations, "Harness is initialized but has no product iteration yet")
-
-    if progress:
-        clean_progress = strip_html_comments(progress.text)
-        event_pairs: dict[tuple[str, str], int] = {}
-        for session_id, event_type in re.findall(
-            r"^## (S-\d{8}-\d{2,}) / (OPEN|DECISION|CHECKPOINT|MERGE|CLOSE) /",
-            clean_progress,
-            flags=re.MULTILINE,
-        ):
-            pair = (session_id, event_type)
-            event_pairs[pair] = event_pairs.get(pair, 0) + 1
-        for pair, count in event_pairs.items():
-            if count > 1:
-                report.add("error", "duplicate-event", harness / "progress.md", f"Duplicate event {pair[0]} / {pair[1]}")
-
-    validate_local_links(report, harness)
-    validate_git_tracking(report, root)
-    return report
-
-
-def collect_committed_governance_validation(
-    git: str,
+def _validate_governance_semantics(
+    report: ValidationReport,
     root: Path,
-    commit: str,
-    entries: Mapping[str, tuple[str, str, bytes]],
-) -> ValidationReport:
-    """Validate the authoritative governance tree without checking it out or writing temp state."""
-    report = ValidationReport(root)
-    texts: dict[str, str] = {}
-    for relative, (_, _, raw) in entries.items():
-        if not relative.lower().endswith(".md"):
-            continue
-        try:
-            texts[relative] = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            report.add("error", "encoding", root / relative, "Committed governance Markdown must be UTF-8")
+    entries: Iterable[str],
+    texts: Mapping[str, str],
+    *,
+    iterations_present: bool,
+    iteration_directories: Iterable[str] = (),
+    anchors: Mapping[str, IterationBaseEvidence] | None,
+) -> None:
+    """Apply source-independent Harness document semantics to an in-memory tree view."""
+    entries = frozenset(entries)
 
     required = (
         "AGENTS.md",
@@ -2504,7 +2075,8 @@ def collect_committed_governance_validation(
     )
     for relative in required:
         if relative not in entries:
-            report.add("error", "missing-global", root / relative, "Missing required committed governance file")
+            code = "missing-agents" if relative == "AGENTS.md" else "missing-global"
+            report.add("error", code, root / relative, "Missing required Harness governance file")
     for relative in required[1:]:
         text_value = texts.get(relative)
         if text_value is not None and not has_owner_marker(text_value):
@@ -2545,8 +2117,10 @@ def collect_committed_governance_validation(
         )
 
     iteration_prefix = "harness/iterations/"
-    iteration_members: dict[str, set[str]] = {}
-    found_iterations_root = False
+    iteration_members: dict[str, set[str]] = {
+        normalize_iteration_number(number): set() for number in iteration_directories
+    }
+    found_iterations_root = iterations_present
     for relative in entries:
         if not relative.startswith(iteration_prefix):
             continue
@@ -2577,7 +2151,7 @@ def collect_committed_governance_validation(
             "error",
             "missing-iterations",
             root / "harness/iterations",
-            "Missing committed harness/iterations/ tree",
+            "Missing harness/iterations/ tree",
         )
 
     all_deviation_ids: dict[str, Path] = {}
@@ -2612,7 +2186,7 @@ def collect_committed_governance_validation(
         if any(value is None for value in bundle_texts.values()):
             for key, value in bundle_texts.items():
                 if value is None:
-                    report.add("error", "encoding", paths[key], "Committed bundle file is not valid UTF-8 Markdown")
+                    report.add("error", "encoding", paths[key], "Bundle file is not valid UTF-8 Markdown")
             continue
         typed_texts = {key: str(value) for key, value in bundle_texts.items()}
         for key, path in paths.items():
@@ -2625,27 +2199,36 @@ def collect_committed_governance_validation(
         if not git_baseline or not re.fullmatch(r"[0-9a-fA-F]{40,64}", git_baseline):
             report.add("error", "prd-git-baseline", paths["prd"], "Missing or invalid immutable Git baseline")
         git_branch = bullet_value(typed_texts["prd"], "Git 分支")
-        if not git_branch or not re.fullmatch(r"refs/heads/[^\s`]+", git_branch):
-            report.add("error", "prd-git-branch", paths["prd"], "Missing or invalid immutable Git branch")
-        try:
-            _, anchored_commit, anchored_branch = read_iteration_base_anchor(git, root, number)
-        except HarnessError as exc:
-            report.add("error", "iteration-base-anchor", paths["prd"], str(exc))
-        else:
-            if git_baseline and git_baseline.lower() != anchored_commit.lower():
+        if not git_branch or not is_allowed_base_ref(git_branch):
+            report.add("error", "prd-git-branch", paths["prd"], "Missing or invalid immutable Git source ref")
+        if anchors is not None:
+            evidence = anchors.get(number)
+            if evidence is None:
                 report.add(
                     "error",
-                    "iteration-base-anchor-drift",
+                    "iteration-base-anchor",
                     paths["prd"],
-                    f"PRD Git baseline {git_baseline} differs from immutable anchor {anchored_commit}",
+                    f"PRD-{number} has no immutable Git base anchor",
                 )
-            if git_branch != anchored_branch:
-                report.add(
-                    "error",
-                    "iteration-branch-anchor-drift",
-                    paths["prd"],
-                    f"PRD Git branch {git_branch!r} differs from immutable anchor {anchored_branch!r}",
-                )
+            elif evidence.error is not None:
+                report.add("error", "iteration-base-anchor", paths["prd"], evidence.error)
+            else:
+                anchored_commit = evidence.commit or ""
+                anchored_branch = evidence.branch or ""
+                if git_baseline and git_baseline.lower() != anchored_commit.lower():
+                    report.add(
+                        "error",
+                        "iteration-base-anchor-drift",
+                        paths["prd"],
+                        f"PRD Git baseline {git_baseline} differs from immutable anchor {anchored_commit}",
+                    )
+                if git_branch != anchored_branch:
+                    report.add(
+                        "error",
+                        "iteration-branch-anchor-drift",
+                        paths["prd"],
+                        f"PRD Git branch {git_branch!r} differs from immutable anchor {anchored_branch!r}",
+                    )
         if f"SPEC-{number}" not in typed_texts["spec"]:
             report.add("error", "spec-id", paths["spec"], f"Missing SPEC-{number} identity")
         if f"PRD-{number}" not in typed_texts["deviation"] or f"SPEC-{number}" not in typed_texts["deviation"]:
@@ -3062,6 +2645,232 @@ def collect_committed_governance_validation(
                     root / relative,
                     f"Missing local link target: {raw_target}",
                 )
+    return None
+
+
+def _anchor_evidence_for_numbers(
+    git: str,
+    root: Path,
+    numbers: Iterable[str],
+    records: Mapping[str, tuple[str, str]] | None = None,
+) -> dict[str, IterationBaseEvidence]:
+    inventory = dict(records) if records is not None else git_ref_records(git, root)
+    result: dict[str, IterationBaseEvidence] = {}
+    for raw_number in numbers:
+        number = normalize_iteration_number(raw_number)
+        try:
+            base = read_iteration_base_compat(git, root, number, inventory)
+        except HarnessError as exc:
+            result[number] = IterationBaseEvidence(error=str(exc))
+            continue
+        if base is None:
+            result[number] = IterationBaseEvidence(
+                error=f"PRD-{number} has no immutable Git base anchor"
+            )
+            continue
+        result[number] = IterationBaseEvidence(
+            format=base.get("format"),
+            reference=base.get("reference"),
+            commit=base.get("commit"),
+            branch=base.get("branch"),
+        )
+    return result
+
+
+def _worktree_governance_view(
+    report: ValidationReport,
+    root: Path,
+) -> tuple[set[str], dict[str, str], bool, set[str]]:
+    entries: set[str] = set()
+    texts: dict[str, str] = {}
+    iterations_present = False
+    iteration_directories: set[str] = set()
+    candidates = (root / "AGENTS.md", root / "harness")
+    for candidate in candidates:
+        try:
+            ensure_inside_root(candidate, root)
+        except HarnessError as exc:
+            report.add("error", "unsafe-path", candidate, str(exc))
+            continue
+        if candidate == root / "AGENTS.md":
+            if candidate.is_file():
+                entries.add("AGENTS.md")
+                try:
+                    texts["AGENTS.md"] = read_document(candidate).text
+                except HarnessError as exc:
+                    report.add("error", "encoding", candidate, str(exc))
+            continue
+        if not candidate.is_dir():
+            continue
+        for current, directory_names, file_names in os.walk(candidate, followlinks=False):
+            current_path = Path(current)
+            safe_directories: list[str] = []
+            for directory_name in directory_names:
+                child = current_path / directory_name
+                try:
+                    ensure_inside_root(child, root)
+                except HarnessError as exc:
+                    report.add("error", "unsafe-path", child, str(exc))
+                    continue
+                if current_path == root / "harness/iterations":
+                    if directory_name == ".gitkeep":
+                        report.add(
+                            "error",
+                            "invalid-gitkeep",
+                            child,
+                            "iterations/.gitkeep must be a regular file",
+                        )
+                        continue
+                    if not re.fullmatch(r"\d{3,}", directory_name):
+                        report.add(
+                            "error",
+                            "invalid-iteration-entry",
+                            child,
+                            "Iteration entries must be NNN directories",
+                        )
+                        continue
+                    iteration_directories.add(directory_name)
+                elif re.fullmatch(r"harness[/\\]iterations[/\\]\d{3,}", str(current_path.relative_to(root))):
+                    report.add(
+                        "error",
+                        "extra-bundle-file",
+                        child,
+                        "Iteration directory must contain exactly the four governance files",
+                    )
+                    continue
+                safe_directories.append(directory_name)
+                if child == root / "harness/iterations":
+                    iterations_present = True
+            directory_names[:] = safe_directories
+            for file_name in file_names:
+                child = current_path / file_name
+                try:
+                    ensure_inside_root(child, root)
+                except HarnessError as exc:
+                    report.add("error", "unsafe-path", child, str(exc))
+                    continue
+                if not child.is_file():
+                    report.add("error", "invalid-governance-file", child, "Governance entries must be regular files")
+                    continue
+                relative = child.relative_to(root).as_posix()
+                entries.add(relative)
+                if child.suffix.lower() == ".md":
+                    try:
+                        texts[relative] = read_document(child).text
+                    except HarnessError as exc:
+                        report.add("error", "encoding", child, str(exc))
+    return entries, texts, iterations_present, iteration_directories
+
+
+def _validate_worktree_iteration_git_paths(
+    report: ValidationReport,
+    root: Path,
+    git: str,
+    entries: Iterable[str],
+) -> None:
+    for relative in sorted(entries):
+        if not re.fullmatch(
+            r"harness/iterations/\d{3,}/(?:README\.md|prd-\d{3,}\.md|spec-\d{3,}\.md|deviation-\d{3,}\.md)",
+            relative,
+        ):
+            continue
+        ignored = run_git(
+            git,
+            root,
+            ["check-ignore", "--no-index", "--quiet", "--", relative],
+            check=False,
+        )
+        if ignored.returncode == 0:
+            report.add(
+                "error",
+                "git-ignored-iteration-file",
+                root / relative,
+                "Iteration governance file is ignored by Git",
+            )
+        elif ignored.returncode != 1:
+            report.add(
+                "error",
+                "git-ignore-check",
+                root / relative,
+                decode_output(ignored.stderr) or f"Git check-ignore exited {ignored.returncode}",
+            )
+
+
+def collect_validation(root: Path) -> ValidationReport:
+    """Validate the live worktree through the shared in-memory semantic core."""
+    report = ValidationReport(root)
+    harness = root / "harness"
+    if not harness.is_dir():
+        report.add("error", "missing-harness", harness, "Missing harness/ directory")
+        validate_git_tracking(report, root)
+        return report
+    entries, texts, iterations_present, iteration_directories = _worktree_governance_view(report, root)
+    git = shutil.which("git")
+    anchors: dict[str, IterationBaseEvidence] | None = None
+    if git:
+        discovery = run_git(
+            git,
+            root,
+            ["rev-parse", "--show-toplevel"],
+            check=False,
+            safe_directory=False,
+        )
+        if discovery.returncode == 0 and Path(decode_output(discovery.stdout)).resolve() == root:
+            numbers = {
+                match.group(1)
+                for relative in entries
+                if (match := re.match(r"^harness/iterations/(\d{3,})/", relative))
+            }
+            anchors = _anchor_evidence_for_numbers(git, root, numbers)
+            _validate_worktree_iteration_git_paths(report, root, git, entries)
+    _validate_governance_semantics(
+        report,
+        root,
+        entries,
+        texts,
+        iterations_present=iterations_present,
+        iteration_directories=iteration_directories,
+        anchors=anchors,
+    )
+    validate_git_tracking(report, root)
+    return report
+
+
+def collect_committed_governance_validation(
+    git: str,
+    root: Path,
+    commit: str,
+    entries: Mapping[str, tuple[str, str, bytes]],
+) -> ValidationReport:
+    """Validate an immutable commit tree using Git objects only; never check it out."""
+    report = ValidationReport(root)
+    texts: dict[str, str] = {}
+    for relative, (_, _, raw) in entries.items():
+        if not relative.lower().endswith(".md"):
+            continue
+        try:
+            texts[relative] = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            report.add("error", "encoding", root / relative, "Committed governance Markdown must be UTF-8")
+    numbers = {
+        match.group(1)
+        for relative in entries
+        if (match := re.match(r"^harness/iterations/(\d{3,})/", relative))
+    }
+    anchors = _anchor_evidence_for_numbers(git, root, numbers)
+    iterations_present = any(
+        relative == "harness/iterations/.gitkeep" or relative.startswith("harness/iterations/")
+        for relative in entries
+    )
+    _validate_governance_semantics(
+        report,
+        root,
+        entries,
+        texts,
+        iterations_present=iterations_present,
+        iteration_directories=numbers,
+        anchors=anchors,
+    )
     return report
 
 

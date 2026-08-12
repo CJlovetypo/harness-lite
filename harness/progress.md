@@ -135,3 +135,15 @@
 - 验证证据：decision/governance/candidate/upgrade/UX 合并回归 81/81 通过；governance 真实 `progress.md` 解析 9 events / 0 blockers；所有目标路径 `git diff --check` 通过；candidate identity-rebind 正反例、legacy upgrade 零写、worktree/commit/push 通知字段均有固定测试。
 - 关联偏差：无；实现与已批准 R-001-01～R-001-05、R-001-10～R-001-14 / SPEC §4～§8、§11 一致。
 - 未决问题与下一步：提交本 checkpoint 后，单独 checkpoint validator/anchor compatibility 与 Local/worktree 编排；补齐 B-first 原地 branch binding，再进入实际 candidate refs/merge-train adapter 和最终文档/eval 收束。
+
+## S-20260812-07 / CHECKPOINT / 2026-08-12T13:20:00+08:00
+
+- 关联：PRD-001 / SPEC-001 / validator-workspace-authority-reconcile slice
+- 会话背景：纯治理/candidate/upgrade/UX checkpoint `91c92a4` 完成后，继续关闭 v2 实际生命周期断点与多工作区安全门禁。
+- 用户目标：Harness 自动判断 Local/Worktree 并保持低打扰；三个以上 PRD 仍有唯一身份和纵向治理；B-first 不提交 A；principle/progress/README 在集成时按权威规则真实落盘且可恢复。
+- 决策与依据：live/committed governance 统一使用单一语义 validator；v2 base 必须与 allocation metadata 成对；authority coordinator 从 PRD/SPEC/实施授权/依赖/refs 自行推导，不信任调用者布尔值；reserve 后以 accepted digest 创建同号四件套，关闭 legacy command 被 v2 ref 阻断后的死路；workspace 使用 single-writer lease、add-only/sticky 状态机和 B-first 原地 HEAD 绑定；governance apply 使用 exact snapshot/digest/journal/file CAS，principle 变化额外要求全局 exact-content lease。
+- 执行与变更：统一 `project_harness.py` validator core；新增 workspace orchestrator、authority coordinator、v2 bundle adapter、governance reconcile apply 及隔离测试。B-first 只用 main/base CAS 创建 A 分支并原地改变 HEAD symref，不 checkout/switch，不 commit/stash/copy/move；governance apply 只原子替换已审阅治理文件，不 commit/merge/push。
+- Git 透明：当前真实仓库始终只有 main worktree、无 v2 refs；所有 worktree/create/bind/apply 测试只在 Windows 临时仓库执行。此非最终 checkpoint 精确排除 `harness_train.py` 中间态、pycache 和任何远端动作；提交后报告 hash 与 `pushed=false`。
+- 验证证据：workspace 13/13（164.517 秒）；validator views 4/4、parallel 18/18、reconcile apply 8/8、coordinator 6/6、v2 bundle 4/4 的交叉回归共 40/40（187.633 秒）；validator-core 另有 legacy 70/70（406 秒）与当前项目 0 errors / 0 warnings；所有目标 diff-check 通过。
+- 关联偏差：无；本切片落实 AC-001-01～AC-001-12、AC-001-15～AC-001-16 的底层门禁，不改变批准范围。真实 candidate ref/merge train/main CAS 尚在下一独立切片，不能把本 checkpoint 声称为 AC-001-13 完成。
+- 未决问题与下一步：完成并验证 `harness_train.py` 的 candidate/ref、integration worktree、默认 no-ff、显式 commit/main advance；随后接入主 CLI，补 upgrade apply、Skill/contract/templates/README/evals 与端到端验收。
