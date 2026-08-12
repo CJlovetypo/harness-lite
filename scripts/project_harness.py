@@ -2896,6 +2896,11 @@ def build_new_iteration_operations(
     now: datetime,
     base_commit: str,
     base_branch: str,
+    *,
+    v2_progress_operation_id: str | None = None,
+    v2_progress_source_ref: str | None = None,
+    v2_progress_source_commit: str | None = None,
+    v2_progress_evidence_refs: Sequence[str] | None = None,
 ) -> tuple[str, list[Operation]]:
     report = collect_validation(root)
     if report.errors:
@@ -2918,12 +2923,60 @@ def build_new_iteration_operations(
     session_id = next_session_id(progress.text, now)
     date = now.date().isoformat()
     timestamp = now.astimezone().isoformat(timespec="seconds")
+    v2_fields = (
+        v2_progress_operation_id,
+        v2_progress_source_ref,
+        v2_progress_source_commit,
+        v2_progress_evidence_refs,
+    )
+    v2_requested = any(value is not None for value in v2_fields)
+    if v2_requested and any(value is None for value in v2_fields):
+        raise HarnessError("v2 progress event binding requires operation, source ref/commit, and evidence")
+
+    rendered_open_event: str | None = None
+    routing_event_id = session_id
+    if v2_requested:
+        try:
+            from .harness_governance import parse_progress_events
+            from .harness_progress import ProgressError, open_event
+        except ImportError:  # pragma: no cover - direct script/module execution
+            from harness_governance import parse_progress_events
+            from harness_progress import ProgressError, open_event
+
+        parsed = parse_progress_events(progress.raw, source=str(progress_path))
+        if parsed.blockers:
+            detail = "; ".join(blocker.code for blocker in parsed.blockers[:8])
+            raise HarnessError(f"Cannot append v2 OPEN to invalid progress history: {detail}")
+        causal_parent = parsed.events[-1].identity if parsed.events else None
+        try:
+            open_record = open_event(
+                open_key="iteration-created",
+                session_id=session_id,
+                iteration=number,
+                occurred_at=timestamp,
+                source_ref=v2_progress_source_ref,
+                source_commit=v2_progress_source_commit,
+                operation_id=v2_progress_operation_id,
+                causal_parent=causal_parent,
+                evidence_refs=tuple(v2_progress_evidence_refs or ()),
+                summary=(
+                    f"Created the PRD-{number}/SPEC-{number} governance bundle for {title}; "
+                    "the bundle is draft evidence and does not authorize implementation."
+                ),
+            )
+        except ProgressError as exc:
+            raise HarnessError(f"Cannot render the v2 OPEN event: {exc}") from exc
+        routing_event_id = open_record.event_id
+        rendered_open_event = open_record.render(progress.newline.encode("ascii")).decode("utf-8")
     values = {
         "NUMBER": number,
         "TITLE": title,
         "DATE": date,
         "TIMESTAMP": timestamp,
-        "SESSION_ID": session_id,
+        # Legacy templates route to the S-* OPEN identity.  V2 routes to the
+        # immutable EV-* identity while the rendered event retains session_id
+        # as an independent display/session field.
+        "SESSION_ID": routing_event_id,
         "BASE_COMMIT": base_commit,
         "BASE_BRANCH": base_branch,
     }
@@ -2980,7 +3033,7 @@ def build_new_iteration_operations(
         progress_index,
         progress.newline,
     )
-    event = f"""
+    legacy_event = f"""
 ## {session_id} / OPEN / {timestamp}
 
 - 关联：PRD-{number} / SPEC-{number}
@@ -2992,6 +3045,7 @@ def build_new_iteration_operations(
 - 关联偏差：无。
 - 未决问题与下一步：先解决决策性歧义；小且明确可同轮起草 PRD-{number}/SPEC-{number}，明确但不小则 PRD 先行，有歧义才 grill 用户。
 """
+    event = rendered_open_event if rendered_open_event is not None else legacy_event
     event = normalize_newlines(event.strip("\r\n"), progress.newline)
     separator = progress.newline if updated_progress.endswith(("\n", "\r")) else progress.newline * 2
     updated_progress = updated_progress + separator + event + progress.newline

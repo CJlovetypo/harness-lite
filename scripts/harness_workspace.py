@@ -26,13 +26,28 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+try:
+    from .harness_candidate import (
+        AcceptanceEvidence,
+        CandidateEvidence,
+        candidate_evidence_gate,
+    )
+except ImportError:  # pragma: no cover - direct script execution
+    from harness_candidate import AcceptanceEvidence, CandidateEvidence, candidate_evidence_gate
+
 
 PUBLIC_SCHEMA = "harness-lite.workspace-operation/v1"
 PLAN_SCHEMA = "harness-lite.workspace-plan/v1"
 JOURNAL_SCHEMA = "harness-lite.workspace-journal/v1"
-LEASE_SCHEMA = "harness-lite.writer-lease/v1"
+LEASE_SCHEMA = "harness-lite.writer-lease/v2"
+LEGACY_LEASE_SCHEMA = "harness-lite.writer-lease/v1"
 TOPOLOGY_SCHEMA = "harness-lite.workspace-topology/v1"
 ALLOCATION_SCHEMA = "harness-lite.allocation-metadata.v1"
+DEPENDENCY_BINDING_SCHEMA = "harness-lite.dependency-candidate-binding/v1"
+DEPENDENCY_REFRESH_PLAN_SCHEMA = "harness-lite.dependency-refresh-plan/v1"
+DEPENDENCY_REFRESH_JOURNAL_SCHEMA = "harness-lite.dependency-refresh-journal/v1"
+DEPENDENCY_REFRESH_RECEIPT_SCHEMA = "harness-lite.dependency-refresh-receipt/v1"
+CANDIDATE_EVIDENCE_METADATA_SCHEMA = "harness-lite.candidate-evidence-metadata/v1"
 
 OPERATION_ID_RE = re.compile(r"OP-[0-9a-f]{32}")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -45,6 +60,20 @@ MAX_PATH = 4096
 MAX_BIND_SNAPSHOT_FILES = 200_000
 MAX_BIND_SNAPSHOT_BYTES = 8 * 1024 * 1024 * 1024
 REGISTRY_PARTS = ("project-harness", "workspace", "v1")
+DEPENDENCY_BINDING_FIELDS = {
+    "schema_version",
+    "iteration",
+    "generation",
+    "candidate_ref",
+    "candidate_commit",
+    "candidate_tree",
+    "candidate_evidence_ref",
+    "candidate_evidence_blob",
+    "candidate_evidence_digest",
+    "candidate_evidence_metadata_digest",
+    "registration_digest",
+    "registry_digest",
+}
 EXCLUSIONS = (
     "no commit",
     "no push",
@@ -127,6 +156,41 @@ class WorkspacePlan:
             "warnings": list(self.warnings),
             "blocking_reasons": [item.as_dict() for item in self.blockers],
             "next_gate": "blocked" if self.blockers else f"apply-{self.action}",
+            "exclusions": list(EXCLUSIONS),
+        }
+
+
+@dataclass(frozen=True)
+class DependencyRefreshPlan:
+    manifest: dict[str, object]
+    digest: str
+    blockers: tuple[Blocker, ...] = ()
+
+    @property
+    def operation_id(self) -> str:
+        return str(self.manifest["operation_id"])
+
+    @property
+    def iteration(self) -> str:
+        return str(self.manifest["iteration"])
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": PUBLIC_SCHEMA,
+            "command": "refresh-dependencies",
+            "action_level": "notify",
+            "notification_phase": "before",
+            "pushed": False,
+            "project_root": self.manifest["project_root"],
+            "git_common_dir": self.manifest["git_common_dir"],
+            "operation_id": self.operation_id,
+            "iteration": self.iteration,
+            "phase": "blocked" if self.blockers else "planned",
+            "plan_digest": self.digest,
+            "notification": dependency_refresh_notification(self.manifest, phase="before"),
+            "warnings": [],
+            "blocking_reasons": [item.as_dict() for item in self.blockers],
+            "next_gate": "blocked" if self.blockers else "apply-refresh-dependencies",
             "exclusions": list(EXCLUSIONS),
         }
 
@@ -577,6 +641,531 @@ def ensure_commit(context: RepositoryContext, object_name: str) -> str:
     return commit
 
 
+def commit_tree(context: RepositoryContext, commit: str) -> str:
+    value = decode_stdout(
+        run_git(context, context.project_root, ["rev-parse", "--verify", f"{commit}^{{tree}}"])
+    )
+    if not OID_RE.fullmatch(value):
+        raise WorkspaceError(f"Git returned an invalid tree ID for commit {commit}")
+    return value
+
+
+def _dependency_generation(value: object) -> str:
+    candidate = str(value).strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", candidate):
+        raise WorkspaceError("dependency candidate generation is invalid")
+    return candidate
+
+
+def normalize_dependency_binding(value: object) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != DEPENDENCY_BINDING_FIELDS:
+        raise WorkspaceError("dependency candidate binding fields do not match the v1 schema")
+    normalized = {field: str(value[field]) for field in DEPENDENCY_BINDING_FIELDS}
+    if normalized["schema_version"] != DEPENDENCY_BINDING_SCHEMA:
+        raise WorkspaceError("dependency candidate binding schema is unsupported")
+    number = validate_iteration(normalized["iteration"])
+    generation = _dependency_generation(normalized["generation"])
+    expected_candidate = f"refs/project-harness/v2/iterations/{number}/candidates/{generation}"
+    expected_evidence = f"refs/project-harness/v2/iterations/{number}/candidate-evidence/{generation}"
+    if normalized["candidate_ref"] != expected_candidate:
+        raise WorkspaceError("dependency candidate ref does not match its iteration/generation")
+    if normalized["candidate_evidence_ref"] != expected_evidence:
+        raise WorkspaceError("dependency candidate evidence ref does not match its iteration/generation")
+    for field in ("candidate_commit", "candidate_tree", "candidate_evidence_blob"):
+        if not OID_RE.fullmatch(normalized[field]):
+            raise WorkspaceError(f"dependency binding {field} is not a full Git object ID")
+    for field in (
+        "candidate_evidence_digest",
+        "candidate_evidence_metadata_digest",
+        "registration_digest",
+        "registry_digest",
+    ):
+        if not DIGEST_RE.fullmatch(normalized[field]):
+            raise WorkspaceError(f"dependency binding {field} is not a SHA-256 digest")
+    return normalized
+
+
+def normalize_dependency_bindings(values: Sequence[Mapping[str, object]] | None) -> tuple[dict[str, str], ...]:
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in values or ():
+        binding = normalize_dependency_binding(raw)
+        number = binding["iteration"]
+        if number in seen:
+            raise WorkspaceError(f"dependency candidate binding is duplicated: PRD-{number}")
+        seen.add(number)
+        normalized.append(binding)
+    return tuple(normalized)
+
+
+def dependency_bindings_digest(values: Sequence[Mapping[str, object]]) -> str:
+    return digest([dict(item) for item in values])
+
+
+def dependency_registry_snapshot(context: RepositoryContext, iteration: str) -> dict[str, object]:
+    number = validate_iteration(iteration)
+    prefixes = (
+        f"refs/project-harness/v2/iterations/{number}/candidates/",
+        f"refs/project-harness/v2/iterations/{number}/candidate-evidence/",
+    )
+    result = run_git(
+        context,
+        context.project_root,
+        ["for-each-ref", "--format=%(refname)%00%(objectname)", *prefixes],
+    )
+    entries: list[dict[str, str]] = []
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        try:
+            raw_ref, raw_oid = line.split(b"\0", 1)
+            reference = raw_ref.decode("utf-8", errors="strict")
+            oid = raw_oid.decode("ascii", errors="strict")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise WorkspaceError("Git returned a malformed dependency candidate ref") from exc
+        if not reference.startswith(prefixes) or not OID_RE.fullmatch(oid):
+            raise WorkspaceError("Git returned an invalid dependency candidate ref identity")
+        entries.append({"ref": reference, "oid": oid})
+    entries.sort(key=lambda item: item["ref"])
+    return {"iteration": number, "refs": entries, "digest": digest(entries)}
+
+
+def _candidate_evidence_from_mapping(value: object) -> CandidateEvidence:
+    if not isinstance(value, Mapping):
+        raise WorkspaceError("dependency candidate core evidence is not an object")
+    expected = {
+        "schema_version",
+        "iteration",
+        "generation",
+        "base_commit",
+        "candidate_commit",
+        "candidate_tree",
+        "principle_sha256",
+        "included_paths",
+        "acceptance_ids",
+        "acceptance_evidence",
+        "verification_ids",
+        "evidence_digest",
+        "verified",
+        "blockers",
+    }
+    if set(value) != expected:
+        raise WorkspaceError("dependency candidate core evidence fields are invalid")
+    acceptance_raw = value.get("acceptance_evidence")
+    if not isinstance(acceptance_raw, list):
+        raise WorkspaceError("dependency candidate acceptance evidence is invalid")
+    acceptance: list[AcceptanceEvidence] = []
+    for item in acceptance_raw:
+        if not isinstance(item, Mapping) or set(item) != {
+            "acceptance_id",
+            "evidence_ids",
+            "verification_ids",
+        }:
+            raise WorkspaceError("dependency candidate acceptance receipt is invalid")
+        evidence_ids = item.get("evidence_ids")
+        verification_ids = item.get("verification_ids")
+        if (
+            not isinstance(evidence_ids, list)
+            or not all(isinstance(entry, str) for entry in evidence_ids)
+            or not isinstance(verification_ids, list)
+            or not all(isinstance(entry, str) for entry in verification_ids)
+        ):
+            raise WorkspaceError("dependency candidate acceptance receipt IDs are invalid")
+        acceptance.append(
+            AcceptanceEvidence(
+                acceptance_id=str(item.get("acceptance_id", "")),
+                evidence_ids=tuple(evidence_ids),
+                verification_ids=tuple(verification_ids),
+            )
+        )
+    sequences: dict[str, tuple[str, ...]] = {}
+    for field in ("included_paths", "acceptance_ids", "verification_ids", "blockers"):
+        raw = value.get(field)
+        if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+            raise WorkspaceError(f"dependency candidate core evidence {field} is invalid")
+        sequences[field] = tuple(raw)
+    candidate = CandidateEvidence(
+        schema_version=str(value.get("schema_version", "")),
+        iteration=str(value.get("iteration", "")),
+        generation=str(value.get("generation", "")),
+        base_commit=str(value.get("base_commit", "")),
+        candidate_commit=str(value.get("candidate_commit", "")),
+        candidate_tree=str(value.get("candidate_tree", "")),
+        principle_sha256=str(value.get("principle_sha256", "")),
+        included_paths=sequences["included_paths"],
+        acceptance_ids=sequences["acceptance_ids"],
+        acceptance_evidence=tuple(acceptance),
+        verification_ids=sequences["verification_ids"],
+        evidence_digest=str(value.get("evidence_digest", "")),
+        verified=value.get("verified") is True,
+        blockers=sequences["blockers"],
+    )
+    gate = candidate_evidence_gate(candidate)
+    if not gate.allowed:
+        raise WorkspaceError("dependency candidate core evidence is not verified: " + ", ".join(gate.blockers))
+    return candidate
+
+
+def dependency_binding_live_blockers(
+    context: RepositoryContext,
+    binding: Mapping[str, object],
+    *,
+    check_registry: bool = True,
+) -> list[Blocker]:
+    try:
+        normalized = normalize_dependency_binding(binding)
+    except WorkspaceError as exc:
+        return [Blocker("dependency-binding-invalid", str(exc))]
+    number = normalized["iteration"]
+    blockers: list[Blocker] = []
+    if ref_oid(context, normalized["candidate_ref"]) != normalized["candidate_commit"]:
+        blockers.append(
+            Blocker("dependency-candidate-ref-drift", f"PRD-{number} candidate ref identity changed")
+        )
+    try:
+        if commit_tree(context, normalized["candidate_commit"]) != normalized["candidate_tree"]:
+            blockers.append(
+                Blocker("dependency-candidate-tree-drift", f"PRD-{number} candidate tree identity changed")
+            )
+    except WorkspaceError as exc:
+        blockers.append(Blocker("dependency-candidate-object-invalid", str(exc)))
+    if ref_oid(context, normalized["candidate_evidence_ref"]) != normalized["candidate_evidence_blob"]:
+        blockers.append(
+            Blocker("dependency-candidate-evidence-ref-drift", f"PRD-{number} evidence ref identity changed")
+        )
+    metadata: object | None = None
+    object_type = run_git(
+        context,
+        context.project_root,
+        ["cat-file", "-t", normalized["candidate_evidence_blob"]],
+        check=False,
+    )
+    if object_type.returncode != 0 or decode_stdout(object_type) != "blob":
+        blockers.append(
+            Blocker("dependency-candidate-evidence-object-invalid", f"PRD-{number} evidence object is not a blob")
+        )
+    else:
+        raw = run_git(
+            context,
+            context.project_root,
+            ["cat-file", "blob", normalized["candidate_evidence_blob"]],
+        ).stdout
+        if not raw or len(raw) > MAX_JSON_BYTES:
+            blockers.append(
+                Blocker("dependency-candidate-evidence-size", f"PRD-{number} evidence blob size is invalid")
+            )
+        else:
+            try:
+                metadata = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                blockers.append(
+                    Blocker("dependency-candidate-evidence-json", f"PRD-{number} evidence blob is invalid JSON")
+                )
+    candidate: CandidateEvidence | None = None
+    if isinstance(metadata, dict):
+        supplied_digest = metadata.get("metadata_digest")
+        metadata_payload = dict(metadata)
+        metadata_payload.pop("metadata_digest", None)
+        expected_metadata_digest = digest(metadata_payload)
+        identity_matches = (
+            metadata.get("schema_version") == CANDIDATE_EVIDENCE_METADATA_SCHEMA
+            and metadata.get("iteration") == number
+            and metadata.get("generation") == normalized["generation"]
+            and metadata.get("candidate_ref") == normalized["candidate_ref"]
+            and metadata.get("candidate_evidence_ref") == normalized["candidate_evidence_ref"]
+            and metadata.get("seal_commit") == normalized["candidate_commit"]
+            and metadata.get("seal_tree") == normalized["candidate_tree"]
+            and supplied_digest == normalized["candidate_evidence_metadata_digest"]
+            and supplied_digest == expected_metadata_digest
+        )
+        if not identity_matches:
+            blockers.append(
+                Blocker("dependency-candidate-evidence-identity", f"PRD-{number} evidence metadata differs")
+            )
+        try:
+            candidate = _candidate_evidence_from_mapping(metadata.get("candidate_evidence"))
+        except WorkspaceError as exc:
+            blockers.append(Blocker("dependency-candidate-evidence-core", str(exc)))
+        else:
+            if (
+                candidate.iteration != number
+                or candidate.generation != normalized["generation"]
+                or candidate.candidate_commit != normalized["candidate_commit"]
+                or candidate.candidate_tree != normalized["candidate_tree"]
+                or candidate.evidence_digest != normalized["candidate_evidence_digest"]
+            ):
+                blockers.append(
+                    Blocker("dependency-candidate-evidence-core-identity", f"PRD-{number} core evidence differs")
+                )
+    elif metadata is not None:
+        blockers.append(
+            Blocker("dependency-candidate-evidence-json", f"PRD-{number} evidence blob is not an object")
+        )
+    if candidate is not None:
+        try:
+            try:
+                from . import harness_train as train
+            except ImportError:  # pragma: no cover - direct script execution
+                import harness_train as train
+            registered, registration_blockers = train.load_registered_candidate(
+                context.project_root,
+                iteration=number,
+                generation=normalized["generation"],
+                current_principle_sha256=candidate.principle_sha256,
+            )
+        except (ImportError, AttributeError, RuntimeError, ValueError) as exc:
+            blockers.append(
+                Blocker("dependency-candidate-registration-unreadable", f"PRD-{number}: {exc}")
+            )
+        else:
+            blockers.extend(
+                Blocker(
+                    "dependency-candidate-registration-invalid",
+                    f"PRD-{number}: {item.code}: {item.message}",
+                )
+                for item in registration_blockers
+            )
+            if registered is None:
+                blockers.append(
+                    Blocker(
+                        "dependency-candidate-registration-missing",
+                        f"PRD-{number} has no exact registered stable candidate",
+                    )
+                )
+            elif (
+                registered.candidate_ref != normalized["candidate_ref"]
+                or registered.candidate_commit != normalized["candidate_commit"]
+                or registered.candidate_tree != normalized["candidate_tree"]
+                or registered.candidate_evidence_ref != normalized["candidate_evidence_ref"]
+                or registered.candidate_evidence_blob != normalized["candidate_evidence_blob"]
+                or registered.candidate_evidence.evidence_digest != normalized["candidate_evidence_digest"]
+                or registered.candidate_evidence_metadata_digest
+                != normalized["candidate_evidence_metadata_digest"]
+                or registered.registration_digest != normalized["registration_digest"]
+            ):
+                blockers.append(
+                    Blocker(
+                        "dependency-candidate-registration-identity",
+                        f"PRD-{number} registered candidate differs from the bound identity",
+                    )
+                )
+    if check_registry:
+        try:
+            registry = dependency_registry_snapshot(context, number)
+        except WorkspaceError as exc:
+            blockers.append(Blocker("dependency-candidate-registry-unreadable", str(exc)))
+        else:
+            if registry["digest"] != normalized["registry_digest"]:
+                blockers.append(
+                    Blocker(
+                        "dependency-baseline-stale",
+                        f"PRD-{number} candidate generation/ref/evidence registry changed; refresh is required",
+                    )
+                )
+    return blockers
+
+
+def dependency_order_blockers(
+    context: RepositoryContext,
+    bindings: Sequence[Mapping[str, object]],
+) -> list[Blocker]:
+    blockers: list[Blocker] = []
+    for binding in bindings:
+        blockers.extend(dependency_binding_live_blockers(context, binding))
+    for previous, current in zip(bindings, bindings[1:]):
+        if not is_ancestor(context, str(previous["candidate_commit"]), str(current["candidate_commit"])):
+            blockers.append(
+                Blocker(
+                    "dependency-order-not-stacked",
+                    f"PRD-{previous['iteration']} candidate is not an ancestor of declared next dependency PRD-{current['iteration']}",
+                )
+            )
+    return blockers
+
+
+def _normalize_refresh_commands(values: Sequence[Mapping[str, object]]) -> tuple[dict[str, object], ...]:
+    normalized: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, Mapping) or set(value) != {"evidence_id", "argv"}:
+            raise WorkspaceError("dependency refresh verification command fields are invalid")
+        evidence_id = validate_label(str(value.get("evidence_id", "")), "verification evidence ID")
+        argv = value.get("argv")
+        if not isinstance(argv, (list, tuple)) or not argv or not all(
+            isinstance(item, str) and item and "\x00" not in item for item in argv
+        ):
+            raise WorkspaceError(f"dependency refresh verification command is invalid: {evidence_id}")
+        if evidence_id in seen:
+            raise WorkspaceError(f"dependency refresh verification evidence ID is duplicated: {evidence_id}")
+        seen.add(evidence_id)
+        normalized.append({"evidence_id": evidence_id, "argv": list(argv)})
+    if not normalized:
+        raise WorkspaceError("dependency refresh requires at least one executable verification command")
+    return tuple(normalized)
+
+
+def dependency_refresh_root(context: RepositoryContext) -> Path:
+    return registry_root(context) / "dependency-refresh"
+
+
+def dependency_refresh_journal_path(context: RepositoryContext, operation_id: str) -> Path:
+    path = dependency_refresh_root(context) / "journal" / f"refresh-{validate_operation_id(operation_id)}.json"
+    assert_operational_path(context, path)
+    return path
+
+
+def dependency_refresh_receipt_path(context: RepositoryContext, operation_id: str) -> Path:
+    path = dependency_refresh_root(context) / "receipts" / f"refresh-{validate_operation_id(operation_id)}.json"
+    assert_operational_path(context, path)
+    return path
+
+
+def _worktree_head_and_tree(context: RepositoryContext, target: Path) -> tuple[str, str]:
+    head = ensure_commit(context, decode_stdout(run_git(context, target, ["rev-parse", "HEAD"])))
+    tree = commit_tree(context, head)
+    return head, tree
+
+
+def dependency_refresh_notification(manifest: Mapping[str, object], *, phase: str) -> dict[str, object]:
+    return {
+        "prd": f"PRD-{manifest['iteration']}",
+        "reason_code": "dependency-baseline-stale-refresh",
+        "reason": "replace only the explicitly reviewed dependency candidate binding after the workspace already contains and revalidates that candidate",
+        "phase": phase,
+        "worktree_path": manifest.get("worktree_path"),
+        "branch_ref": manifest.get("branch_ref"),
+        "head_commit": manifest.get("worktree_head"),
+        "before_bindings": manifest.get("before_bindings"),
+        "after_bindings": manifest.get("after_bindings"),
+        "verification_commands": manifest.get("verification_commands"),
+        "will_switch_branch": False,
+        "will_move_worktree": False,
+        "will_commit": False,
+        "will_stash": False,
+        "remote": {"involved": False, "pushed": False, "force": False},
+    }
+
+
+def build_dependency_refresh_plan(
+    project_root: str | Path,
+    *,
+    iteration: str,
+    owner: str,
+    lease_generation: int,
+    worktree_path: str | Path,
+    branch_ref: str,
+    base_commit: str,
+    dependency_bindings: Sequence[Mapping[str, object]],
+    verification_commands: Sequence[Mapping[str, object]],
+    operation_id: str | None = None,
+) -> DependencyRefreshPlan:
+    context = resolve_repository(project_root)
+    number = validate_iteration(iteration)
+    operation = validate_operation_id(operation_id) if operation_id else new_operation_id()
+    target = Path(worktree_path).expanduser()
+    if not target.is_absolute():
+        raise WorkspaceError("dependency refresh worktree path must be absolute")
+    target = target.resolve(strict=False)
+    branch = validate_branch_ref(context, branch_ref)
+    generation = validate_generation(lease_generation)
+    owner_value = validate_label(owner, "writer owner")
+    if not OID_RE.fullmatch(base_commit):
+        raise WorkspaceError("dependency refresh base commit is invalid")
+    after_bindings = normalize_dependency_bindings(dependency_bindings)
+    commands = _normalize_refresh_commands(verification_commands)
+    blockers: list[Blocker] = dependency_order_blockers(context, after_bindings)
+    lease = load_lease(context, number)
+    if lease is None:
+        raise WorkspaceError(f"PRD-{number} has no active writer lease")
+    guard_blockers, actual = guard_lease(
+        context,
+        lease,
+        owner=owner_value,
+        generation=generation,
+        worktree_path=target,
+        branch_ref=branch,
+        base_commit=base_commit,
+    )
+    blockers.extend(item for item in guard_blockers if not item.code.startswith("dependency-"))
+    before_bindings = normalize_dependency_bindings(lease.get("dependency_bindings", []))
+    if not before_bindings:
+        blockers.append(Blocker("dependency-refresh-independent", "an independent workspace has no dependency baseline"))
+    if tuple(item["iteration"] for item in before_bindings) != tuple(
+        item["iteration"] for item in after_bindings
+    ):
+        blockers.append(
+            Blocker(
+                "dependency-refresh-scope-change",
+                "refresh cannot add, remove, or reorder PRD dependencies; revise the approved PRD instead",
+            )
+        )
+    if [dict(item) for item in before_bindings] == [dict(item) for item in after_bindings]:
+        blockers.append(Blocker("dependency-refresh-no-change", "dependency baseline is already exact"))
+    if not isinstance(actual, Mapping) or actual.get("present") is not True:
+        blockers.append(Blocker("dependency-refresh-worktree-missing", "writer worktree is not registered"))
+        head, tree = base_commit, commit_tree(context, base_commit)
+    else:
+        head = str(actual.get("head_oid", ""))
+        if not OID_RE.fullmatch(head):
+            blockers.append(Blocker("dependency-refresh-head-invalid", "writer HEAD is unavailable"))
+            head = base_commit
+        tree = commit_tree(context, head)
+    for binding in after_bindings:
+        if not is_ancestor(context, binding["candidate_commit"], head):
+            blockers.append(
+                Blocker(
+                    "dependency-refresh-candidate-not-contained",
+                    f"writer HEAD does not contain PRD-{binding['iteration']} candidate {binding['generation']}",
+                )
+            )
+    status = status_fingerprint(context, target)
+    if status.get("readable") is not True or any(
+        int(status.get(field, 0) or 0) for field in ("tracked", "untracked")
+    ):
+        blockers.append(
+            Blocker(
+                "dependency-refresh-worktree-dirty",
+                "dependency refresh requires a clean tracked/untracked worktree for exact revalidation",
+            )
+        )
+    before_lease = lease_projection(lease)
+    after_lease = dict(before_lease)
+    after_lease["generation"] = generation + 1
+    after_lease["implementation_ref"] = after_bindings[-1]["candidate_ref"] if after_bindings else "refs/heads/main"
+    after_lease["implementation_commit"] = (
+        after_bindings[-1]["candidate_commit"] if after_bindings else lease["implementation_commit"]
+    )
+    after_lease["dependency_bindings"] = [dict(item) for item in after_bindings]
+    after_lease["dependency_bindings_digest"] = dependency_bindings_digest(after_bindings)
+    after_lease["dependency_refresh_generation"] = int(lease.get("dependency_refresh_generation", 0)) + 1
+    manifest: dict[str, object] = {
+        "schema_version": DEPENDENCY_REFRESH_PLAN_SCHEMA,
+        "operation_id": operation,
+        "project_root": str(context.project_root),
+        "git_common_dir": str(context.common_dir),
+        "iteration": number,
+        "owner": owner_value,
+        "lease_generation": generation,
+        "worktree_path": str(target),
+        "branch_ref": branch,
+        "base_commit": base_commit,
+        "worktree_head": head,
+        "worktree_tree": tree,
+        "status_fingerprint": status,
+        "before_bindings": [dict(item) for item in before_bindings],
+        "after_bindings": [dict(item) for item in after_bindings],
+        "before_lease": before_lease,
+        "before_lease_digest": digest(lease),
+        "after_lease": after_lease,
+        "verification_commands": [dict(item) for item in commands],
+    }
+    return DependencyRefreshPlan(
+        manifest=manifest,
+        digest=digest(manifest),
+        blockers=tuple(dict.fromkeys(blockers)),
+    )
+
+
 def read_json_blob(context: RepositoryContext, object_name: str) -> dict[str, object]:
     object_type = decode_stdout(run_git(context, context.project_root, ["cat-file", "-t", object_name]))
     if object_type != "blob":
@@ -799,7 +1388,7 @@ def coordinator_lock(context: RepositoryContext, *, timeout_seconds: float = 30.
         handle.close()
 
 
-LEASE_FIELDS = {
+LEGACY_LEASE_FIELDS = {
     "schema_version",
     "scope",
     "state",
@@ -819,12 +1408,25 @@ LEASE_FIELDS = {
     "heartbeat",
 }
 
+LEASE_FIELDS = LEGACY_LEASE_FIELDS | {
+    "implementation_ref",
+    "implementation_commit",
+    "dependency_bindings",
+    "dependency_bindings_digest",
+    "dependency_refresh_generation",
+}
+
 
 def validate_lease(value: object, *, source: Path) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) != LEASE_FIELDS:
+    if not isinstance(value, dict) or set(value) not in {frozenset(LEASE_FIELDS), frozenset(LEGACY_LEASE_FIELDS)}:
         raise WorkspaceError(f"writer lease fields do not match the v1 schema: {source}")
-    if value.get("schema_version") != LEASE_SCHEMA or value.get("scope") != "iteration-writer":
+    schema = value.get("schema_version")
+    if schema not in {LEASE_SCHEMA, LEGACY_LEASE_SCHEMA} or value.get("scope") != "iteration-writer":
         raise WorkspaceError(f"unsupported writer lease schema: {source}")
+    if schema == LEASE_SCHEMA and set(value) != LEASE_FIELDS:
+        raise WorkspaceError(f"writer lease v2 fields are incomplete: {source}")
+    if schema == LEGACY_LEASE_SCHEMA and set(value) != LEGACY_LEASE_FIELDS:
+        raise WorkspaceError(f"writer lease v1 fields are invalid: {source}")
     if value.get("state") != "active":
         raise WorkspaceError(f"active lease registry contains a non-active lease: {source}")
     validate_iteration(str(value.get("iteration", "")))
@@ -855,7 +1457,48 @@ def validate_lease(value: object, *, source: Path) -> dict[str, object]:
     validate_label(str(value.get("runtime_namespace", "")), "runtime namespace")
     for field in ("acquired_at", "heartbeat"):
         validate_label(str(value.get(field, "")), field, max_length=80)
-    return dict(value)
+    normalized = dict(value)
+    if schema == LEGACY_LEASE_SCHEMA:
+        normalized.update(
+            {
+                "schema_version": LEASE_SCHEMA,
+                "implementation_ref": "refs/heads/main",
+                "implementation_commit": value["base_commit"],
+                "dependency_bindings": [],
+                "dependency_bindings_digest": dependency_bindings_digest(()),
+                "dependency_refresh_generation": 0,
+            }
+        )
+        return normalized
+    implementation_ref = value.get("implementation_ref")
+    implementation_commit = value.get("implementation_commit")
+    if not isinstance(implementation_ref, str) or not (
+        implementation_ref == "refs/heads/main"
+        or implementation_ref.startswith("refs/project-harness/v2/iterations/")
+    ):
+        raise WorkspaceError(f"writer lease implementation_ref is invalid: {source}")
+    if not isinstance(implementation_commit, str) or not OID_RE.fullmatch(implementation_commit):
+        raise WorkspaceError(f"writer lease implementation_commit is invalid: {source}")
+    raw_dependencies = value.get("dependency_bindings")
+    if not isinstance(raw_dependencies, list):
+        raise WorkspaceError(f"writer lease dependency_bindings are invalid: {source}")
+    dependencies = normalize_dependency_bindings(raw_dependencies)
+    if value.get("dependency_bindings_digest") != dependency_bindings_digest(dependencies):
+        raise WorkspaceError(f"writer lease dependency binding digest differs: {source}")
+    refresh_generation = value.get("dependency_refresh_generation")
+    if not isinstance(refresh_generation, int) or refresh_generation < 0 or refresh_generation > 2_147_483_647:
+        raise WorkspaceError(f"writer lease dependency refresh generation is invalid: {source}")
+    if dependencies:
+        last = dependencies[-1]
+        if implementation_ref != last["candidate_ref"] or implementation_commit != last["candidate_commit"]:
+            # The original start remains immutable after an explicit refresh.
+            # A refreshed binding can therefore differ only once generation > 0.
+            if refresh_generation == 0:
+                raise WorkspaceError(f"writer lease implementation start differs from dependency baseline: {source}")
+    elif implementation_ref != "refs/heads/main":
+        raise WorkspaceError(f"independent writer lease implementation ref must be main: {source}")
+    normalized["dependency_bindings"] = [dict(item) for item in dependencies]
+    return normalized
 
 
 def load_lease(context: RepositoryContext, iteration: str) -> dict[str, object] | None:
@@ -1024,6 +1667,13 @@ def lease_projection(lease: Mapping[str, object]) -> dict[str, object]:
         "branch_ref": lease.get("branch_ref"),
         "base_ref": lease.get("base_ref"),
         "base_commit": lease.get("base_commit"),
+        "implementation_ref": lease.get("implementation_ref"),
+        "implementation_commit": lease.get("implementation_commit"),
+        "dependency_bindings": [
+            dict(item) for item in lease.get("dependency_bindings", []) if isinstance(item, Mapping)
+        ],
+        "dependency_bindings_digest": lease.get("dependency_bindings_digest"),
+        "dependency_refresh_generation": lease.get("dependency_refresh_generation"),
         "principle_sha256": lease.get("principle_sha256"),
         "runtime_namespace": lease.get("runtime_namespace"),
         "heartbeat": lease.get("heartbeat"),
@@ -1041,6 +1691,11 @@ LEASE_PROJECTION_FIELDS = {
     "branch_ref",
     "base_ref",
     "base_commit",
+    "implementation_ref",
+    "implementation_commit",
+    "dependency_bindings",
+    "dependency_bindings_digest",
+    "dependency_refresh_generation",
     "principle_sha256",
     "runtime_namespace",
     "heartbeat",
@@ -1130,6 +1785,25 @@ def guard_lease(
     current_base = ref_oid(context, str(lease["base_ref"]))
     if current_base != lease["base_commit"]:
         blockers.append(Blocker("base-anchor-drift", "immutable iteration base ref no longer matches the lease"))
+    raw_bindings = lease.get("dependency_bindings", [])
+    if not isinstance(raw_bindings, list):
+        blockers.append(Blocker("dependency-binding-invalid", "writer lease dependency bindings are unreadable"))
+        bindings: tuple[dict[str, str], ...] = ()
+    else:
+        try:
+            bindings = normalize_dependency_bindings(raw_bindings)
+        except WorkspaceError as exc:
+            blockers.append(Blocker("dependency-binding-invalid", str(exc)))
+            bindings = ()
+    dependency_blockers = dependency_order_blockers(context, bindings)
+    blockers.extend(dependency_blockers)
+    if dependency_blockers and not any(item.code == "dependency-baseline-stale" for item in dependency_blockers):
+        blockers.append(
+            Blocker(
+                "dependency-baseline-stale",
+                "one or more exact dependency candidate identities changed; explicit refresh/revalidation is required",
+            )
+        )
     worktrees = list_worktrees(context, include_status=True)
     actual = next((item for item in worktrees if same_path(str(item["path"]), expected_path)), None)
     if actual is None:
@@ -1145,6 +1819,15 @@ def guard_lease(
             blockers.append(Blocker("actual-head-invalid", "worktree HEAD identity is unavailable"))
         elif not is_ancestor(context, str(lease["base_commit"]), head):
             blockers.append(Blocker("actual-base-diverged", "worktree HEAD does not descend from its immutable base"))
+        else:
+            implementation_commit = str(lease.get("implementation_commit", lease["base_commit"]))
+            if not is_ancestor(context, implementation_commit, head):
+                blockers.append(
+                    Blocker(
+                        "actual-implementation-start-diverged",
+                        "worktree HEAD no longer descends from its exact implementation start",
+                    )
+                )
         markers = operation_markers(context, expected_path) if expected_path.is_dir() else []
         if markers:
             blockers.append(
@@ -1183,6 +1866,7 @@ def build_activation_plan(
     worktree_path: str | Path,
     owner: str,
     lease_generation: int,
+    dependency_bindings: Sequence[Mapping[str, object]] = (),
     operation_id: str | None = None,
 ) -> WorkspacePlan:
     context = resolve_repository(project_root)
@@ -1196,9 +1880,27 @@ def build_activation_plan(
     branch = validate_branch_ref(context, branch_ref)
     allocation_ref, allocation_object, metadata = load_allocation(context, number, base_ref)
     base_commit = str(metadata["base_commit"])
+    dependencies = normalize_dependency_bindings(dependency_bindings)
+    if dependencies:
+        implementation_ref = dependencies[-1]["candidate_ref"]
+        implementation_commit = dependencies[-1]["candidate_commit"]
+    else:
+        implementation_ref = "refs/heads/main"
+        implementation_commit = ref_oid(context, implementation_ref)
+        if implementation_commit is None:
+            raise WorkspaceError("canonical main implementation start ref is missing")
     existing_worktrees = list_worktrees(context, include_status=True)
     active_leases, lease_errors = load_active_leases(context)
     blockers: list[Blocker] = list(lease_errors)
+    dependency_blockers = dependency_order_blockers(context, dependencies)
+    blockers.extend(dependency_blockers)
+    if dependency_blockers:
+        blockers.append(
+            Blocker(
+                "dependency-baseline-stale",
+                "the exact stable dependency candidate changed before activation",
+            )
+        )
     # A new writer must not use a broken existing writer as proof that the
     # repository is safely parallel.  Validate every active lease before any
     # branch, path, or journal can be created.
@@ -1230,11 +1932,23 @@ def build_activation_plan(
             blockers.append(Blocker("local-path-mismatch", "Local workspace must remain at the primary checkout"))
         if active_leases:
             blockers.append(Blocker("local-requires-idle", "Local activation is allowed only when no writer is active"))
+        if dependencies:
+            blockers.append(
+                Blocker(
+                    "stacked-requires-worktree",
+                    "an implementation that consumes a stable dependency candidate must use a linked worktree",
+                )
+            )
         primary = existing_worktrees[0]
         if primary.get("branch_ref") != branch:
             blockers.append(Blocker("local-branch-mismatch", "primary checkout is attached to a different branch"))
-        if primary.get("head_oid") != base_commit:
-            blockers.append(Blocker("local-base-mismatch", "primary checkout HEAD does not equal the iteration base"))
+        if primary.get("head_oid") != implementation_commit:
+            blockers.append(
+                Blocker(
+                    "local-implementation-start-mismatch",
+                    "primary checkout HEAD does not equal the accepted latest-main implementation start",
+                )
+            )
         primary_status = primary.get("status")
         if not isinstance(primary_status, Mapping) or not primary_status.get("readable"):
             blockers.append(Blocker("local-status-unreadable", "primary checkout status could not be read"))
@@ -1246,7 +1960,7 @@ def build_activation_plan(
                 )
             )
     else:
-        if not active_leases:
+        if not active_leases and not dependencies:
             blockers.append(
                 Blocker(
                     "worktree-requires-existing-writer",
@@ -1265,6 +1979,13 @@ def build_activation_plan(
         existing_branch = ref_oid(context, branch)
         if existing_branch is not None:
             blockers.append(Blocker("branch-already-exists", f"planned PRD branch already exists: {branch}"))
+    if not is_ancestor(context, base_commit, implementation_commit):
+        blockers.append(
+            Blocker(
+                "implementation-start-not-descendant",
+                "latest main no longer descends from the immutable PRD creation baseline",
+            )
+        )
 
     journal = operation_path(context, operation)
     if journal.exists():
@@ -1282,6 +2003,10 @@ def build_activation_plan(
         "base": {
             "ref": base_ref,
             "commit": base_commit,
+            "implementation_ref": implementation_ref,
+            "implementation_commit": implementation_commit,
+            "dependency_bindings": [dict(item) for item in dependencies],
+            "dependency_bindings_digest": dependency_bindings_digest(dependencies),
             "allocation_ref": allocation_ref,
             "allocation_object": allocation_object,
             "principle_sha256": metadata["principle_sha256"],
@@ -1446,10 +2171,6 @@ def build_bind_local_branch_plan(
             blockers.append(Blocker("allocation-base-mismatch", "Local allocation differs from the requested base"))
     except WorkspaceError as exc:
         blockers.append(Blocker("allocation-invalid", str(exc)))
-    if ref_oid(context, "refs/heads/main") != base_commit:
-        blockers.append(Blocker("main-ref-drift", "refs/heads/main no longer equals the Local committed base"))
-    if actual.get("head_oid") != base_commit:
-        blockers.append(Blocker("local-head-drift", "Local HEAD no longer equals its committed base"))
     if ref_oid(context, new_branch) is not None:
         blockers.append(Blocker("branch-already-exists", f"Local release branch already exists: {new_branch}"))
     if any(item.get("branch_ref") == new_branch for item in leases):
@@ -1457,6 +2178,16 @@ def build_bind_local_branch_plan(
     if operation_path(context, operation).exists():
         blockers.append(Blocker("operation-id-already-used", f"workspace operation already exists: {operation}"))
     source_snapshot = local_binding_snapshot(context)
+    binding_commit = source_snapshot.get("head_oid")
+    if not isinstance(binding_commit, str) or not OID_RE.fullmatch(binding_commit):
+        blockers.append(Blocker("local-head-invalid", "Local HEAD identity is unavailable for branch binding"))
+        binding_commit = base_commit
+    elif not is_ancestor(context, base_commit, binding_commit):
+        blockers.append(Blocker("local-base-diverged", "Local HEAD no longer descends from its immutable baseline"))
+    if ref_oid(context, "refs/heads/main") != binding_commit:
+        blockers.append(Blocker("main-ref-drift", "refs/heads/main no longer equals the Local committed HEAD"))
+    if actual.get("head_oid") != binding_commit:
+        blockers.append(Blocker("local-head-drift", "Local HEAD differs from the committed main identity"))
     lease_before = lease_projection(lease)
     lease_after = dict(lease_before)
     lease_after["operation_id"] = operation
@@ -1499,15 +2230,32 @@ def notification_before(manifest: Mapping[str, object]) -> dict[str, object]:
     worktree = dict(manifest["worktree"])  # type: ignore[arg-type]
     preconditions = dict(manifest["preconditions"])  # type: ignore[arg-type]
     existing = preconditions.get("existing_worktrees", [])
+    dependency_bindings = base.get("dependency_bindings")
+    stacked = isinstance(dependency_bindings, list) and bool(dependency_bindings)
     return {
         "prd": f"PRD-{manifest['iteration']}",
-        "reason_code": "parallel-prd-lazy-worktree" if topology == "worktree" else "single-active-prd-local",
+        "reason_code": (
+            "stable-dependency-stacked-worktree"
+            if stacked
+            else "parallel-prd-lazy-worktree"
+            if topology == "worktree"
+            else "single-active-prd-local"
+        ),
         "reason": (
-            "another writable PRD is already active, so this PRD receives an independent linked worktree"
+            "this PRD consumes exact stable dependency candidates, so it receives a stacked linked worktree"
+            if stacked
+            else "another writable PRD is already active, so this PRD receives an independent linked worktree"
             if topology == "worktree"
             else "this is the only writable PRD, so it stays in the primary checkout"
         ),
-        "base": {"ref": base.get("ref"), "commit": base.get("commit")},
+        "base": {
+            "ref": base.get("ref"),
+            "commit": base.get("commit"),
+            "implementation_ref": base.get("implementation_ref"),
+            "implementation_commit": base.get("implementation_commit"),
+            "dependency_bindings": base.get("dependency_bindings"),
+            "dependency_bindings_digest": base.get("dependency_bindings_digest"),
+        },
         "branch": {"ref": branch.get("ref"), "will_create": bool(branch.get("create"))},
         "worktree": {"path": worktree.get("path"), "will_create": bool(worktree.get("create"))},
         "effect_on_existing_prds": {
@@ -1669,7 +2417,17 @@ def validate_manifest(value: object) -> dict[str, object]:
     expected_base_fields = (
         {"ref", "commit"}
         if action in {"release-writer", "bind-local-branch"}
-        else {"ref", "commit", "allocation_ref", "allocation_object", "principle_sha256"}
+        else {
+            "ref",
+            "commit",
+            "implementation_ref",
+            "implementation_commit",
+            "dependency_bindings",
+            "dependency_bindings_digest",
+            "allocation_ref",
+            "allocation_object",
+            "principle_sha256",
+        }
     )
     if action == "release-writer":
         expected_precondition_fields = {"writer_lease", "existing_worktrees", "strategy"}
@@ -1728,6 +2486,22 @@ def validate_manifest(value: object) -> dict[str, object]:
             str(base["principle_sha256"])
         ):
             raise WorkspaceError("workspace operation manifest principle hash is invalid")
+        raw_dependencies = base.get("dependency_bindings")
+        if not isinstance(raw_dependencies, list):
+            raise WorkspaceError("workspace operation manifest dependency bindings are invalid")
+        dependencies = normalize_dependency_bindings(raw_dependencies)
+        if base.get("dependency_bindings_digest") != dependency_bindings_digest(dependencies):
+            raise WorkspaceError("workspace operation manifest dependency binding digest differs")
+        expected_implementation_ref = dependencies[-1]["candidate_ref"] if dependencies else "refs/heads/main"
+        expected_implementation_commit = dependencies[-1]["candidate_commit"] if dependencies else None
+        if base.get("implementation_ref") != expected_implementation_ref:
+            raise WorkspaceError("workspace operation manifest implementation start ref is invalid")
+        if not isinstance(base.get("implementation_commit"), str) or not OID_RE.fullmatch(
+            str(base["implementation_commit"])
+        ):
+            raise WorkspaceError("workspace operation manifest implementation start commit is invalid")
+        if expected_implementation_commit is not None and base.get("implementation_commit") != expected_implementation_commit:
+            raise WorkspaceError("workspace operation manifest implementation start differs from dependency candidate")
         if not isinstance(value.get("runtime_namespace"), str):
             raise WorkspaceError("workspace operation manifest runtime namespace is invalid")
     elif action == "release-writer":
@@ -1757,7 +2531,11 @@ def validate_manifest(value: object) -> dict[str, object]:
             raise WorkspaceError("Local branch-bind source snapshot fields are invalid")
         if source_snapshot.get("path") != value["project_root"]:
             raise WorkspaceError("Local branch-bind source snapshot belongs to a different root")
-        if source_snapshot.get("head_oid") != base["commit"] or source_snapshot.get("branch_ref") != "refs/heads/main":
+        if (
+            not isinstance(source_snapshot.get("head_oid"), str)
+            or not OID_RE.fullmatch(str(source_snapshot.get("head_oid")))
+            or source_snapshot.get("branch_ref") != "refs/heads/main"
+        ):
             raise WorkspaceError("Local branch-bind source snapshot has the wrong HEAD identity")
         status = source_snapshot.get("status")
         index = source_snapshot.get("index")
@@ -1929,6 +2707,11 @@ def lease_from_manifest(manifest: Mapping[str, object]) -> dict[str, object]:
         "branch_ref": branch["ref"],
         "base_ref": base["ref"],
         "base_commit": base["commit"],
+        "implementation_ref": base["implementation_ref"],
+        "implementation_commit": base["implementation_commit"],
+        "dependency_bindings": [dict(item) for item in base["dependency_bindings"]],
+        "dependency_bindings_digest": base["dependency_bindings_digest"],
+        "dependency_refresh_generation": 0,
         "principle_sha256": base["principle_sha256"],
         "runtime_namespace": manifest["runtime_namespace"],
         "acquired_at": timestamp,
@@ -1999,6 +2782,7 @@ def bind_local_head_transaction(
     *,
     base_ref: str,
     base_commit: str,
+    binding_commit: str,
     new_branch_ref: str,
     operation_id: str,
 ) -> bool:
@@ -2006,12 +2790,12 @@ def bind_local_head_transaction(
     new_branch_oid = ref_oid(context, new_branch_ref)
     main_oid = ref_oid(context, "refs/heads/main")
     if current_head == new_branch_ref:
-        if new_branch_oid != base_commit or main_oid != base_commit:
+        if new_branch_oid != binding_commit or main_oid != binding_commit:
             raise WorkspaceError("Local branch is bound but its branch/main identity differs from the accepted plan")
         return False
     if current_head != "refs/heads/main":
         raise WorkspaceError("primary checkout is no longer attached to refs/heads/main")
-    if main_oid != base_commit:
+    if main_oid != binding_commit:
         raise WorkspaceError("refs/heads/main changed before Local branch binding")
     branch_created = False
     if new_branch_oid is None:
@@ -2023,8 +2807,8 @@ def bind_local_head_transaction(
         commands = (
             "start\n"
             f"verify {base_ref} {base_commit}\n"
-            f"verify refs/heads/main {base_commit}\n"
-            f"create {new_branch_ref} {base_commit}\n"
+            f"verify refs/heads/main {binding_commit}\n"
+            f"create {new_branch_ref} {binding_commit}\n"
             "prepare\n"
             "commit\n"
         ).encode("ascii")
@@ -2040,11 +2824,11 @@ def bind_local_head_transaction(
             error = result.stderr.decode("utf-8", errors="replace").strip()
             raise WorkspaceError(error or "Local branch/base CAS transaction failed")
         branch_created = True
-    elif new_branch_oid != base_commit:
+    elif new_branch_oid != binding_commit:
         raise WorkspaceError("Local release branch appeared at a different commit")
     if current_symbolic_head(context, context.project_root) != "refs/heads/main":
         raise WorkspaceError("primary HEAD changed after Local branch creation; branch was preserved for reconcile")
-    if ref_oid(context, "refs/heads/main") != base_commit or ref_oid(context, new_branch_ref) != base_commit:
+    if ref_oid(context, "refs/heads/main") != binding_commit or ref_oid(context, new_branch_ref) != binding_commit:
         raise WorkspaceError("main or Local branch changed before the symbolic HEAD bind")
     result = run_git(
         context,
@@ -2058,7 +2842,7 @@ def bind_local_head_transaction(
         raise WorkspaceError(error or "Local symbolic HEAD bind failed")
     if current_symbolic_head(context, context.project_root) != new_branch_ref:
         raise WorkspaceError("atomic transaction completed without the expected Local HEAD symref")
-    if ref_oid(context, new_branch_ref) != base_commit or ref_oid(context, "refs/heads/main") != base_commit:
+    if ref_oid(context, new_branch_ref) != binding_commit or ref_oid(context, "refs/heads/main") != binding_commit:
         raise WorkspaceError("atomic transaction completed with an unexpected branch identity")
     return True
 
@@ -2107,13 +2891,18 @@ def verify_bound_local_result(
         raise WorkspaceError("Local branch-bind manifest is structurally invalid")
     base_ref = str(base["ref"])
     base_commit = str(base["commit"])
+    source_snapshot = preconditions.get("source_snapshot")
+    binding_commit = source_snapshot.get("head_oid") if isinstance(source_snapshot, Mapping) else None
     new_branch = str(branch["to_ref"])
     if ref_oid(context, base_ref) != base_commit:
         blockers.append(Blocker("base-anchor-drift", "immutable iteration base changed during Local branch binding"))
-    if ref_oid(context, "refs/heads/main") != base_commit:
+    if not isinstance(binding_commit, str) or not OID_RE.fullmatch(binding_commit):
+        blockers.append(Blocker("binding-commit-invalid", "accepted Local binding commit is invalid"))
+        binding_commit = base_commit
+    if ref_oid(context, "refs/heads/main") != binding_commit:
         blockers.append(Blocker("main-ref-drift", "refs/heads/main changed during Local branch binding"))
-    if ref_oid(context, new_branch) != base_commit:
-        blockers.append(Blocker("bound-branch-mismatch", "Local release branch does not equal the committed base"))
+    if ref_oid(context, new_branch) != binding_commit:
+        blockers.append(Blocker("bound-branch-mismatch", "Local release branch does not equal the accepted Local HEAD"))
     if current_symbolic_head(context, context.project_root) != new_branch:
         blockers.append(Blocker("bound-head-mismatch", "primary checkout HEAD is not bound to the Local PRD branch"))
     after_lease = preconditions.get("writer_lease_after")
@@ -2208,6 +2997,7 @@ def manifest_matches_arguments(
     base_ref: str | None = None,
     branch_ref: str | None = None,
     worktree_path: Path | None = None,
+    dependency_bindings: Sequence[Mapping[str, object]] | None = None,
 ) -> list[Blocker]:
     blockers: list[Blocker] = []
     base = manifest.get("base")
@@ -2231,6 +3021,20 @@ def manifest_matches_arguments(
         not isinstance(worktree, Mapping) or not same_path(str(worktree.get("path")), worktree_path)
     ):
         blockers.append(Blocker("operation-path-mismatch", "request path differs from durable manifest"))
+    if dependency_bindings is not None:
+        try:
+            requested = normalize_dependency_bindings(dependency_bindings)
+        except WorkspaceError as exc:
+            blockers.append(Blocker("operation-dependency-binding-invalid", str(exc)))
+        else:
+            accepted_dependencies = base.get("dependency_bindings") if isinstance(base, Mapping) else None
+            if not isinstance(accepted_dependencies, list) or [dict(item) for item in requested] != accepted_dependencies:
+                blockers.append(
+                    Blocker(
+                        "operation-dependency-mismatch",
+                        "requested dependency candidates differ from the durable manifest",
+                    )
+                )
     return blockers
 
 
@@ -2254,13 +3058,14 @@ def result_payload(
         evidence = dict(created_objects) if isinstance(created_objects, Mapping) else {}
         preconditions = manifest.get("preconditions")
         lease_after = preconditions.get("writer_lease_after") if isinstance(preconditions, Mapping) else None
+        source_snapshot = preconditions.get("source_snapshot") if isinstance(preconditions, Mapping) else None
         notification = {
             "prd": f"PRD-{plan.iteration}",
             "reason_code": "main-release-for-earlier-integration",
             "actual_path": worktree.get("path"),
             "branch_from_ref": branch.get("from_ref"),
             "actual_branch_ref": branch.get("to_ref"),
-            "actual_head": base.get("commit"),
+            "actual_head": source_snapshot.get("head_oid") if isinstance(source_snapshot, Mapping) else None,
             "branch_created": not blockers,
             "main_released": not blockers,
             "main_ref_moved": False,
@@ -2293,17 +3098,22 @@ def result_payload(
             "remote": {"involved": False, "pushed": False, "force": False},
         }
     else:
+        raw_dependencies = base.get("dependency_bindings")
+        stacked = isinstance(raw_dependencies, list) and bool(raw_dependencies)
         notification = {
             "prd": f"PRD-{plan.iteration}",
             "reason_code": (
-                "parallel-prd-lazy-worktree"
+                "stable-dependency-stacked-worktree"
+                if stacked
+                else "parallel-prd-lazy-worktree"
                 if manifest["execution_topology"] == "worktree"
                 else "single-active-prd-local"
             ),
             "actual_path": worktree.get("path"),
             "actual_branch_ref": branch.get("ref"),
-            "actual_head": base.get("commit"),
+            "actual_head": base.get("implementation_commit", base.get("commit")),
             "runtime_namespace": manifest.get("runtime_namespace"),
+            "dependency_bindings": raw_dependencies,
             "writer_lease": {
                 "owner": manifest.get("owner"),
                 "generation": manifest.get("lease_generation"),
@@ -2369,6 +3179,7 @@ def apply_activation(
     lease_generation: int,
     operation_id: str,
     accepted_plan_digest: str,
+    dependency_bindings: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
     context = resolve_repository(project_root)
     number = validate_iteration(iteration)
@@ -2399,6 +3210,7 @@ def apply_activation(
                 base_ref=base_ref,
                 branch_ref=branch,
                 worktree_path=target,
+                dependency_bindings=dependency_bindings,
             )
             if accepted != plan.digest:
                 blockers.append(
@@ -2438,6 +3250,7 @@ def apply_activation(
                 worktree_path=target,
                 owner=owner_value,
                 lease_generation=generation,
+                dependency_bindings=dependency_bindings,
                 operation_id=operation,
             )
             blockers = list(plan.blockers)
@@ -2454,6 +3267,34 @@ def apply_activation(
 
         created_now = False
         try:
+            accepted_base = plan.manifest.get("base")
+            if not isinstance(accepted_base, Mapping):
+                raise WorkspaceError("accepted workspace manifest lacks its implementation start")
+            raw_dependencies = accepted_base.get("dependency_bindings")
+            if not isinstance(raw_dependencies, list):
+                raise WorkspaceError("accepted workspace manifest lacks exact dependency bindings")
+            dependencies = normalize_dependency_bindings(raw_dependencies)
+            live_dependency_blockers = dependency_order_blockers(context, dependencies)
+            if live_dependency_blockers:
+                raise WorkspaceError(
+                    "dependency baseline changed after planning: "
+                    + "; ".join(item.code for item in live_dependency_blockers)
+                )
+            implementation_ref = str(accepted_base.get("implementation_ref"))
+            implementation_commit = str(accepted_base.get("implementation_commit"))
+            if ref_oid(context, implementation_ref) != implementation_commit:
+                raise WorkspaceError("latest-main implementation start changed after the accepted workspace plan")
+            if not is_ancestor(context, str(accepted_base["commit"]), implementation_commit):
+                raise WorkspaceError("implementation start no longer descends from the immutable PRD baseline")
+            if topology_name == "local":
+                local_worktrees = list_worktrees(context, include_status=True)
+                primary = local_worktrees[0] if local_worktrees else None
+                if (
+                    not isinstance(primary, Mapping)
+                    or primary.get("branch_ref") != branch
+                    or primary.get("head_oid") != implementation_commit
+                ):
+                    raise WorkspaceError("Local checkout changed after the accepted implementation start plan")
             lease, lease_created = acquire_matching_lease(context, plan.manifest)
             created_now = created_now or lease_created
             journal = advance_journal(
@@ -2474,8 +3315,8 @@ def apply_activation(
                 branch_created = create_branch(
                     context,
                     branch_ref=str(branch_manifest["ref"]),
-                    base_ref=str(base["ref"]),
-                    base_commit=str(base["commit"]),
+                    base_ref=str(base["implementation_ref"]),
+                    base_commit=str(base["implementation_commit"]),
                     operation_id=operation,
                 )
                 created_now = created_now or branch_created
@@ -2489,7 +3330,7 @@ def apply_activation(
                     context,
                     path=Path(str(worktree_manifest["path"])),
                     branch_ref=str(branch_manifest["ref"]),
-                    base_commit=str(base["commit"]),
+                    base_commit=str(base["implementation_commit"]),
                 )
                 created_now = created_now or worktree_created
                 journal = advance_journal(
@@ -2683,6 +3524,7 @@ def apply_bind_local_branch(
                 context,
                 base_ref=str(base["ref"]),
                 base_commit=str(base["commit"]),
+                binding_commit=str(expected_source["head_oid"]),
                 new_branch_ref=str(branch["to_ref"]),
                 operation_id=operation,
             )
@@ -2730,6 +3572,308 @@ def apply_bind_local_branch(
                 topology=derive_topology(load_active_leases(context)[0], load_topology_state(context)),
                 blockers=(Blocker("workspace-needs-reconcile", str(exc)),),
             )
+
+
+def _read_dependency_refresh_json(
+    context: RepositoryContext,
+    path: Path,
+    *,
+    label: str,
+) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    return read_json_file(context, path, label=label)
+
+
+def _dependency_refresh_result(
+    plan: DependencyRefreshPlan,
+    *,
+    phase: str,
+    blockers: Sequence[Blocker],
+    receipts: Sequence[Mapping[str, object]] = (),
+    receipt_digest: str | None = None,
+    idempotent: bool = False,
+) -> dict[str, object]:
+    return {
+        "schema_version": PUBLIC_SCHEMA,
+        "command": "refresh-dependencies",
+        "action_level": "notify",
+        "notification_phase": "after",
+        "pushed": False,
+        "project_root": plan.manifest["project_root"],
+        "git_common_dir": plan.manifest["git_common_dir"],
+        "operation_id": plan.operation_id,
+        "iteration": plan.iteration,
+        "phase": "blocked" if blockers else phase,
+        "plan_digest": plan.digest,
+        "notification": dependency_refresh_notification(plan.manifest, phase="after"),
+        "verification_receipts": [dict(item) for item in receipts],
+        "dependency_refresh_receipt_digest": receipt_digest,
+        "idempotent_replay": idempotent,
+        "blocking_reasons": [item.as_dict() for item in blockers],
+        "next_gate": "blocked" if blockers else "workspace-revalidated-candidate-allowed",
+        "exclusions": list(EXCLUSIONS),
+    }
+
+
+def _run_dependency_refresh_commands(
+    context: RepositoryContext,
+    plan: DependencyRefreshPlan,
+) -> tuple[list[dict[str, object]], list[Blocker]]:
+    target = Path(str(plan.manifest["worktree_path"]))
+    receipts: list[dict[str, object]] = []
+    blockers: list[Blocker] = []
+    commands = plan.manifest.get("verification_commands")
+    if not isinstance(commands, list):
+        raise WorkspaceError("dependency refresh plan verification commands are invalid")
+    for command in commands:
+        if not isinstance(command, Mapping):
+            raise WorkspaceError("dependency refresh plan verification command is invalid")
+        evidence_id = str(command.get("evidence_id", ""))
+        argv = command.get("argv")
+        if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
+            raise WorkspaceError(f"dependency refresh argv is invalid: {evidence_id}")
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=target,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                env=git_environment(),
+                timeout=3600,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            blockers.append(Blocker("dependency-refresh-verification-error", f"{evidence_id}: {exc}"))
+            continue
+        if len(result.stdout) > 8 * 1024 * 1024 or len(result.stderr) > 8 * 1024 * 1024:
+            blockers.append(
+                Blocker("dependency-refresh-verification-output", f"{evidence_id}: output exceeded safety limit")
+            )
+            continue
+        receipt_payload: dict[str, object] = {
+            "evidence_id": evidence_id,
+            "argv": list(argv),
+            "exit_code": result.returncode,
+            "stdout_sha256": hashlib.sha256(result.stdout).hexdigest(),
+            "stderr_sha256": hashlib.sha256(result.stderr).hexdigest(),
+            "worktree_head": plan.manifest["worktree_head"],
+            "worktree_tree": plan.manifest["worktree_tree"],
+            "dependency_bindings_digest": dependency_bindings_digest(
+                plan.manifest["after_bindings"]  # type: ignore[arg-type]
+            ),
+        }
+        receipt_payload["receipt_digest"] = digest(receipt_payload)
+        receipts.append(receipt_payload)
+        if result.returncode != 0:
+            blockers.append(
+                Blocker(
+                    "dependency-refresh-verification-failed",
+                    f"{evidence_id} exited with {result.returncode}",
+                )
+            )
+    return receipts, blockers
+
+
+def apply_dependency_refresh(
+    plan: DependencyRefreshPlan,
+    *,
+    accepted_plan_digest: str,
+) -> dict[str, object]:
+    if not isinstance(plan, DependencyRefreshPlan):
+        raise WorkspaceError("dependency refresh requires a DependencyRefreshPlan")
+    accepted = validate_digest(accepted_plan_digest)
+    if accepted != plan.digest or plan.digest != digest(plan.manifest):
+        return _dependency_refresh_result(
+            plan,
+            phase="blocked",
+            blockers=(Blocker("accepted-plan-digest-mismatch", "dependency refresh plan was not accepted exactly"),),
+        )
+    if plan.blockers:
+        return _dependency_refresh_result(plan, phase="blocked", blockers=plan.blockers)
+    context = resolve_repository(str(plan.manifest["project_root"]))
+    journal_path = dependency_refresh_journal_path(context, plan.operation_id)
+    receipt_path = dependency_refresh_receipt_path(context, plan.operation_id)
+    with coordinator_lock(context):
+        journal = _read_dependency_refresh_json(
+            context,
+            journal_path,
+            label="dependency refresh journal",
+        )
+        current = load_lease(context, plan.iteration)
+        if current is None:
+            return _dependency_refresh_result(
+                plan,
+                phase="blocked",
+                blockers=(Blocker("writer-lease-missing", "writer lease disappeared before dependency refresh"),),
+            )
+        before_digest = str(plan.manifest["before_lease_digest"])
+        after_projection = plan.manifest.get("after_lease")
+        if not isinstance(after_projection, Mapping):
+            raise WorkspaceError("dependency refresh after lease is invalid")
+        current_projection = lease_projection(current)
+        current_digest = digest(current)
+        already_applied = current_projection == dict(after_projection)
+        if journal is not None:
+            if (
+                journal.get("schema_version") != DEPENDENCY_REFRESH_JOURNAL_SCHEMA
+                or journal.get("operation_id") != plan.operation_id
+                or journal.get("plan_digest") != plan.digest
+                or journal.get("manifest") != plan.manifest
+            ):
+                return _dependency_refresh_result(
+                    plan,
+                    phase="blocked",
+                    blockers=(Blocker("dependency-refresh-journal-mismatch", "refresh operation identity differs"),),
+                )
+            if journal.get("status") == "complete" and already_applied:
+                receipt = _read_dependency_refresh_json(
+                    context,
+                    receipt_path,
+                    label="dependency refresh receipt",
+                )
+                if receipt is None or receipt.get("receipt_digest") != digest(
+                    {key: value for key, value in receipt.items() if key != "receipt_digest"}
+                ):
+                    return _dependency_refresh_result(
+                        plan,
+                        phase="blocked",
+                        blockers=(Blocker("dependency-refresh-receipt-invalid", "refresh receipt is missing or changed"),),
+                    )
+                return _dependency_refresh_result(
+                    plan,
+                    phase="succeeded",
+                    blockers=(),
+                    receipts=receipt.get("verification_receipts", []),  # type: ignore[arg-type]
+                    receipt_digest=str(receipt["receipt_digest"]),
+                    idempotent=True,
+                )
+        elif current_digest != before_digest:
+            return _dependency_refresh_result(
+                plan,
+                phase="blocked",
+                blockers=(Blocker("dependency-refresh-lease-cas", "writer lease changed after planning"),),
+            )
+        if journal is None:
+            journal = {
+                "schema_version": DEPENDENCY_REFRESH_JOURNAL_SCHEMA,
+                "operation_id": plan.operation_id,
+                "plan_digest": plan.digest,
+                "manifest": plan.manifest,
+                "status": "planned",
+                "verification_receipts": [],
+                "receipt_digest": None,
+            }
+            exclusive_write_json(context, journal_path, journal)
+        if already_applied:
+            receipts_raw = journal.get("verification_receipts")
+            if not isinstance(receipts_raw, list) or not receipts_raw:
+                return _dependency_refresh_result(
+                    plan,
+                    phase="blocked",
+                    blockers=(
+                        Blocker(
+                            "dependency-refresh-reconcile",
+                            "lease was refreshed without durable verification receipts",
+                        ),
+                    ),
+                )
+            receipts = [dict(item) for item in receipts_raw if isinstance(item, Mapping)]
+        else:
+            head, tree = _worktree_head_and_tree(context, Path(str(plan.manifest["worktree_path"])))
+            status = status_fingerprint(context, Path(str(plan.manifest["worktree_path"])))
+            if (
+                head != plan.manifest["worktree_head"]
+                or tree != plan.manifest["worktree_tree"]
+                or status != plan.manifest["status_fingerprint"]
+            ):
+                return _dependency_refresh_result(
+                    plan,
+                    phase="blocked",
+                    blockers=(Blocker("dependency-refresh-worktree-drift", "worktree changed after planning"),),
+                )
+            bindings = normalize_dependency_bindings(plan.manifest["after_bindings"])  # type: ignore[arg-type]
+            live = dependency_order_blockers(context, bindings)
+            if live:
+                return _dependency_refresh_result(plan, phase="blocked", blockers=live)
+            receipts, verification_blockers = _run_dependency_refresh_commands(context, plan)
+            post_head, post_tree = _worktree_head_and_tree(
+                context,
+                Path(str(plan.manifest["worktree_path"])),
+            )
+            post_status = status_fingerprint(context, Path(str(plan.manifest["worktree_path"])))
+            if (
+                post_head != plan.manifest["worktree_head"]
+                or post_tree != plan.manifest["worktree_tree"]
+                or post_status != plan.manifest["status_fingerprint"]
+            ):
+                verification_blockers.append(
+                    Blocker("dependency-refresh-verification-mutated", "verification changed the writer worktree")
+                )
+            journal["verification_receipts"] = receipts
+            journal["status"] = "verified" if not verification_blockers else "failed-needs-reconcile"
+            atomic_write_json(context, journal_path, journal)
+            if verification_blockers:
+                return _dependency_refresh_result(
+                    plan,
+                    phase="blocked",
+                    blockers=verification_blockers,
+                    receipts=receipts,
+                )
+            live_current = load_lease(context, plan.iteration)
+            if live_current is None or digest(live_current) != before_digest:
+                return _dependency_refresh_result(
+                    plan,
+                    phase="blocked",
+                    blockers=(Blocker("dependency-refresh-lease-cas", "writer lease changed during verification"),),
+                    receipts=receipts,
+                )
+            updated = dict(live_current)
+            for field, value in after_projection.items():
+                if field in updated:
+                    updated[field] = value
+            atomic_write_json(context, lease_path(context, plan.iteration), updated)
+            validate_lease(updated, source=lease_path(context, plan.iteration))
+        receipt_payload: dict[str, object] = {
+            "schema_version": DEPENDENCY_REFRESH_RECEIPT_SCHEMA,
+            "operation_id": plan.operation_id,
+            "plan_digest": plan.digest,
+            "iteration": plan.iteration,
+            "before_lease_digest": before_digest,
+            "after_lease_digest": digest(load_lease(context, plan.iteration)),
+            "worktree_head": plan.manifest["worktree_head"],
+            "worktree_tree": plan.manifest["worktree_tree"],
+            "before_bindings_digest": dependency_bindings_digest(
+                plan.manifest["before_bindings"]  # type: ignore[arg-type]
+            ),
+            "after_bindings_digest": dependency_bindings_digest(
+                plan.manifest["after_bindings"]  # type: ignore[arg-type]
+            ),
+            "verification_receipts": receipts,
+            "pushed": False,
+        }
+        receipt_payload["receipt_digest"] = digest(receipt_payload)
+        if not receipt_path.exists():
+            exclusive_write_json(context, receipt_path, receipt_payload)
+        else:
+            existing_receipt = read_json_file(context, receipt_path, label="dependency refresh receipt")
+            if existing_receipt != receipt_payload:
+                return _dependency_refresh_result(
+                    plan,
+                    phase="blocked",
+                    blockers=(Blocker("dependency-refresh-receipt-collision", "refresh receipt differs"),),
+                )
+        journal["status"] = "complete"
+        journal["receipt_digest"] = receipt_payload["receipt_digest"]
+        atomic_write_json(context, journal_path, journal)
+        write_topology(context)
+        return _dependency_refresh_result(
+            plan,
+            phase="succeeded",
+            blockers=(),
+            receipts=receipts,
+            receipt_digest=str(receipt_payload["receipt_digest"]),
+        )
 
 
 def apply_release(
@@ -3014,6 +4158,10 @@ def status_payload(context: RepositoryContext) -> dict[str, object]:
         blockers.extend(reasons)
         projected = lease_projection(lease)
         projected["guard_valid"] = not reasons
+        dependency_reasons = [item.as_dict() for item in reasons if item.code.startswith("dependency-")]
+        projected["dependency_baseline_state"] = "stale" if dependency_reasons else "current"
+        projected["dependency_blocking_reasons"] = dependency_reasons
+        projected["dependency_refresh_required"] = bool(dependency_reasons)
         projected["actual"] = actual
         guarded_leases.append(projected)
     next_gate = "reconcile" if blockers else {
@@ -3078,10 +4226,25 @@ def add_activation_arguments(parser: argparse.ArgumentParser, *, apply: bool) ->
     parser.add_argument("--worktree-path", required=True)
     parser.add_argument("--owner", required=True)
     parser.add_argument("--lease-generation", required=True, type=int)
+    parser.add_argument(
+        "--dependency-bindings-json",
+        default="[]",
+        help="Exact ordered stable-candidate bindings emitted by the coordinator",
+    )
     parser.add_argument("--operation-id", required=apply)
     if apply:
         parser.add_argument("--accept-plan-digest", required=True)
     parser.add_argument("--json", action="store_true")
+
+
+def dependency_bindings_argument(raw: str) -> tuple[dict[str, str], ...]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise WorkspaceError("dependency bindings JSON is invalid") from exc
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise WorkspaceError("dependency bindings JSON must be an array of objects")
+    return normalize_dependency_bindings(value)
 
 
 def add_release_arguments(parser: argparse.ArgumentParser, *, apply: bool) -> None:
@@ -3184,6 +4347,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 worktree_path=args.worktree_path,
                 owner=args.owner,
                 lease_generation=args.lease_generation,
+                dependency_bindings=dependency_bindings_argument(args.dependency_bindings_json),
                 operation_id=args.operation_id,
             ).as_dict()
         elif args.command == "activate":
@@ -3199,6 +4363,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lease_generation=args.lease_generation,
                 operation_id=args.operation_id,
                 accepted_plan_digest=args.accept_plan_digest,
+                dependency_bindings=dependency_bindings_argument(args.dependency_bindings_json),
             )
         elif args.command == "plan" and args.plan_command == "release":
             command_label = "release-writer"

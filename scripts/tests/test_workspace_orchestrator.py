@@ -12,11 +12,46 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from scripts import harness_workspace as workspace
 
 SCRIPT = Path(__file__).resolve().parents[1] / "harness_workspace.py"
 
 
 class WorkspaceOrchestratorTests(unittest.TestCase):
+    @staticmethod
+    def dependency_binding(iteration: str, generation: str, marker: str) -> dict[str, str]:
+        oid = marker * 40
+        sha = marker * 64
+        return {
+            "schema_version": workspace.DEPENDENCY_BINDING_SCHEMA,
+            "iteration": iteration,
+            "generation": generation,
+            "candidate_ref": f"refs/project-harness/v2/iterations/{iteration}/candidates/{generation}",
+            "candidate_commit": oid,
+            "candidate_tree": oid,
+            "candidate_evidence_ref": (
+                f"refs/project-harness/v2/iterations/{iteration}/candidate-evidence/{generation}"
+            ),
+            "candidate_evidence_blob": oid,
+            "candidate_evidence_digest": sha,
+            "candidate_evidence_metadata_digest": sha,
+            "registration_digest": sha,
+            "registry_digest": sha,
+        }
+
+    def test_dependency_binding_order_is_digest_bound_and_duplicates_fail_closed(self) -> None:
+        first = self.dependency_binding("002", "g1", "a")
+        second = self.dependency_binding("003", "g2", "b")
+        normalized = workspace.normalize_dependency_bindings((first, second))
+
+        self.assertEqual(tuple(item["iteration"] for item in normalized), ("002", "003"))
+        self.assertNotEqual(
+            workspace.dependency_bindings_digest(normalized),
+            workspace.dependency_bindings_digest(tuple(reversed(normalized))),
+        )
+        with self.assertRaisesRegex(workspace.WorkspaceError, "duplicated"):
+            workspace.normalize_dependency_bindings((first, first))
+
     """Black-box safety contracts for the Local/worktree vertical slice."""
 
     maxDiff = None

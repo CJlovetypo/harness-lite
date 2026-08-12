@@ -926,6 +926,8 @@ def _read_json_file(path: Path, limit: int) -> dict[str, object]:
 def _load_and_match_lease(plan: GovernanceReconcilePlan) -> None:
     expected = plan.manifest.get("principle_lease")
     if expected is None:
+        if any(item.category == "principle" for item in plan.previews):
+            raise ReconcileError("accepted principle change lacks its global lease")
         return
     path = principle_lease_path(plan.git_common_dir)
     if not path.is_file():

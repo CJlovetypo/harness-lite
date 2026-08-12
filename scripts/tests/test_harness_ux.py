@@ -20,15 +20,26 @@ class HarnessInteractionTests(unittest.TestCase):
             branch_ref="refs/heads/prd/002",
             worktree_path="D:/workspace/worktrees/prd-002",
             reason="second writable PRD requires isolation",
+            affected_prds=("001", "002"),
+            runtime_namespace="prd-002",
+            effect_on_existing_prds=("PRD-001 stays in place",),
+            remote_involved=False,
+            source_preserved=True,
+            next_gate="implement-prd-002",
         )
         before = interaction(ActionFacts(phase="before", **common))
-        after = interaction(ActionFacts(phase="after", **common))
+        after = interaction(ActionFacts(phase="after", actual_head=OID_A, **common))
 
         self.assertEqual(before.action_level, "notify")
         self.assertFalse(before.requires_user_response)
         self.assertEqual(before.facts["base_commit"], OID_A)
         self.assertEqual(after.phase, "after")
         self.assertFalse(after.facts["pushed"])
+        self.assertEqual(after.facts["affected_prds"], ["001", "002"])
+        self.assertEqual(after.facts["runtime_namespace"], "prd-002")
+        self.assertEqual(after.facts["actual_head"], OID_A)
+        self.assertTrue(after.facts["source_preserved"])
+        self.assertFalse(after.facts["remote_involved"])
 
     def test_worktree_notification_missing_path_fails_closed(self) -> None:
         with self.assertRaisesRegex(InteractionError, "worktree_path"):

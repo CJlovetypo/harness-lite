@@ -52,6 +52,13 @@ class ActionFacts:
     force: bool = False
     pushed: bool = False
     reason: str | None = None
+    affected_prds: tuple[str, ...] = ()
+    runtime_namespace: str | None = None
+    effect_on_existing_prds: tuple[str, ...] = ()
+    remote_involved: bool = False
+    source_preserved: bool | None = None
+    actual_head: str | None = None
+    next_gate: str | None = None
 
 
 @dataclass(frozen=True)
@@ -128,11 +135,18 @@ def _facts_payload(value: ActionFacts) -> dict[str, object]:
     target_ref = _clean(value.target_ref)
     commit_range = _clean(value.commit_range)
     reason = _clean(value.reason)
+    affected_prds = _strings(value.affected_prds, "affected_prds")
+    runtime_namespace = _clean(value.runtime_namespace)
+    effects = _strings(value.effect_on_existing_prds, "effect_on_existing_prds")
+    actual_head = _clean(value.actual_head)
+    next_gate = _clean(value.next_gate)
 
     if base is not None and not HEX_OBJECT.fullmatch(base.lower()):
         raise InteractionError("base_commit must be a full Git object ID")
     if result_commit is not None and not HEX_OBJECT.fullmatch(result_commit.lower()):
         raise InteractionError("resulting_commit must be a full Git object ID")
+    if actual_head is not None and not HEX_OBJECT.fullmatch(actual_head.lower()):
+        raise InteractionError("actual_head must be a full Git object ID")
     if action in WORKTREE_ACTIONS:
         for label, item in (
             ("iteration", iteration),
@@ -185,6 +199,13 @@ def _facts_payload(value: ActionFacts) -> dict[str, object]:
         "force": bool(value.force),
         "pushed": bool(value.pushed),
         "reason": reason,
+        "affected_prds": list(affected_prds),
+        "runtime_namespace": runtime_namespace,
+        "effect_on_existing_prds": list(effects),
+        "remote_involved": bool(value.remote_involved),
+        "source_preserved": value.source_preserved,
+        "actual_head": actual_head.lower() if actual_head else None,
+        "next_gate": next_gate,
     }
 
 

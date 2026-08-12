@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """Authoritative v2 request routing and lifecycle coordination.
 
-The coordinator is the only public layer allowed to convert repository facts
-into low-level Harness operations.  Its first slice closes the unsafe gap where
-callers could reserve an identity and then manually assert approval booleans:
-it derives governance, authorization, dependency, allocation, and workspace
-facts from the target project and emits one versioned route/start plan.
-
-This module currently plans only.  Mutating adapters continue to require their
-own accepted digest/journal and are invoked in later phases by an authorized
-coordinator.  A plan never writes files, refs, indexes, leases, or worktrees.
+The coordinator derives governance, authorization, dependency, allocation, and
+workspace facts from repository authority. It plans only: no files, refs,
+indexes, leases, branches, or worktrees are mutated here. Facts that cannot be
+authenticated by the currently persisted schemas fail closed.
 """
 
 from __future__ import annotations
@@ -28,20 +23,36 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 try:
+    from . import harness_workspace as workspace
+    from . import harness_train as train
+    from . import project_harness as core
     from .harness_decision import AuthorizationState, DecisionInput, RiskVector, classify
 except ImportError:  # pragma: no cover - direct script execution
+    import harness_workspace as workspace
+    import harness_train as train
+    import project_harness as core
     from harness_decision import AuthorizationState, DecisionInput, RiskVector, classify
 
 
 SCHEMA_V1 = "harness-lite.coordinator-plan/v1"
 ITERATION_RE = re.compile(r"[0-9]{3,}")
 OID_RE = re.compile(r"[0-9a-f]{40,64}")
+OP_RE = re.compile(r"OP-[0-9a-f]{32}")
 STATUS_LINE = re.compile(
     r"^- (?P<label>[^：:\r\n]+)[：:]\s*(?:`(?P<quoted>[^`\r\n]+)`|(?P<plain>[^\r\n]+))\s*$",
     re.MULTILINE,
 )
 PRD_STATUSES = {"草案", "待批准", "已批准", "实施中", "待验收", "已验收", "已取代", "已取消"}
 SPEC_STATUSES = {"受 PRD 阻塞", "草案", "待批准", "已批准", "实施中", "已完成", "已取代", "已取消"}
+GIT_ENVIRONMENT_OVERRIDES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+)
 
 
 class CoordinatorError(RuntimeError):
@@ -57,13 +68,21 @@ class IterationAuthority:
     prd_approved: bool
     spec_approved: bool
     implementation_authorized: bool
+    governance_ref: str
+    governance_commit: str
+    governance_tree: str
     principle_sha256: str
     base_ref: str | None
     base_commit: str | None
+    source_base_ref: str | None
     depends_on: tuple[str, ...]
     conflicts_with: tuple[str, ...]
     candidate_refs: tuple[str, ...]
+    candidate_objects: tuple[tuple[str, str], ...]
+    verified_candidate_refs: tuple[str, ...]
+    stable_candidate_bindings: tuple[dict[str, str], ...]
     integrated: bool
+    integrated_object: str | None
     active_writer: bool
     blockers: tuple[str, ...]
 
@@ -100,6 +119,8 @@ def _git(root: Path, arguments: Sequence[str], *, check: bool = True) -> subproc
     if not executable:
         raise CoordinatorError("Git is required")
     environment = os.environ.copy()
+    for name in GIT_ENVIRONMENT_OVERRIDES:
+        environment.pop(name, None)
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     result = subprocess.run(
         [executable, "-C", str(root), *arguments],
@@ -139,30 +160,28 @@ def _read_utf8(path: Path, maximum: int = 2 * 1024 * 1024) -> str:
     if len(raw) > maximum:
         raise CoordinatorError(f"authority file exceeds safe size limit: {path}")
     try:
-        return raw.decode("utf-8-sig")
+        text = raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise CoordinatorError(f"authority file is not UTF-8: {path}") from exc
+    if not core.has_owner_marker(text):
+        raise CoordinatorError(f"authority file lacks a Harness ownership marker: {path}")
+    return text
 
 
 def _value(text: str, label: str) -> str | None:
-    for match in STATUS_LINE.finditer(text):
+    clean = core.strip_html_comments(text)
+    values: list[str] = []
+    for match in STATUS_LINE.finditer(clean):
         if match.group("label").strip() == label:
-            value = match.group("quoted") or match.group("plain")
-            return value.strip()
-    return None
-
-
-def _truthy_authorization(value: str | None) -> bool:
-    if value is None:
-        return False
-    lowered = value.strip().lower()
-    negative = ("待批准", "未批准", "未授权", "尚未", "无", "n/a", "todo")
-    return bool(lowered and not any(fragment in lowered for fragment in negative))
+            values.append((match.group("quoted") or match.group("plain")).strip())
+    if len(values) > 1:
+        raise CoordinatorError(f"authority field is duplicated: {label}")
+    return values[0] if values else None
 
 
 def _ids_from_field(text: str, label: str) -> tuple[str, ...]:
     value = _value(text, label)
-    if not value:
+    if not value or value.strip().casefold() in {"无", "none", "n/a", "尚无"}:
         return ()
     return tuple(dict.fromkeys(re.findall(r"(?:PRD-)?([0-9]{3,})", value)))
 
@@ -190,40 +209,176 @@ def _common_dir(root: Path) -> Path:
     return (raw if raw.is_absolute() else root / raw).resolve()
 
 
-def _active_workspace_iterations(root: Path) -> set[str]:
-    directory = _common_dir(root) / "project-harness" / "workspace" / "v1" / "leases" / "iterations"
-    if not directory.is_dir():
-        return set()
-    result: set[str] = set()
-    for path in directory.glob("*.json"):
-        if not ITERATION_RE.fullmatch(path.stem):
-            continue
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise CoordinatorError(f"workspace lease is corrupt: {path}: {exc}") from exc
-        if not isinstance(value, Mapping) or value.get("iteration") != path.stem:
-            raise CoordinatorError(f"workspace lease identity mismatch: {path}")
-        result.add(path.stem)
-    return result
-
-
 def _workspace_lease_snapshots(root: Path) -> dict[str, dict[str, object]]:
-    directory = _common_dir(root) / "project-harness" / "workspace" / "v1" / "leases" / "iterations"
-    if not directory.is_dir():
-        return {}
-    result: dict[str, dict[str, object]] = {}
-    for path in directory.glob("*.json"):
-        if not ITERATION_RE.fullmatch(path.stem):
+    executable = shutil.which("git")
+    if not executable:
+        raise CoordinatorError("Git is required")
+    context = workspace.RepositoryContext(
+        git=executable,
+        project_root=root,
+        common_dir=_common_dir(root),
+    )
+    try:
+        leases, blockers = workspace.load_active_leases(context)
+    except workspace.WorkspaceError as exc:
+        raise CoordinatorError(f"workspace lease registry is invalid: {exc}") from exc
+    if blockers:
+        detail = "; ".join(f"{item.code}: {item.message}" for item in blockers)
+        raise CoordinatorError("workspace lease registry is invalid: " + detail)
+    return {str(item["iteration"]): item for item in leases}
+
+
+def _active_workspace_iterations(root: Path) -> set[str]:
+    return set(_workspace_lease_snapshots(root))
+
+
+def _object_type(root: Path, oid: str) -> str | None:
+    result = _git(root, ["cat-file", "-t", oid], check=False)
+    return _text(result) if result.returncode == 0 else None
+
+
+def _generation_key(reference: str) -> tuple[int, int | str, str]:
+    generation = reference.rsplit("/", 1)[-1]
+    numeric = re.fullmatch(r"g([0-9]+)", generation)
+    if numeric:
+        return (0, int(numeric.group(1)), generation)
+    return (1, generation, generation)
+
+
+def _v2_base_identity(
+    root: Path, number: str, refs: Mapping[str, str]
+) -> tuple[str | None, str | None, str | None, tuple[str, ...]]:
+    blockers: list[str] = []
+    allocation_ref = f"refs/project-harness/v2/allocations/{number}"
+    base_ref = f"refs/project-harness/v2/iterations/{number}/base"
+    allocation_oid = refs.get(allocation_ref)
+    base_commit = refs.get(base_ref)
+    if allocation_oid is None and base_commit is None:
+        return None, None, None, ()
+    if allocation_oid is None or base_commit is None:
+        return base_ref if base_commit else None, base_commit, None, ("partial-v2-identity",)
+    if _object_type(root, allocation_oid) != "blob" or _object_type(root, base_commit) != "commit":
+        return base_ref, base_commit, None, ("v2-identity-object-type-invalid",)
+    git = shutil.which("git") or "git"
+    try:
+        metadata = core.read_allocation_metadata(git, root, allocation_oid)
+    except core.HarnessError as exc:
+        return base_ref, base_commit, None, (f"v2-allocation-metadata-invalid:{exc}",)
+    if metadata.get("iteration") != number or metadata.get("base_commit") != base_commit:
+        blockers.append("v2-allocation-base-mismatch")
+    owner = str(metadata.get("operation_id"))
+    try:
+        journal, _ = core.load_operation_journal(_common_dir(root), owner)
+    except core.HarnessError as exc:
+        blockers.append(f"v2-reservation-owner-invalid:{exc}")
+    else:
+        if (
+            journal.phase != "READY"
+            or journal.plan_digest != metadata.get("plan_digest")
+            or journal.iteration != number
+            or journal.allocation_object != allocation_oid
+            or journal.base_commit != base_commit
+            or journal.base_branch != metadata.get("base_branch")
+        ):
+            blockers.append("v2-reservation-owner-mismatch")
+    return base_ref, base_commit, str(metadata.get("base_branch")), tuple(blockers)
+
+
+def _candidate_observations(
+    root: Path,
+    number: str,
+    refs: Mapping[str, str],
+    *,
+    principle_sha256: str,
+) -> tuple[
+    tuple[str, ...],
+    tuple[tuple[str, str], ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[dict[str, str], ...],
+]:
+    del refs  # the dependency registry is re-read atomically enough for CAS-style drift detection below
+    candidate_prefix = f"refs/project-harness/v2/iterations/{number}/candidates/"
+    evidence_prefix = f"refs/project-harness/v2/iterations/{number}/candidate-evidence/"
+    observations: list[tuple[str, str]] = []
+    verified: list[str] = []
+    bindings: list[dict[str, str]] = []
+    blockers: list[str] = []
+    executable = shutil.which("git")
+    if not executable:
+        raise CoordinatorError("Git is required")
+    context = workspace.RepositoryContext(git=executable, project_root=root, common_dir=_common_dir(root))
+    registry = workspace.dependency_registry_snapshot(context, number)
+    registry_digest = str(registry["digest"])
+    registry_entries = registry.get("refs")
+    if not isinstance(registry_entries, list):
+        raise CoordinatorError(f"candidate registry for PRD-{number} is unreadable")
+    registry_refs = {
+        str(item["ref"]): str(item["oid"])
+        for item in registry_entries
+        if isinstance(item, Mapping) and set(item) == {"ref", "oid"}
+    }
+    if len(registry_refs) != len(registry_entries):
+        raise CoordinatorError(f"candidate registry for PRD-{number} contains malformed or duplicate refs")
+    candidate_names = tuple(
+        sorted((name for name in registry_refs if name.startswith(candidate_prefix)), key=_generation_key)
+    )
+    generations = {
+        name[len(candidate_prefix) :]
+        for name in candidate_names
+    } | {
+        name[len(evidence_prefix) :]
+        for name in registry_refs
+        if name.startswith(evidence_prefix)
+    }
+    ordered_generations = tuple(
+        reference.rsplit("/", 1)[-1]
+        for reference in sorted(
+            (f"{candidate_prefix}{generation}" for generation in generations),
+            key=_generation_key,
+        )
+    )
+    for generation in ordered_generations:
+        reference = f"{candidate_prefix}{generation}"
+        oid = registry_refs.get(reference)
+        if oid is not None:
+            observations.append((reference, oid))
+        registered, candidate_blockers = train.load_registered_candidate(
+            root,
+            iteration=number,
+            generation=generation,
+            current_principle_sha256=principle_sha256,
+        )
+        blockers.extend(
+            f"candidate-registration:{generation}:{item.code}:{item.message}"
+            for item in candidate_blockers
+        )
+        if registered is None:
+            blockers.append(f"candidate-stable-registration-missing:{generation}")
             continue
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise CoordinatorError(f"workspace lease is corrupt: {path}: {exc}") from exc
-        if not isinstance(value, dict) or value.get("iteration") != path.stem:
-            raise CoordinatorError(f"workspace lease identity mismatch: {path}")
-        result[path.stem] = value
-    return result
+        verified.append(registered.candidate_ref)
+        bindings.append(
+            {
+                "schema_version": workspace.DEPENDENCY_BINDING_SCHEMA,
+                "iteration": registered.iteration,
+                "generation": registered.generation,
+                "candidate_ref": registered.candidate_ref,
+                "candidate_commit": registered.candidate_commit,
+                "candidate_tree": registered.candidate_tree,
+                "candidate_evidence_ref": registered.candidate_evidence_ref,
+                "candidate_evidence_blob": registered.candidate_evidence_blob,
+                "candidate_evidence_digest": registered.candidate_evidence.evidence_digest,
+                "candidate_evidence_metadata_digest": registered.candidate_evidence_metadata_digest,
+                "registration_digest": registered.registration_digest,
+                "registry_digest": registry_digest,
+            }
+        )
+    final_registry = workspace.dependency_registry_snapshot(context, number)
+    if final_registry["digest"] != registry_digest:
+        blockers.append("candidate-registry-changed-during-read")
+        verified.clear()
+        bindings.clear()
+    return candidate_names, tuple(observations), tuple(blockers), tuple(verified), tuple(bindings)
 
 
 def derive_iteration_authority(root: Path, iteration: str) -> IterationAuthority:
@@ -242,9 +397,10 @@ def derive_iteration_authority(root: Path, iteration: str) -> IterationAuthority
     missing = [str(path) for path in expected.values() if not path.is_file()]
     if missing:
         raise CoordinatorError("iteration bundle is incomplete: " + ", ".join(missing))
+    for path in expected.values():
+        _read_utf8(path)
     prd = _read_utf8(expected["prd"])
     spec = _read_utf8(expected["spec"])
-    principle = (root / "harness" / "principle.md").read_bytes()
     prd_status = _value(prd, "状态") or ""
     spec_status = _value(spec, "状态") or ""
     blockers: list[str] = []
@@ -252,30 +408,55 @@ def derive_iteration_authority(root: Path, iteration: str) -> IterationAuthority
         blockers.append("invalid-prd-status")
     if spec_status not in SPEC_STATUSES:
         blockers.append("invalid-spec-status")
-    prd_approved = prd_status in {"已批准", "实施中", "待验收", "已验收"} and _truthy_authorization(
-        _value(prd, "批准依据")
+    prd_approved = prd_status in {"已批准", "实施中", "待验收", "已验收"} and core.explicit_user_baseline_approval(
+        _value(prd, "批准依据"), f"PRD-{number}"
     )
-    spec_approved = spec_status in {"已批准", "实施中", "已完成"} and _truthy_authorization(
-        _value(spec, "批准依据")
+    spec_approved = spec_status in {"已批准", "实施中", "已完成"} and core.explicit_user_baseline_approval(
+        _value(spec, "批准依据"), f"SPEC-{number}"
     )
-    implementation_authorized = _truthy_authorization(_value(spec, "实施授权"))
+    implementation_authorized = core.explicit_user_implementation_authorization(_value(spec, "实施授权"))
+    git = shutil.which("git") or "git"
+    try:
+        governance_ref, governance_commit, snapshot = core.committed_governance_snapshot(
+            git, root, "refs/heads/main"
+        )
+    except core.HarnessError as exc:
+        raise CoordinatorError(f"canonical main governance is invalid: {exc}") from exc
     refs = _refs(root)
-    v2_base = f"refs/project-harness/v2/iterations/{number}/base"
-    legacy_prefix = f"refs/project-harness/iterations/{number}/base/"
-    legacy = [(name, oid) for name, oid in refs.items() if name.startswith(legacy_prefix)]
-    base_ref: str | None = None
-    base_commit: str | None = None
-    if v2_base in refs:
-        base_ref, base_commit = v2_base, refs[v2_base]
-    elif len(legacy) == 1:
-        base_ref, base_commit = legacy[0]
-    else:
-        blockers.append("immutable-base-missing-or-ambiguous")
-    candidate_prefix = f"refs/project-harness/v2/iterations/{number}/candidates/"
-    candidates = tuple(sorted(name for name in refs if name.startswith(candidate_prefix)))
-    integrated = f"refs/project-harness/v2/iterations/{number}/integrated" in refs
+    base_ref, base_commit, source_base_ref, v2_blockers = _v2_base_identity(root, number, refs)
+    blockers.extend(v2_blockers)
+    if base_ref is None:
+        legacy_prefix = f"refs/project-harness/iterations/{number}/base/"
+        legacy = [(name, oid) for name, oid in refs.items() if name.startswith(legacy_prefix)]
+        if len(legacy) == 1 and _object_type(root, legacy[0][1]) == "commit":
+            base_ref, base_commit = legacy[0]
+            source_base_ref = legacy[0][0][len(legacy_prefix) :]
+        else:
+            blockers.append("immutable-base-missing-or-ambiguous")
+    (
+        candidate_refs,
+        candidate_objects,
+        candidate_blockers,
+        verified_candidate_refs,
+        stable_candidate_bindings,
+    ) = _candidate_observations(
+        root,
+        number,
+        refs,
+        principle_sha256=str(snapshot["principle_sha256"]),
+    )
+    blockers.extend(candidate_blockers)
+    integrated_ref = f"refs/project-harness/v2/iterations/{number}/integrated"
+    integrated_object = refs.get(integrated_ref)
+    integrated = False
+    if integrated_object is not None:
+        if _object_type(root, integrated_object) != "commit":
+            blockers.append("integrated-object-not-commit")
+        else:
+            blockers.append("integrated-evidence-envelope-missing")
     title_match = re.search(rf"^#\s+PRD-{re.escape(number)}[：:]\s*(.+?)\s*$", prd, re.MULTILINE)
     title = title_match.group(1).strip() if title_match else f"PRD-{number}"
+    active = _active_workspace_iterations(root)
     return IterationAuthority(
         iteration=number,
         title=title,
@@ -284,14 +465,22 @@ def derive_iteration_authority(root: Path, iteration: str) -> IterationAuthority
         prd_approved=prd_approved,
         spec_approved=spec_approved,
         implementation_authorized=implementation_authorized,
-        principle_sha256=hashlib.sha256(principle).hexdigest(),
+        governance_ref=governance_ref,
+        governance_commit=governance_commit,
+        governance_tree=str(snapshot["tree"]),
+        principle_sha256=str(snapshot["principle_sha256"]),
         base_ref=base_ref,
         base_commit=base_commit,
+        source_base_ref=source_base_ref,
         depends_on=_ids_from_field(prd, "依赖 PRD") or _ids_from_field(prd, "depends_on"),
         conflicts_with=_ids_from_field(prd, "冲突 PRD") or _ids_from_field(prd, "conflicts_with"),
-        candidate_refs=candidates,
+        candidate_refs=candidate_refs,
+        candidate_objects=candidate_objects,
+        verified_candidate_refs=verified_candidate_refs,
+        stable_candidate_bindings=stable_candidate_bindings,
         integrated=integrated,
-        active_writer=number in _active_workspace_iterations(root),
+        integrated_object=integrated_object,
+        active_writer=number in active,
         blockers=tuple(blockers),
     )
 
@@ -310,6 +499,44 @@ def _risk(value: Mapping[str, object]) -> RiskVector:
     return RiskVector(**normalized)
 
 
+def _declared_dependencies(root: Path, iteration: str) -> tuple[str, ...]:
+    number = iteration.strip()
+    path = root / "harness" / "iterations" / number / f"prd-{number}.md"
+    if not path.is_file():
+        raise CoordinatorError(f"declared dependency iteration is missing: PRD-{number}")
+    prd = _read_utf8(path)
+    return _ids_from_field(prd, "依赖 PRD") or _ids_from_field(prd, "depends_on")
+
+
+def _dependency_dag_blockers(root: Path, iteration: str) -> tuple[str, ...]:
+    blockers: list[str] = []
+    visited: set[str] = set()
+    visiting: list[str] = []
+
+    def visit(number: str) -> None:
+        if number in visiting:
+            cycle = visiting[visiting.index(number) :] + [number]
+            blockers.append("dependency-cycle:" + "->".join(cycle))
+            return
+        if number in visited:
+            return
+        visiting.append(number)
+        try:
+            dependencies = _declared_dependencies(root, number)
+        except CoordinatorError as exc:
+            blockers.append(f"dependency-authority-missing:{number}:{exc}")
+            visiting.pop()
+            visited.add(number)
+            return
+        for dependency in dependencies:
+            visit(dependency)
+        visiting.pop()
+        visited.add(number)
+
+    visit(iteration)
+    return tuple(dict.fromkeys(blockers))
+
+
 def plan_route(
     project_root: str | Path,
     *,
@@ -320,25 +547,43 @@ def plan_route(
     operation_id: str | None = None,
 ) -> CoordinatorPlan:
     root = resolve_root(project_root)
+    operation = operation_id or f"OP-{uuid.uuid4().hex}"
+    if not OP_RE.fullmatch(operation):
+        raise CoordinatorError("operation ID must use canonical OP- plus 32 lowercase hexadecimal characters")
     authority = derive_iteration_authority(root, iteration)
-    active = _active_workspace_iterations(root)
+    leases = _workspace_lease_snapshots(root)
+    active = set(leases)
     blockers = list(authority.blockers)
-    dependency_candidates: dict[str, tuple[str, ...]] = {}
+    blockers.extend(_dependency_dag_blockers(root, authority.iteration))
+    dependency_candidates: dict[str, tuple[dict[str, str], ...]] = {}
+    selected_dependency_bindings: list[dict[str, str]] = []
     for dependency in authority.depends_on:
         dep = derive_iteration_authority(root, dependency)
-        dependency_candidates[dependency] = dep.candidate_refs
-        if not dep.candidate_refs and not dep.integrated:
+        dependency_candidates[dependency] = dep.stable_candidate_bindings
+        blockers.extend(f"dependency-authority:{dependency}:{reason}" for reason in dep.blockers)
+        if not dep.stable_candidate_bindings:
             blockers.append(f"dependency-stable-candidate-missing:{dependency}")
-        elif dep.candidate_refs:
-            leases = _workspace_lease_snapshots(root)
-            current_generation = dep.candidate_refs[-1].rsplit("/", 1)[-1]
-            dependent_lease = leases.get(authority.iteration)
-            if dependent_lease is not None:
-                bound = dependent_lease.get("dependency_generations")
-                if isinstance(bound, Mapping):
-                    accepted_generation = bound.get(dependency)
-                    if accepted_generation is not None and accepted_generation != current_generation:
-                        blockers.append(f"dependency-candidate-stale:{dependency}")
+        else:
+            selected_dependency_bindings.append(dict(dep.stable_candidate_bindings[-1]))
+    if selected_dependency_bindings:
+        executable = shutil.which("git")
+        if not executable:
+            raise CoordinatorError("Git is required")
+        dependency_context = workspace.RepositoryContext(
+            git=executable,
+            project_root=root,
+            common_dir=_common_dir(root),
+        )
+        order_blockers = workspace.dependency_order_blockers(
+            dependency_context,
+            selected_dependency_bindings,
+        )
+        blockers.extend(f"dependency-order:{item.code}:{item.message}" for item in order_blockers)
+    current_lease = leases.get(authority.iteration)
+    if current_lease is not None:
+        current_bindings = current_lease.get("dependency_bindings")
+        if not isinstance(current_bindings, list) or current_bindings != selected_dependency_bindings:
+            blockers.append("dependency-baseline-stale:explicit-refresh-required")
     for conflict in authority.conflicts_with:
         if conflict in active:
             blockers.append(f"declared-conflict-active:{conflict}")
@@ -354,7 +599,7 @@ def plan_route(
                 prd_approved=authority.prd_approved,
                 spec_approved=authority.spec_approved,
                 implementation_authorized=authority.implementation_authorized,
-                integration_authorized=bool(authority.candidate_refs),
+                integration_authorized=bool(authority.verified_candidate_refs),
                 finally_accepted=authority.integrated,
             ),
         )
@@ -366,12 +611,7 @@ def plan_route(
         blockers.append("spec-not-approved")
     if not read_only and not authority.implementation_authorized:
         blockers.append("implementation-not-authorized")
-    if decision.execution_topology == "stacked-worktree" and not active:
-        # A dependent PRD still needs an isolated path even if it is the first
-        # local writer, because its base is not canonical main.
-        topology = "stacked-worktree"
-    else:
-        topology = decision.execution_topology
+    topology = decision.execution_topology
     steps: list[dict[str, object]] = [
         {"step": "authority-preflight", "writes": False},
         {"step": "three-axis-classification", "writes": False},
@@ -384,14 +624,32 @@ def plan_route(
                     "topology": topology,
                     "base_ref": authority.base_ref,
                     "base_commit": authority.base_commit,
+                    "source_base_ref": authority.source_base_ref,
+                    "implementation_ref": (
+                        selected_dependency_bindings[-1]["candidate_ref"]
+                        if selected_dependency_bindings
+                        else "refs/heads/main"
+                    ),
+                    "implementation_commit": (
+                        selected_dependency_bindings[-1]["candidate_commit"]
+                        if selected_dependency_bindings
+                        else authority.governance_commit
+                    ),
+                    "dependency_bindings": selected_dependency_bindings,
+                    "dependency_bindings_digest": workspace.dependency_bindings_digest(
+                        selected_dependency_bindings
+                    ),
                     "writes": False,
                 },
-                {"step": "workspace-apply", "writes": True, "action_level": "notify" if "worktree" in topology else "silent"},
+                {
+                    "step": "workspace-apply",
+                    "writes": True,
+                    "action_level": "notify" if "worktree" in topology else "silent",
+                },
             )
         )
     head = _text(_git(root, ["rev-parse", "--verify", "HEAD^{commit}"]))
     branch_result = _git(root, ["symbolic-ref", "-q", "HEAD"], check=False)
-    operation = operation_id or f"OP-{uuid.uuid4().hex}"
     payload = {
         "schema_version": SCHEMA_V1,
         "operation_id": operation,
@@ -401,6 +659,7 @@ def plan_route(
         "authority": asdict(authority),
         "decision": decision.as_dict(),
         "dependency_candidates": dependency_candidates,
+        "selected_dependency_bindings": selected_dependency_bindings,
         "planned_steps": steps,
         "blocking_reasons": sorted(set(blockers)),
     }
