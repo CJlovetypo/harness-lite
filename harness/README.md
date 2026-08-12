@@ -11,8 +11,8 @@
 
 <!-- project-harness:focus:start -->
 - 当前迭代：[001](iterations/001/README.md) — 并行 PRD 编排与全局治理无感化。
-- 当前门禁：P-001～P-003、PRD-001 与 SPEC-001 已批准，实施已授权；checkpoint 1 已保存前序三路起草改动，尚需发布治理 checkpoint 2。
-- 下一步：验证并明确提交 `AGENTS.md` 与 `harness/` 治理基线；不 push。完成后把 PRD/SPEC 转为实施中，进入 v2 身份与可恢复性底座。
+- 当前门禁：PRD-001 / SPEC-001 实施中；v2 identity/ref/journal/status 首切片已通过并发、legacy 与治理校验，等待本地 checkpoint 确认；未 push。
+- 下一步：明确提交首切片；随后统一 worktree/commit-tree validator 语义核心并完成 v2/legacy anchor compatibility，再进入 Local/worktree 编排。
 <!-- project-harness:focus:end -->
 
 ## 迭代索引
@@ -20,7 +20,7 @@
 | 迭代 | 标题 | PRD | SPEC | 开放偏差 | 一句话结果 | 下一步 | 入口 |
 |---|---|---|---|---:|---|---|---|
 <!-- project-harness:iterations:start -->
-| [001](iterations/001/README.md) | 并行 PRD 编排与全局治理无感化 | 已批准 | 已批准 | 0 | 原则与实施基线已批准；checkpoint 1 已完成 | 提交治理 checkpoint 2 后开始实现 | [进入](iterations/001/README.md) |
+| [001](iterations/001/README.md) | 并行 PRD 编排与全局治理无感化 | 实施中 | 实施中 | 0 | v2 identity/reservation 首切片已验证，尚未 candidate 化 | 确认首切片 checkpoint 后收束 validator/anchor compatibility | [进入](iterations/001/README.md) |
 <!-- project-harness:iterations:end -->
 
 ## 渐进阅读路由

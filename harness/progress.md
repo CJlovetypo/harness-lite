@@ -13,7 +13,7 @@
 | 迭代 | PRD 状态 | SPEC 状态 | 下一步 |
 |---|---|---|---|
 <!-- project-harness:progress-index:start -->
-| [001](iterations/001/README.md) | 已批准 | 已批准 | 提交治理 checkpoint 2 后开始实现 |
+| [001](iterations/001/README.md) | 实施中 | 实施中 | 确认首切片 checkpoint 后收束 validator/anchor compatibility |
 <!-- project-harness:progress-index:end -->
 
 ## 事件
@@ -87,3 +87,27 @@
 - 验证证据：70 tests passed；本地与安装版 Harness validator 均为 0 errors；staged `git diff --check` 通过。
 - 关联偏差：无；这是实施前过渡记录，不是 as-built deviation。
 - 未决问题与下一步：验证并提交 checkpoint 2（仅 `AGENTS.md` 与 `harness/`），排除 pycache；然后进入实施中。
+
+## S-20260812-03 / CHECKPOINT / 2026-08-12T00:13:14+08:00
+
+- 关联：PRD-001 / SPEC-001 / checkpoint 2
+- 会话背景：两次获准 lifecycle-v2 bootstrap checkpoint 已完成，实施前置门禁关闭。
+- 用户目标：基于已批准原则、PRD、SPEC 和开放问题裁决开始迭代。
+- 决策与依据：先实现身份与可恢复性底座，避免在没有 refs/journal/status 的情况下直接扩展 worktree 和共享治理合并。
+- 执行与变更：治理 checkpoint 2 已创建为本地 commit `2d1be71`，范围为 `AGENTS.md` 与 8 个 `harness/` 文件；PRD/SPEC 状态切换为实施中。
+- Git 透明：checkpoint 2 message 为 `checkpoint: establish PRD-001 governance baseline`，9 条路径、950 additions；未 push。当前继续使用 Local，不创建 worktree。
+- 验证证据：70 tests passed；两套 validator 0 errors；checkpoint 2 staged diff check 通过；旧 base anchor 保持 `7376803cffb09269bc8a03346901b2e9e224d704`。
+- 关联偏差：无。
+- 未决问题与下一步：实现 v2 status、兼容 refs、operation journal 和原子 reservation；完成后执行结构、并发、恢复与 legacy 回归测试。
+
+## S-20260812-04 / CHECKPOINT / 2026-08-12T08:16:05+08:00
+
+- 关联：PRD-001 / SPEC-001 / v2 identity-reservation first slice
+- 会话背景：在不提前创建 worktree、branch、governance bundle 或 candidate 的前提下，先建立多 PRD 编排所需的身份、CAS、journal、状态与治理基线底座。
+- 用户目标：Harness 自动判断和编排，但任何新 worktree、commit、push 都必须明确告知；全局 principle 与过程 progress 始终保持权威。
+- 决策与依据：实现基线必须来自显式允许 ref；全局治理基线固定读取 committed `refs/heads/main`，而不是调用者 cwd/worktree。plan 必须零写并绑定 digest，reserve 才能创建 common-dir journal 与 v2 allocation/base refs；Git transaction 同时验证 accepted base/governance refs。
+- 执行与变更：新增版本化 JSON `status`、`plan reserve-iteration`、`reserve-iteration`；实现 v2/legacy ref inventory、原子 allocation/base reservation、operation lock/journal 幂等恢复、坏 journal/orphan/ref mismatch 阻断、旧写入口保护，以及 main commit tree 的 bounded object validation。plan/journal/allocation/status 共同绑定 governance commit/tree 与 principle SHA-256。
+- Git 透明：本切片尚未创建 worktree、branch 或真实 v2 ref；尚未 commit、未 push。真实仓库仍只有旧 `PRD-001` base anchor，且只有当前 main worktree。
+- 验证证据：新增并发/恢复黑盒 18/18 通过（106.864 秒，反方复跑 112.2 秒）；legacy 回归 70/70 通过（367.668 秒）；本地与安装版 validator 均为 0 errors / 0 warnings；无落盘语法编译与 `git diff --check` 通过。marker-only 损坏 main、caller-only 实现差异、source-ref 漂移均有固定回归。
+- 关联偏差：无；当前是非 candidate 的实现 checkpoint，不改变已批准产品范围或验收标准。
+- 未决问题与下一步：提交前需用户确认 exact scope/message；下一切片统一 worktree/commit-tree validator 纯语义核心，补齐 v2/legacy anchor compatibility，并让 status 重算 governance object 一致性后再进入 Local/worktree 编排。

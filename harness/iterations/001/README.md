@@ -6,10 +6,10 @@
 ## 状态卡
 
 - 迭代：`001`
-- PRD 状态：`已批准`
-- SPEC 状态：`已批准`
+- PRD 状态：`实施中`
+- SPEC 状态：`实施中`
 - 开放偏差：`0`
-- 摘要更新时间：`2026-08-11`
+- 摘要更新时间：`2026-08-12`
 
 ## 本轮目标
 
@@ -17,7 +17,7 @@
 
 ## 当前结果
 
-已批准 14 项需求、16 项验收标准、P-001～P-003 全局原则和 SPEC 技术基线；6 个开放问题均已裁决，用户已明确授权开始实施。Checkpoint 1 已保存前序三路起草改动，hash 为 `6cc0104075b5394a3ed6c6933b59817832503aeb`，未 push。
+已批准 14 项需求、16 项验收标准、P-001～P-003 全局原则和 SPEC 技术基线；6 个开放问题均已裁决。Checkpoint 1 `6cc0104` 与治理 checkpoint 2 `2d1be71` 均已本地创建且未 push。v2 identity/ref/journal/status 首切片已完成只读 plan/status、显式 digest 接受、原子 reservation、崩溃恢复、legacy 阻断和 committed-main 治理树校验，尚未形成 candidate/final。
 
 仓库在本轮创建前已有 11 个已跟踪修改文件和未跟踪 `evals/`。用户裁决这些三路起草分类改动先形成独立本地提交；提交完成后才开始 PRD-001 新实现。
 
@@ -29,12 +29,14 @@
 | 2026-08-11 | `S-20260811-03 / CHECKPOINT` | 完成 PRD/SPEC 草案；等待原则、开放问题与基线审阅 |
 | 2026-08-12 | `S-20260812-01 / DECISION` | 批准原则与 PRD/SPEC，裁决开放问题并授权实施 |
 | 2026-08-12 | `S-20260812-02 / CHECKPOINT` | 前序 drafting-path 改动已提交；记录 lifecycle-v2 bootstrap 过渡 |
+| 2026-08-12 | `S-20260812-03 / CHECKPOINT` | 治理 checkpoint 已发布；开始 v2 identity/ref/journal/status 实现 |
+| 2026-08-12 | `S-20260812-04 / CHECKPOINT` | v2 identity/reservation 首切片验证通过；等待明确本地提交 |
 
 ## 开放事项与下一步
 
 - 开放偏差：无。
-- 提交 PRD-001 治理基线，范围仅限 `AGENTS.md` 与 `harness/`；完成后报告 hash 与未 push 状态。
-- 随后把 PRD/SPEC 状态切换为实施中，先实现 v2 identity/ref/journal/status 最小闭环。
+- 明确确认并提交 v2 identity/ref/journal/status 首切片；提交不包含 pycache，且不 push。
+- 下一切片统一 worktree/commit-tree validator 语义核心，补齐 v2/legacy anchor compatibility 与 governance status 重算，再进入 Local/worktree 编排。
 - 当前只有一个活跃 PRD，保持 Local；不创建 worktree，不 push。
 
 ## 文档地图与按需阅读

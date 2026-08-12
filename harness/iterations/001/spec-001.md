@@ -4,13 +4,13 @@
 ## 文档元数据
 
 - SPEC ID：`SPEC-001`
-- 状态：`已批准`
+- 状态：`实施中`
 - 创建日期：`2026-08-11`
 - 对应需求：[`prd-001.md`](prd-001.md)
 - 对应偏差：[`deviation-001.md`](deviation-001.md)
 - 当前批准基线：用户于 2026-08-11 批准的 PRD-001（R-001-01～R-001-14 / AC-001-01～AC-001-16）及 P-001～P-003。
 - 批准依据：用户于 2026-08-11 明确批准 SPEC-001 实施规格，逐项裁决 OQ-001-01～OQ-001-06，并要求按推荐方案和指定 `merge --no-ff` 策略开始迭代。
-- 实施授权：用户明确要求“基于上面的澄清，开始进行迭代”；先提交既有三路起草改动，再开始 PRD-001 新实现。
+- 实施授权：用户已明确授权并要求开始实施 PRD-001 / SPEC-001；按其指令先提交既有三路起草改动，再开始本迭代新实现。
 
 ## 0. Lifecycle-v2 Bootstrap 过渡
 
@@ -133,18 +133,18 @@ IDLE -> SINGLE_LOCAL -> PARALLEL -> DRAINING -> IDLE
 新生命周期至少使用：
 
 ```text
-refs/project-harness/allocations/NNN
-refs/project-harness/iterations/NNN/base
-refs/project-harness/iterations/NNN/candidates/GGG
-refs/project-harness/iterations/NNN/integrated
-refs/project-harness/iterations/NNN/final
+refs/project-harness/v2/allocations/NNN
+refs/project-harness/v2/iterations/NNN/base
+refs/project-harness/v2/iterations/NNN/candidates/GGG
+refs/project-harness/v2/iterations/NNN/integrated
+refs/project-harness/v2/iterations/NNN/final
 ```
 
 - allocation 与 ref 创建使用 `git update-ref` compare-and-swap 或原子 transaction，不再由各 worktree 独立扫描 `max+1`。
 - `base` 创建后不可变。
 - 每次 candidate 内容改变创建新 generation，不覆盖已被证据引用的 generation。
 - `integrated` 绑定 latest-main 组合后的 exact tree/commit；`final` 绑定最终验收关闭身份。
-- 现有 `refs/project-harness/iterations/NNN/base/refs/heads/...` 与 final refs 继续可读，迁移不得改写。
+- v2 使用独立顶层 namespace，避免与现有 `refs/project-harness/iterations/NNN/base/refs/heads/...` 的 file/directory ref namespace 冲突。legacy base/final refs 继续只读兼容，迁移不得改写，也不得尝试在 legacy `.../base` 前缀创建 direct ref。
 
 ### 3.3 Leases
 
@@ -412,3 +412,7 @@ iteration 元数据增加 `depends_on`、`conflicts_with`、integration target�
 
 - 2026-08-11：根据多 PRD、懒 worktree、无感交互、Git 透明、principle/progress 和 merge train 讨论形成 SPEC 草案；尚未批准，尚未授权实施。
 - 2026-08-11：用户裁决全部开放问题、批准 P-001～P-003 和本 SPEC，并明确授权按“先提交既有改动，再开始实现”执行。
+- 2026-08-12：checkpoint `6cc0104` 与 `2d1be71` 完成且未 push；开始执行 identity/ref/journal/status 最小闭环。
+- 2026-08-12：将新 refs 修正到 `refs/project-harness/v2/...` 独立 namespace，避免与 legacy nested base ref 冲突；不改变产品范围或授权门禁。
+- 2026-08-12：完成首个 v2 实现切片：只读 `status` / `plan reserve-iteration`、显式 plan digest 接受、Git common-dir operation journal、allocation/base 原子 CAS、legacy/v2 状态识别与旧写入口阻断；该切片不创建 branch/worktree/governance bundle，不 commit、不 push。
+- 2026-08-12：独立实现基线与全局治理基线；任意 worktree 发起时，base 只能来自显式允许 ref，governance 固定读取并校验 committed `refs/heads/main` tree，同时把 governance commit/tree 与 principle 内容哈希绑定到 plan、journal、allocation metadata 和 status。提交树校验与 worktree 校验的共享纯语义核心将在下一切片收束，当前 checkpoint 不构成 candidate/final。
