@@ -11,8 +11,8 @@
 
 <!-- project-harness:focus:start -->
 - 当前迭代：[001](iterations/001/README.md) — 并行 PRD 编排与全局治理无感化。
-- 当前门禁：PRD-001 / SPEC-001 实施中；v2 identity/ref/journal/status 首切片已提交为 `ca8223b` 且未 push。用户已授权后续非最终 checkpoint 由协调器验证后自行提交并报告。
-- 下一步：统一 worktree/commit-tree validator 语义核心并完成 v2/legacy anchor compatibility；并行推进 Local/worktree 与治理 reconciler 的隔离切片。
+- 当前门禁：PRD-001 / SPEC-001 实施中；三轴决策 checkpoint `721c291` 已提交且未 push。治理/candidate/upgrade/UX 纯门禁切片已通过 81 项回归，正在形成自主非最终 checkpoint。
+- 下一步：提交纯门禁切片；随后单独收束 validator/anchor compatibility 与 Local/worktree 编排，补齐 B-first 原地 branch binding。
 <!-- project-harness:focus:end -->
 
 ## 迭代索引
@@ -20,7 +20,7 @@
 | 迭代 | 标题 | PRD | SPEC | 开放偏差 | 一句话结果 | 下一步 | 入口 |
 |---|---|---|---|---:|---|---|---|
 <!-- project-harness:iterations:start -->
-| [001](iterations/001/README.md) | 并行 PRD 编排与全局治理无感化 | 实施中 | 实施中 | 0 | v2 identity/reservation 首切片已提交，尚未 candidate 化 | 收束 validator/anchor compatibility 与并行编排切片 | [进入](iterations/001/README.md) |
+| [001](iterations/001/README.md) | 并行 PRD 编排与全局治理无感化 | 实施中 | 实施中 | 0 | 三轴决策已提交；治理/candidate/upgrade/UX 纯门禁已验证 | 提交纯门禁 checkpoint，收束 validator/workspace | [进入](iterations/001/README.md) |
 <!-- project-harness:iterations:end -->
 
 ## 渐进阅读路由

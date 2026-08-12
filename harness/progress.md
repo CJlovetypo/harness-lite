@@ -123,3 +123,15 @@
 - 验证证据：上一 checkpoint `ca8223b` 为 7 条路径、4069 additions / 127 deletions；新增 18/18 与 legacy 70/70 通过，两套 validator 0 errors / 0 warnings；该 commit 未 push，旧 base anchor 未改变。
 - 关联偏差：无；仅调整本轮 checkpoint 交互门禁，不改变 PRD 产品范围、验收标准或全局 principle。
 - 未决问题与下一步：各隔离切片完成后统一集成测试并自主创建非最终 checkpoint；最终 candidate/integrated 证据包提交用户校核。
+
+## S-20260812-06 / CHECKPOINT / 2026-08-12T12:35:00+08:00
+
+- 关联：PRD-001 / SPEC-001 / governance-candidate-upgrade-UX slice
+- 会话背景：按三轴决策 checkpoint 之后的执行计划，先收束不直接执行 Git mutation 的治理合并、候选证据、升级预览和用户交互契约，避免与仍在修改的 validator/workspace adapter 混合提交。
+- 用户目标：多 PRD 编排尽可能无感且鲁棒；principle 维持全局产品控制，progress 保留过程证据；worktree、commit、push 保持透明，最终只校核完整产物。
+- 决策与依据：principle 使用三方 exact-approval gate，progress 使用不可变事件 union，README 只重建 managed 区；candidate/integrated/main-advance 分层绑定 evidence digest；默认 `merge --no-ff`，其他策略改变 identity 时必须生成新 integrated generation、显式重验和新证据；升级首步只提供零写 dry-run，不静默迁移 legacy；所有动作由版本化 Silent/Notify/Confirm envelope fail-closed。
+- 执行与变更：新增 `harness_governance.py`、`harness_candidate.py`、`harness_upgrade.py`、`harness_ux.py` 及其隔离测试。本切片均为纯 plan/gate/preview，不创建 branch/worktree/ref，不 merge，不推进 main，不 commit implementation，不 push。
+- Git 透明：本事件对应的非最终 checkpoint 由用户 standing authorization 覆盖；精确范围为上述 4 个模块、4 个测试和本轮治理路由记录。提交完成后报告 hash 与 `pushed=false`；pycache、validator/workspace 中间态均排除。
+- 验证证据：decision/governance/candidate/upgrade/UX 合并回归 81/81 通过；governance 真实 `progress.md` 解析 9 events / 0 blockers；所有目标路径 `git diff --check` 通过；candidate identity-rebind 正反例、legacy upgrade 零写、worktree/commit/push 通知字段均有固定测试。
+- 关联偏差：无；实现与已批准 R-001-01～R-001-05、R-001-10～R-001-14 / SPEC §4～§8、§11 一致。
+- 未决问题与下一步：提交本 checkpoint 后，单独 checkpoint validator/anchor compatibility 与 Local/worktree 编排；补齐 B-first 原地 branch binding，再进入实际 candidate refs/merge-train adapter 和最终文档/eval 收束。
