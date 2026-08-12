@@ -16,6 +16,7 @@ if str(TESTS) not in sys.path:
 
 import harness_integrated_evidence as registry  # noqa: E402
 import harness_train as train  # noqa: E402
+import harness_coordinator as coordinator  # noqa: E402
 import test_harness_train as _train_tests  # noqa: E402
 
 
@@ -73,6 +74,12 @@ class IntegratedEvidenceRegistryTests(unittest.TestCase):
             ),
         )
         for reference in self.plan_refs:
+            self.helper.git("update-ref", "-d", reference, check=False)
+        for reference in (
+            "refs/project-harness/v2/iterations/001/integrated",
+            "refs/project-harness/v2/iterations/001/final",
+            registry.iteration_final_evidence_ref("001"),
+        ):
             self.helper.git("update-ref", "-d", reference, check=False)
         # Restore source identities after any preceding drift/tamper case.
         self.helper.git(
@@ -282,6 +289,91 @@ class IntegratedEvidenceRegistryTests(unittest.TestCase):
         )
         self.assertEqual(blockers, ())
         self.assertIsNotNone(loaded)
+
+    def test_main_advance_requires_public_registration_and_rejects_tamper(self) -> None:
+        with self.assertRaisesRegex(train.TrainError, "RegisteredIntegratedEvidence"):
+            train.plan_main_advance(self.integration)
+
+        plan = self.plan()
+        receipt = self.apply(plan)
+        clean = train.plan_main_advance(receipt)
+        self.assertNotIn(
+            "integrated-evidence-registration-required",
+            {item.code for item in clean.blockers},
+        )
+        wrong_blob = self.helper.git(
+            "hash-object",
+            "-w",
+            "--stdin",
+            input_text='{"tampered":true}\n',
+        ).stdout.strip()
+        self.helper.git("update-ref", plan.evidence_ref, wrong_blob, plan.metadata_blob)
+
+        blocked = train.plan_main_advance(receipt)
+
+        self.assertTrue(
+            {
+                "integrated-evidence-metadata-invalid",
+                "integrated-evidence-ref-drift",
+                "integrated-evidence-registration-required",
+            }
+            & {item.code for item in blocked.blockers}
+        )
+
+    def test_main_cas_crash_recovery_binds_public_evidence_and_coordinator_loader(self) -> None:
+        receipt = self.apply(self.plan())
+        self.helper.bind_primary_for_main_advance()
+        advance = train.plan_main_advance(receipt)
+        self.assertEqual(advance.blockers, ())
+        authorization = "AUTH-ADVANCE-REGISTRY"
+        token = train.ConfirmationToken(
+            schema_version=train.CONFIRM_TOKEN_SCHEMA,
+            action="advance-main",
+            subject_digest=advance.plan_digest,
+            authorization_id=authorization,
+            token_digest=train.confirmation_token_digest(
+                "advance-main", advance.plan_digest, authorization
+            ),
+        )
+
+        def crash(stage: str) -> None:
+            if stage == "main-advance-after-refs":
+                raise train.InjectedCrash(stage)
+
+        with self.assertRaises(train.InjectedCrash):
+            train.apply_main_advance(
+                advance,
+                accepted_plan_digest=advance.plan_digest,
+                accepted_integrated_evidence_digest=receipt.registration_digest,
+                confirmation_token=token,
+                failpoint=crash,
+            )
+        recovered = train.apply_main_advance(
+            advance,
+            accepted_plan_digest=advance.plan_digest,
+            accepted_integrated_evidence_digest=receipt.registration_digest,
+            confirmation_token=token,
+        )
+        self.assertTrue(recovered.idempotent)
+        for reference in (
+            "refs/project-harness/v2/iterations/001/integrated",
+            "refs/project-harness/v2/iterations/001/final",
+        ):
+            self.assertEqual(self.helper.oid(reference), receipt.metadata.integrated_commit)
+        self.assertEqual(
+            self.helper.oid(registry.iteration_final_evidence_ref("001")),
+            receipt.evidence_blob,
+        )
+
+        refs = coordinator._refs(self.root)
+        integrated, oid, blockers = coordinator._integrated_observation(
+            self.root,
+            "001",
+            refs,
+        )
+        self.assertTrue(integrated, blockers)
+        self.assertEqual(oid, receipt.metadata.integrated_commit)
+        self.assertEqual(blockers, ())
 
 
 if __name__ == "__main__":

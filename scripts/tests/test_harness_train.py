@@ -28,6 +28,7 @@ import harness_workspace as workspace  # noqa: E402
 import harness_governance  # noqa: E402
 import harness_principle_audit as principle_audit  # noqa: E402
 import harness_train as train  # noqa: E402
+import harness_integrated_evidence as integrated_registry  # noqa: E402
 from harness_train import (  # noqa: E402
     ConfirmationToken,
     InjectedCrash,
@@ -542,6 +543,18 @@ class HarnessTrainTests(unittest.TestCase):
                 plan.commit_plan_digest,
                 f"COMMIT-{plan.generation}",
             ),
+        )
+
+    def register_integration(self, committed):
+        plan = integrated_registry.plan_register_integrated_evidence(
+            committed,
+            commit_confirmation_token=committed.commit_confirmation_token,
+        )
+        self.assertEqual(plan.blockers, ())
+        return integrated_registry.apply_register_integrated_evidence(
+            plan,
+            accepted_plan_digest=plan.plan_digest,
+            commit_confirmation_token=committed.commit_confirmation_token,
         )
 
     def detach_primary(self) -> None:
@@ -1533,7 +1546,8 @@ class HarnessTrainTests(unittest.TestCase):
         committed = self.commit(prepared)
         self.bind_primary_for_main_advance()
         before_file = (self.root / "app.txt").read_bytes()
-        advance = plan_main_advance(committed)
+        registered = self.register_integration(committed)
+        advance = plan_main_advance(registered)
         self.assertEqual(advance.blockers, ())
         evidence = committed.integrated_candidate
         assert evidence is not None
@@ -1548,14 +1562,14 @@ class HarnessTrainTests(unittest.TestCase):
             apply_main_advance(
                 advance,
                 accepted_plan_digest=advance.plan_digest,
-                accepted_integrated_evidence_digest=evidence.evidence_digest,
+                accepted_integrated_evidence_digest=advance.integrated_evidence_digest,
                 confirmation_token=self.token("prepare-integration", advance.plan_digest, "WRONG-ADVANCE"),
             )
 
         result = apply_main_advance(
             advance,
             accepted_plan_digest=advance.plan_digest,
-            accepted_integrated_evidence_digest=evidence.evidence_digest,
+            accepted_integrated_evidence_digest=advance.integrated_evidence_digest,
             confirmation_token=self.token("advance-main", advance.plan_digest, "ADVANCE-001"),
         )
 
@@ -1612,7 +1626,8 @@ class HarnessTrainTests(unittest.TestCase):
         self.assertFalse(commit_after.facts["remote_involved"])
 
         self.bind_primary_for_main_advance()
-        advance = plan_main_advance(committed)
+        registered = self.register_integration(committed)
+        advance = plan_main_advance(registered)
         advance_before = main_advance_interaction(advance, "before")
         self.assertEqual(advance_before.action, "main-advance")
         self.assertEqual(advance_before.action_level, "confirm")
@@ -1622,7 +1637,7 @@ class HarnessTrainTests(unittest.TestCase):
         result = apply_main_advance(
             advance,
             accepted_plan_digest=advance.plan_digest,
-            accepted_integrated_evidence_digest=evidence.evidence_digest,
+            accepted_integrated_evidence_digest=advance.integrated_evidence_digest,
             confirmation_token=self.token("advance-main", advance.plan_digest, "ADVANCE-UX"),
         )
         advance_after = main_advance_interaction(advance, "after")
@@ -1653,13 +1668,13 @@ class HarnessTrainTests(unittest.TestCase):
         _prepare_plan, prepared, _notifications = self.prepare((candidate,))
         committed = self.commit(prepared)
         self.bind_primary_for_main_advance()
-        advance = plan_main_advance(committed)
+        advance = plan_main_advance(self.register_integration(committed))
         evidence = committed.integrated_candidate
         assert evidence is not None
         result = apply_main_advance(
             advance,
             accepted_plan_digest=advance.plan_digest,
-            accepted_integrated_evidence_digest=evidence.evidence_digest,
+            accepted_integrated_evidence_digest=advance.integrated_evidence_digest,
             confirmation_token=self.token("advance-main", advance.plan_digest, "ADVANCE-CLEANUP-IGNORED"),
         )
         worktree = Path(committed.integration_worktree)
@@ -1675,13 +1690,13 @@ class HarnessTrainTests(unittest.TestCase):
         _prepare_plan, prepared, _notifications = self.prepare((candidate,))
         committed = self.commit(prepared)
         self.bind_primary_for_main_advance()
-        advance = plan_main_advance(committed)
+        advance = plan_main_advance(self.register_integration(committed))
         evidence = committed.integrated_candidate
         assert evidence is not None
         result = apply_main_advance(
             advance,
             accepted_plan_digest=advance.plan_digest,
-            accepted_integrated_evidence_digest=evidence.evidence_digest,
+            accepted_integrated_evidence_digest=advance.integrated_evidence_digest,
             confirmation_token=self.token("advance-main", advance.plan_digest, "ADVANCE-CLEANUP-CRASH"),
         )
         worktree = Path(committed.integration_worktree)
@@ -1727,18 +1742,19 @@ class HarnessTrainTests(unittest.TestCase):
         _prepare_plan, prepared, _notifications = self.prepare((candidate,))
         committed = self.commit(prepared)
 
-        checked_out = plan_main_advance(committed)
+        registered = self.register_integration(committed)
+        checked_out = plan_main_advance(registered)
 
         self.assertIn("main-ref-checked-out", {item.code for item in checked_out.blockers})
         self.detach_primary()
-        detached = plan_main_advance(committed)
+        detached = plan_main_advance(registered)
         self.assertIn(
             "main-release-local-holder-active",
             {item.code for item in detached.blockers},
         )
         self.git("switch", "main")
         self.bind_primary_for_main_advance()
-        planned = plan_main_advance(committed)
+        planned = plan_main_advance(registered)
         self.assertEqual(planned.blockers, ())
         self.git("update-ref", "refs/heads/main", self.a_commit, self.base)
         evidence = committed.integrated_candidate
@@ -1747,7 +1763,7 @@ class HarnessTrainTests(unittest.TestCase):
             apply_main_advance(
                 planned,
                 accepted_plan_digest=planned.plan_digest,
-                accepted_integrated_evidence_digest=evidence.evidence_digest,
+                accepted_integrated_evidence_digest=planned.integrated_evidence_digest,
                 confirmation_token=self.token("advance-main", planned.plan_digest, "ADVANCE-DRIFT"),
             )
 
@@ -1756,7 +1772,7 @@ class HarnessTrainTests(unittest.TestCase):
         _prepare_plan, prepared, _notifications = self.prepare((candidate,))
         committed = self.commit(prepared)
         self.bind_primary_for_main_advance()
-        advance = plan_main_advance(committed)
+        advance = plan_main_advance(self.register_integration(committed))
         evidence = committed.integrated_candidate
         assert evidence is not None
         token = self.token("advance-main", advance.plan_digest, "ADVANCE-CRASH")
@@ -1769,14 +1785,14 @@ class HarnessTrainTests(unittest.TestCase):
             apply_main_advance(
                 advance,
                 accepted_plan_digest=advance.plan_digest,
-                accepted_integrated_evidence_digest=evidence.evidence_digest,
+                accepted_integrated_evidence_digest=advance.integrated_evidence_digest,
                 confirmation_token=token,
                 failpoint=crash,
             )
         recovered = apply_main_advance(
             advance,
             accepted_plan_digest=advance.plan_digest,
-            accepted_integrated_evidence_digest=evidence.evidence_digest,
+            accepted_integrated_evidence_digest=advance.integrated_evidence_digest,
             confirmation_token=token,
         )
 

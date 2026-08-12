@@ -881,6 +881,60 @@ def _append_exact_event(content: bytes, event: bytes, newline: bytes) -> bytes:
     return content + separator + event
 
 
+def append_progress_event_exact(
+    content: bytes,
+    event: ProgressEventV2,
+) -> tuple[bytes, bool]:
+    """Return an exact semantic append suitable for an integration snapshot.
+
+    This is the write-free counterpart of :func:`plan_progress_append`.  It is
+    intentionally small so a merge-train governance adapter can pre-bind an
+    immutable event inside the candidate tree without consulting the live
+    checkout or creating a second operation journal.  Existing same-ID/same-
+    bytes events are idempotent; same-ID/different-bytes and missing causal
+    parents fail closed.
+    """
+
+    if not isinstance(content, bytes):
+        raise TypeError("content must be bytes")
+    if not isinstance(event, ProgressEventV2):
+        raise TypeError("event must be ProgressEventV2")
+    if len(content) > MAX_PROGRESS_BYTES:
+        raise ProgressError("progress history exceeds the safe size")
+    style = _pure_eol_style(content, "progress history")
+    newline = b"\r\n" if style == "crlf" else b"\n"
+    rendered = event.render(newline)
+    parsed, existing = _event_by_identity(content, event.event_id)
+    if existing is not None:
+        if existing.exact_bytes != rendered:
+            raise ProgressError(
+                f"event ID {event.event_id} already exists with different exact bytes"
+            )
+        return content, False
+
+    identities = {item.identity for item in parsed.events}
+    if event.causal_parent is not None and event.causal_parent not in identities:
+        raise ProgressError(
+            f"event {event.event_id} causal parent is absent: {event.causal_parent}"
+        )
+    candidate = _append_exact_event(content, rendered, newline)
+    if len(candidate) > MAX_PROGRESS_BYTES:
+        raise ProgressError("progress history exceeds the safe size after event append")
+    semantic = plan_progress_union(
+        branch_base=content,
+        latest_main=content,
+        branch_candidate=candidate,
+    )
+    if (
+        not semantic.ready
+        or semantic.preview != candidate
+        or semantic.appended_event_identities != (event.event_id,)
+    ):
+        detail = _semantic_errors(semantic) or "semantic union did not preserve the exact event"
+        raise ProgressError(f"progress event cannot be reconciled exactly: {detail}")
+    return candidate, True
+
+
 def _semantic_errors(plan: object) -> str:
     blockers = getattr(plan, "blockers", ())
     return "; ".join(f"{item.code}: {item.message}" for item in blockers)
@@ -1606,6 +1660,7 @@ __all__ = [
     "RESULT_SCHEMA",
     "SimulatedCrash",
     "apply_progress_append",
+    "append_progress_event_exact",
     "build_progress_event",
     "candidate_event",
     "checkout_progress_variants",

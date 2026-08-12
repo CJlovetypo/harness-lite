@@ -238,6 +238,20 @@ class ProgressAppendTests(unittest.TestCase):
 
         self.assertEqual(self.event_count(self.root, original.event_id), 1)
 
+    def test_write_free_exact_append_is_idempotent_and_rejects_same_id_tamper(self) -> None:
+        original = self.event("snapshot-event", summary="exact train snapshot fact")
+
+        appended, changed = progress.append_progress_event_exact(BASE_PROGRESS, original)
+        repeated, repeated_changed = progress.append_progress_event_exact(appended, original)
+
+        self.assertTrue(changed)
+        self.assertFalse(repeated_changed)
+        self.assertEqual(repeated, appended)
+        conflicting = self.event("snapshot-event", summary="tampered train snapshot fact")
+        self.assertEqual(conflicting.event_id, original.event_id)
+        with self.assertRaisesRegex(progress.ProgressError, "different exact bytes"):
+            progress.append_progress_event_exact(appended, conflicting)
+
     def test_crash_after_atomic_replace_resumes_without_duplicate(self) -> None:
         event = self.event("crash-recovery")
         plan = progress.plan_progress_append(project_root=self.root, event=event)

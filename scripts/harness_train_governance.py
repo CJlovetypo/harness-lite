@@ -31,6 +31,7 @@ import time
 from typing import Callable, Literal, Mapping, Sequence
 
 import harness_governance
+import harness_progress
 import harness_reconcile
 import harness_train
 import project_harness
@@ -43,6 +44,9 @@ README_AUTHORITY_SCHEMA = "harness-lite.train-governance-readme-authority/v1"
 EXECUTION_JOURNAL_SCHEMA = "harness-lite.train-governance-execution-journal/v2"
 RESUME_STATE_SCHEMA = "harness-lite.train-governance-resume-state/v2"
 CANDIDATE_AUTHORITY_SCHEMA = "harness-lite.train-governance-candidate-authority/v2"
+TRAIN_PROGRESS_SPEC_SCHEMA = "harness-lite.train-progress-event-spec/v1"
+PROGRESS_EVIDENCE_RESOLUTION_SCHEMA = "harness-lite.progress-evidence-resolution/v1"
+PROGRESS_MATERIALIZATION_SCHEMA = "harness-lite.train-progress-materialization/v1"
 
 PRINCIPLE_PATH = harness_reconcile.PRINCIPLE_PATH
 PROGRESS_PATH = harness_reconcile.PROGRESS_PATH
@@ -186,6 +190,8 @@ class CandidateAuthorityBinding:
     seal_verification_receipt_digests: tuple[str, ...]
     verification_binding_digest: str
     principle_gate_binding_digest: str | None
+    candidate_progress_event_id: str
+    candidate_progress_event_sha256: str
     authority_digest: str
 
     def as_dict(self) -> dict[str, object]:
@@ -277,6 +283,7 @@ class GovernanceExecutionPreview:
     reconciliations: tuple[harness_reconcile.GovernanceReconcilePlan, ...]
     reconciliation_labels: tuple[str, ...]
     reconciliation_snapshots: tuple[harness_reconcile.GovernanceSnapshot, ...]
+    progress_events: tuple["TrainProgressEventSpec", ...]
     final_snapshot: harness_reconcile.GovernanceSnapshot
     blockers: tuple[AdapterBlocker, ...]
 
@@ -305,6 +312,62 @@ class GovernanceResumeState:
         }
 
 
+@dataclass(frozen=True)
+class TrainProgressEventSpec:
+    """One exact train-owned event pre-bound into the integrated tree.
+
+    ``integration_started`` is an immediately materialized historical fact.
+    The other transitions are proposals embedded before the downstream
+    commit/evidence identities exist; status consumers must use
+    :func:`materialize_train_progress_events` before projecting them.
+    """
+
+    schema_version: str
+    transition: Literal["integration_started", "integration_verified", "main_advanced"]
+    iteration: str
+    generation: str
+    event: harness_progress.ProgressEventV2
+    event_bytes_b64: str
+    event_sha256: str
+    evidence_ref: str
+    conditional: bool
+    spec_digest: str
+
+    def as_dict(self) -> dict[str, object]:
+        result = asdict(self)
+        result["event"] = self.event.as_dict()
+        return result
+
+
+@dataclass(frozen=True)
+class ProgressEvidenceResolution:
+    """Exact public-evidence result returned by a registry resolver."""
+
+    schema_version: str
+    ref_name: str
+    object_id: str
+    evidence_digest: str
+    event_ids: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TrainProgressMaterialization:
+    schema_version: str
+    transition: str
+    iteration: str
+    event_id: str
+    evidence_ref: str
+    conditional: bool
+    materialized: bool
+    blocker: str | None
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
 Failpoint = Callable[[str], None]
 
 
@@ -327,6 +390,7 @@ _ValidatedCandidate = tuple[
     _CommitSnapshot,
     _CommitSnapshot,
     CandidateAuthorityBinding,
+    harness_progress.ProgressEventV2,
 ]
 _ValidatedCandidates = tuple[_ValidatedCandidate, ...]
 
@@ -750,6 +814,8 @@ def _candidate_authority_from_mapping(value: object) -> CandidateAuthorityBindin
         "seal_verification_receipt_digests",
         "verification_binding_digest",
         "principle_gate_binding_digest",
+        "candidate_progress_event_id",
+        "candidate_progress_event_sha256",
         "authority_digest",
     }
     if not isinstance(value, dict) or set(value) != required:
@@ -786,6 +852,8 @@ def _candidate_authority_from_mapping(value: object) -> CandidateAuthorityBindin
         seal_verification_receipt_digests=tuple(seal),
         verification_binding_digest=str(value["verification_binding_digest"]),
         principle_gate_binding_digest=optional_principle,
+        candidate_progress_event_id=str(value["candidate_progress_event_id"]),
+        candidate_progress_event_sha256=str(value["candidate_progress_event_sha256"]),
         authority_digest=str(value["authority_digest"]),
     )
     digest_fields = (
@@ -793,6 +861,7 @@ def _candidate_authority_from_mapping(value: object) -> CandidateAuthorityBindin
         binding.candidate_evidence_metadata_digest,
         binding.candidate_evidence_digest,
         binding.verification_binding_digest,
+        binding.candidate_progress_event_sha256,
         binding.authority_digest,
     )
     oid_fields = (
@@ -804,6 +873,7 @@ def _candidate_authority_from_mapping(value: object) -> CandidateAuthorityBindin
         binding.schema_version != CANDIDATE_AUTHORITY_SCHEMA
         or any(DIGEST_RE.fullmatch(item) is None for item in digest_fields)
         or any(OID_RE.fullmatch(item) is None for item in oid_fields)
+        or harness_progress.EVENT_ID_RE.fullmatch(binding.candidate_progress_event_id) is None
         or binding.authority_digest != _digest(_candidate_authority_payload(binding))
     ):
         raise GovernanceAdapterError("durable candidate authority identity/digest is invalid")
@@ -817,6 +887,7 @@ def _load_public_candidate_metadata(
     Mapping[str, object],
     tuple[harness_train.CandidateVerificationReceipt, ...],
     tuple[harness_train.CandidateVerificationReceipt, ...],
+    harness_progress.ProgressEventV2,
 ]:
     if _resolve_ref(repo, candidate.candidate_evidence_ref) != candidate.candidate_evidence_blob:
         raise GovernanceAdapterError(
@@ -904,7 +975,28 @@ def _load_public_candidate_metadata(
         raise GovernanceAdapterError(
             f"candidate public seal receipts differ from registered authority: {candidate.candidate_ref}"
         )
-    return metadata, pre, seal
+    try:
+        candidate_event = harness_progress.ProgressEventV2.from_dict(metadata.get("progress_event"))
+    except (TypeError, harness_progress.ProgressError) as exc:
+        raise GovernanceAdapterError(
+            f"candidate public evidence lacks a valid progress event: {candidate.candidate_ref}"
+        ) from exc
+    event_hash = metadata.get("progress_event_bytes_sha256")
+    exact_hashes = {
+        _sha256(candidate_event.render(b"\n")),
+        _sha256(candidate_event.render(b"\r\n")),
+    }
+    if (
+        candidate_event.iteration != candidate.iteration
+        or candidate_event.scope != "candidate"
+        or candidate_event.operation_id != candidate.operation_id
+        or not isinstance(event_hash, str)
+        or event_hash not in exact_hashes
+    ):
+        raise GovernanceAdapterError(
+            f"candidate public progress event identity/bytes differ: {candidate.candidate_ref}"
+        )
+    return metadata, pre, seal, candidate_event
 
 
 def _public_candidate_authority(
@@ -914,7 +1006,11 @@ def _public_candidate_authority(
     generation: str,
     current_principle_sha256: str,
     supplied: harness_train.RegisteredCandidate | None = None,
-) -> tuple[harness_train.RegisteredCandidate, CandidateAuthorityBinding]:
+) -> tuple[
+    harness_train.RegisteredCandidate,
+    CandidateAuthorityBinding,
+    harness_progress.ProgressEventV2,
+]:
     if supplied is not None:
         try:
             blockers = harness_train.registered_candidate_gate(
@@ -949,7 +1045,7 @@ def _public_candidate_authority(
                 f"candidate public authority is blocked: PRD-{iteration}/{generation}: "
                 + ", ".join(item.code for item in blockers)
             )
-    metadata, pre, seal = _load_public_candidate_metadata(repo, loaded)
+    metadata, pre, seal, candidate_event = _load_public_candidate_metadata(repo, loaded)
     verification_binding = _digest(
         {
             "pre_seal": [item.as_dict() for item in pre],
@@ -972,19 +1068,21 @@ def _public_candidate_authority(
         seal_verification_receipt_digests=tuple(item.receipt_digest for item in seal),
         verification_binding_digest=verification_binding,
         principle_gate_binding_digest=_principle_gate_binding_digest(loaded, metadata),
+        candidate_progress_event_id=candidate_event.event_id,
+        candidate_progress_event_sha256=str(metadata["progress_event_bytes_sha256"]),
         authority_digest="0" * 64,
     )
     return loaded, replace(
         provisional,
         authority_digest=_digest(_candidate_authority_payload(provisional)),
-    )
+    ), candidate_event
 
 
 def _revalidate_candidate_authority(
     repo: harness_train.Repository,
     expected: CandidateAuthorityBinding,
 ) -> harness_train.RegisteredCandidate:
-    loaded, actual = _public_candidate_authority(
+    loaded, actual, _candidate_event = _public_candidate_authority(
         repo,
         iteration=expected.iteration,
         generation=expected.generation,
@@ -1007,7 +1105,7 @@ def _validate_candidates(
         raise GovernanceAdapterError("latest-main principle identity differs from integration plan")
     validated: list[_ValidatedCandidate] = []
     for supplied in plan.candidates:
-        candidate, binding = _public_candidate_authority(
+        candidate, binding, candidate_event = _public_candidate_authority(
             repo,
             iteration=supplied.iteration,
             generation=supplied.generation,
@@ -1018,7 +1116,7 @@ def _validate_candidates(
             raise GovernanceAdapterError(f"candidate principle baseline is stale: {candidate.candidate_ref}")
         base = _commit_snapshot(repo, candidate.base_commit, source_id=f"base:{candidate.base_commit}")
         branch = _commit_snapshot(repo, candidate.candidate_commit, source_id=f"candidate:{candidate.candidate_commit}")
-        validated.append((candidate, base, branch, binding))
+        validated.append((candidate, base, branch, binding, candidate_event))
     return main, tuple(validated)
 
 
@@ -1248,7 +1346,7 @@ def plan_premerge_normalization(
         blockers.append(AdapterBlocker("normalization-input-tree-unavailable", "an unmerged index cannot match a tree identity"))
 
     paths = set(main.files)
-    for _candidate, base, branch, _binding in candidates:
+    for _candidate, base, branch, _binding, _candidate_event in candidates:
         paths.update(base.files)
         paths.update(branch.files)
     tracked = _null_paths(_git(repo, ["ls-files", "-z", "--", "harness"], cwd=worktree).stdout)
@@ -1409,6 +1507,7 @@ def _execution_manifest(
                 preview.reconciliation_snapshots,
             )
         ],
+        "progress_events": [item.as_dict() for item in preview.progress_events],
         "final_snapshot": _snapshot_manifest(preview.final_snapshot),
     }
 
@@ -1700,13 +1799,198 @@ def _suboperation_id(operation_id: str, label: str) -> str:
     return "OP-" + hashlib.sha256(f"{operation_id}:{label}".encode("utf-8")).hexdigest()[:32]
 
 
+def _integrated_progress_evidence_ref(iteration: str, generation: str) -> str:
+    normalized_generation = generation.strip().lower()
+    if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", normalized_generation) is None:
+        raise GovernanceAdapterError("integration generation cannot form a canonical evidence ref")
+    return (
+        f"refs/project-harness/v2/iterations/{iteration}/"
+        f"integrated-evidence/{normalized_generation}"
+    )
+
+
+def _final_progress_evidence_ref(iteration: str) -> str:
+    return f"refs/project-harness/v2/iterations/{iteration}/final-evidence"
+
+
+def _progress_spec_payload(value: TrainProgressEventSpec) -> dict[str, object]:
+    result = value.as_dict()
+    result.pop("spec_digest", None)
+    return result
+
+
+def _build_train_progress_specs(
+    train_plan: harness_train.IntegrationPreparePlan,
+    validated: Sequence[_ValidatedCandidate],
+    *,
+    progress_content: bytes,
+) -> tuple[TrainProgressEventSpec, ...]:
+    style = harness_progress._pure_eol_style(progress_content, "integrated progress history")
+    newline = b"\r\n" if style == "crlf" else b"\n"
+    specs: list[TrainProgressEventSpec] = []
+    for candidate, _base, _branch, _binding, candidate_event in validated:
+        integrated_ref = _integrated_progress_evidence_ref(
+            candidate.iteration,
+            train_plan.generation,
+        )
+        final_ref = _final_progress_evidence_ref(candidate.iteration)
+        started = harness_progress.integration_event(
+            integration_state=f"started:{train_plan.generation}",
+            session_id=candidate_event.session_id,
+            iteration=candidate.iteration,
+            occurred_at=candidate_event.occurred_at,
+            source_ref=train_plan.main_ref,
+            source_commit=train_plan.target_main,
+            operation_id=train_plan.operation_id,
+            causal_parent=candidate_event.event_id,
+            evidence_refs=(
+                f"operation:{train_plan.operation_id}",
+                candidate.candidate_ref,
+                candidate.candidate_evidence_ref,
+            ),
+            summary=(
+                f"Integration {train_plan.operation_id} started for PRD-{candidate.iteration}; "
+                "this event binds only latest-main planning and stable candidate refs."
+            ),
+        )
+        verified = harness_progress.integration_event(
+            integration_state=f"verified:{train_plan.generation}",
+            session_id=candidate_event.session_id,
+            iteration=candidate.iteration,
+            occurred_at=candidate_event.occurred_at,
+            source_ref=train_plan.main_ref,
+            source_commit=train_plan.target_main,
+            operation_id=train_plan.operation_id,
+            causal_parent=started.event_id,
+            evidence_refs=(integrated_ref, candidate.candidate_ref, candidate.candidate_evidence_ref),
+            summary=(
+                "Conditional transition proposal: integration_verified is not materialized "
+                f"until exact public integrated evidence resolves at {integrated_ref}."
+            ),
+        )
+        advanced = harness_progress.integration_event(
+            integration_state=f"main-advanced:{train_plan.generation}",
+            session_id=candidate_event.session_id,
+            iteration=candidate.iteration,
+            occurred_at=candidate_event.occurred_at,
+            source_ref=train_plan.main_ref,
+            source_commit=train_plan.target_main,
+            operation_id=train_plan.operation_id,
+            causal_parent=verified.event_id,
+            evidence_refs=(final_ref, integrated_ref),
+            summary=(
+                "Conditional transition proposal: main_advanced is not materialized until "
+                f"exact public final evidence resolves at {final_ref}."
+            ),
+        )
+        for transition, event, evidence_ref, conditional in (
+            ("integration_started", started, candidate.candidate_evidence_ref, False),
+            ("integration_verified", verified, integrated_ref, True),
+            ("main_advanced", advanced, final_ref, True),
+        ):
+            event_bytes = event.render(newline)
+            provisional = TrainProgressEventSpec(
+                schema_version=TRAIN_PROGRESS_SPEC_SCHEMA,
+                transition=transition,  # type: ignore[arg-type]
+                iteration=candidate.iteration,
+                generation=train_plan.generation,
+                event=event,
+                event_bytes_b64=base64.b64encode(event_bytes).decode("ascii"),
+                event_sha256=_sha256(event_bytes),
+                evidence_ref=evidence_ref,
+                conditional=conditional,
+                spec_digest="0" * 64,
+            )
+            specs.append(
+                replace(provisional, spec_digest=_digest(_progress_spec_payload(provisional)))
+            )
+    return tuple(specs)
+
+
+def _validate_progress_spec(value: TrainProgressEventSpec) -> bytes:
+    if not isinstance(value, TrainProgressEventSpec):
+        raise GovernanceAdapterError("train progress spec has an unsupported type")
+    try:
+        raw = base64.b64decode(value.event_bytes_b64.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise GovernanceAdapterError("train progress event bytes are invalid") from exc
+    if (
+        value.schema_version != TRAIN_PROGRESS_SPEC_SCHEMA
+        or value.iteration != value.event.iteration
+        or value.event_sha256 != _sha256(raw)
+        or value.spec_digest != _digest(_progress_spec_payload(value))
+        or value.conditional != (value.transition != "integration_started")
+        or value.event.render(b"\r\n" if b"\r\n" in raw else b"\n") != raw
+        or not value.evidence_ref.startswith("refs/")
+    ):
+        raise GovernanceAdapterError("train progress event spec identity/bytes changed")
+    return raw
+
+
+ProgressEvidenceResolver = Callable[[str], ProgressEvidenceResolution | None]
+
+
+def materialize_train_progress_events(
+    specs: Sequence[TrainProgressEventSpec],
+    *,
+    resolver: ProgressEvidenceResolver,
+) -> tuple[TrainProgressMaterialization, ...]:
+    """Project pre-bound transitions only after exact public evidence resolves."""
+
+    if not callable(resolver):
+        raise TypeError("resolver must be callable")
+    results: list[TrainProgressMaterialization] = []
+    seen: set[str] = set()
+    for spec in specs:
+        _validate_progress_spec(spec)
+        if spec.event.event_id in seen:
+            raise GovernanceAdapterError("train progress event spec IDs are duplicated")
+        seen.add(spec.event.event_id)
+        materialized = not spec.conditional
+        blocker: str | None = None
+        if spec.conditional:
+            try:
+                resolution = resolver(spec.evidence_ref)
+            except Exception as exc:
+                resolution = None
+                blocker = f"evidence-resolver-failed:{type(exc).__name__}"
+            if resolution is None:
+                blocker = blocker or "public-evidence-ref-absent"
+            elif not isinstance(resolution, ProgressEvidenceResolution):
+                blocker = "public-evidence-resolution-type"
+            elif (
+                resolution.schema_version != PROGRESS_EVIDENCE_RESOLUTION_SCHEMA
+                or resolution.ref_name != spec.evidence_ref
+                or OID_RE.fullmatch(resolution.object_id) is None
+                or DIGEST_RE.fullmatch(resolution.evidence_digest) is None
+                or spec.event.event_id not in resolution.event_ids
+                or len(set(resolution.event_ids)) != len(resolution.event_ids)
+            ):
+                blocker = "public-evidence-resolution-mismatch"
+            else:
+                materialized = True
+        results.append(
+            TrainProgressMaterialization(
+                schema_version=PROGRESS_MATERIALIZATION_SCHEMA,
+                transition=spec.transition,
+                iteration=spec.iteration,
+                event_id=spec.event.event_id,
+                evidence_ref=spec.evidence_ref,
+                conditional=spec.conditional,
+                materialized=materialized,
+                blocker=blocker,
+            )
+        )
+    return tuple(results)
+
+
 def _readme_differences(
     validated: Sequence[_ValidatedCandidate],
 ) -> tuple[bool, set[str], list[AdapterBlocker]]:
     l0_changed = False
     changed_l1: set[str] = set()
     blockers: list[AdapterBlocker] = []
-    for candidate, base, branch, _binding in validated:
+    for candidate, base, branch, _binding, _candidate_event in validated:
         base_files = base.semantic.as_mapping()
         branch_files = branch.semantic.as_mapping()
         if base_files.get(L0_PATH) != branch_files.get(L0_PATH):
@@ -1819,7 +2103,7 @@ def _plan_execution(
     reconcile_plans: list[harness_reconcile.GovernanceReconcilePlan] = []
     labels: list[str] = []
     snapshots: list[harness_reconcile.GovernanceSnapshot] = []
-    for index, (candidate, base, branch, binding) in enumerate(validated):
+    for index, (candidate, base, branch, binding, _candidate_event) in enumerate(validated):
         label = f"candidate-{index:04d}-{candidate.iteration}-{binding.authority_digest}"
         operation = _suboperation_id(context.operation_id, label)
         semantic_candidate = _semantic_candidate(
@@ -1843,6 +2127,87 @@ def _plan_execution(
         if not reconcile_plan.blockers:
             current = _apply_previews_to_snapshot(current, reconcile_plan, source_id=f"after:{label}")
         snapshots.append(current)
+
+    progress_specs: tuple[TrainProgressEventSpec, ...] = ()
+    if not blockers:
+        current_files = current.as_mapping()
+        progress_content = current_files.get(PROGRESS_PATH)
+        if progress_content is None:
+            blockers.append(
+                AdapterBlocker(
+                    "train-progress-missing",
+                    "integrated governance snapshot lacks harness/progress.md",
+                    PROGRESS_PATH,
+                )
+            )
+        else:
+            try:
+                progress_specs = _build_train_progress_specs(
+                    train_plan,
+                    validated,
+                    progress_content=progress_content,
+                )
+            except (GovernanceAdapterError, harness_progress.ProgressError) as exc:
+                blockers.append(AdapterBlocker("train-progress-spec-invalid", str(exc), PROGRESS_PATH))
+
+    for spec in progress_specs:
+        if blockers:
+            break
+        try:
+            updated_progress, _appended = harness_progress.append_progress_event_exact(
+                current.as_mapping()[PROGRESS_PATH],
+                spec.event,
+            )
+            exact = _validate_progress_spec(spec)
+            parsed = harness_governance.parse_progress_events(
+                updated_progress,
+                source=f"train-event:{spec.event.event_id}",
+            )
+            exact_event = next(
+                (item for item in parsed.events if item.identity == spec.event.event_id),
+                None,
+            )
+            if parsed.blockers or exact_event is None or exact_event.exact_bytes != exact:
+                raise GovernanceAdapterError("train progress event exact bytes were not preserved")
+            desired = _snapshot_with_files(
+                current,
+                source_id=f"train-event:{spec.event.event_id}",
+                replacements={PROGRESS_PATH: updated_progress},
+            )
+            operation = _suboperation_id(
+                context.operation_id,
+                f"train-event:{spec.event.event_id}:{spec.spec_digest}",
+            )
+            event_plan = harness_reconcile.plan_reconciliation(
+                project_root=context.integration_worktree,
+                git_common_dir=repo.common_dir,
+                operation_id=operation,
+                branch_base=current,
+                latest_main=current,
+                branch_candidate=desired,
+            )
+            label = f"train-event-{spec.iteration}-{spec.transition}-{spec.event_sha256}"
+            reconcile_plans.append(event_plan)
+            labels.append(label)
+            blockers.extend(
+                AdapterBlocker(item.code, item.message, item.subject)
+                for item in event_plan.blockers
+            )
+            if not event_plan.blockers:
+                current = _apply_previews_to_snapshot(
+                    current,
+                    event_plan,
+                    source_id=f"after:{label}",
+                )
+            snapshots.append(current)
+        except (GovernanceAdapterError, harness_progress.ProgressError) as exc:
+            blockers.append(
+                AdapterBlocker(
+                    "train-progress-reconcile-blocked",
+                    str(exc),
+                    spec.event.event_id,
+                )
+            )
 
     if not blockers and readme_authority is not None:
         replacements: dict[str, bytes | None] = {}
@@ -1882,6 +2247,7 @@ def _plan_execution(
         tuple(reconcile_plans),
         tuple(labels),
         tuple(snapshots),
+        progress_specs,
         current,
         tuple(blockers),
     )
@@ -2234,6 +2600,11 @@ class MergeTrainGovernanceAdapter:
             f"candidate-authority:{item.authority_digest}"
             for item in preview.normalization.candidate_authorities
         ]
+        evidence_ids.extend(
+            f"train-progress:{item.transition}:{item.event.event_id}:"
+            f"{item.event_sha256}:{item.spec_digest}"
+            for item in preview.progress_events
+        )
         if "normalization" not in completed:
             normalization = apply_premerge_normalization(
                 preview.normalization,
@@ -2408,13 +2779,17 @@ __all__ = [
     "MergeTrainGovernanceAdapter",
     "NormalizationResult",
     "PreMergeNormalizationPlan",
+    "ProgressEvidenceResolution",
     "ReadmeRebuildAuthority",
+    "TrainProgressEventSpec",
+    "TrainProgressMaterialization",
     "apply_premerge_normalization",
     "build_governance_callback",
     "build_conflict_normalizer",
     "build_readme_rebuild_authority",
     "execution_journal_path",
     "inspect_governance_resume",
+    "materialize_train_progress_events",
     "normalization_journal_path",
     "normalization_plan_digest",
     "plan_premerge_normalization",

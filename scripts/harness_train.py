@@ -27,7 +27,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from typing import Callable, Iterable, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Iterable, Literal, Mapping, Sequence
 import uuid
 
 try:
@@ -83,6 +83,12 @@ try:
 except ImportError:  # pragma: no cover - direct execution
     from harness_ux import ActionFacts, InteractionEnvelope, interaction
 
+if TYPE_CHECKING:
+    try:
+        from .harness_integrated_evidence import RegisteredIntegratedEvidence
+    except ImportError:  # pragma: no cover - direct execution
+        from harness_integrated_evidence import RegisteredIntegratedEvidence
+
 
 TRAIN_SCHEMA = "harness-lite.train/v1"
 AUTHORITY_SCHEMA = "harness-lite.authority-receipt/v1"
@@ -96,7 +102,7 @@ GOVERNANCE_RECEIPT_SCHEMA = "harness-lite.governance-apply-receipt/v1"
 VERIFICATION_RECEIPT_SCHEMA = "harness-lite.verification-receipt/v1"
 COMMIT_PLAN_SCHEMA = "harness-lite.integration-commit-plan/v1"
 COMMIT_RESULT_SCHEMA = "harness-lite.integration-commit-result/v1"
-ADVANCE_PLAN_SCHEMA = "harness-lite.main-advance-plan/v1"
+ADVANCE_PLAN_SCHEMA = "harness-lite.main-advance-plan/v2"
 ADVANCE_RESULT_SCHEMA = "harness-lite.main-advance-result/v1"
 CLEANUP_PLAN_SCHEMA = "harness-lite.integration-cleanup-plan/v1"
 CLEANUP_RESULT_SCHEMA = "harness-lite.integration-cleanup-result/v1"
@@ -578,6 +584,7 @@ class IntegrationCommitResult:
     integrated_commit: str
     integrated_tree: str
     commit_plan: IntegrationCommitPlan
+    commit_confirmation_token: ConfirmationToken
     integrated_candidate: IntegratedCandidate | None
     blockers: tuple[Blocker, ...]
     journal_path: str
@@ -604,9 +611,15 @@ class MainAdvancePlan:
     integrated_commit: str
     integrated_tree: str
     integrated_evidence_digest: str
+    integrated_evidence_metadata_digest: str
+    integrated_evidence_blob: str
+    operation_commit_ref: str
+    operation_evidence_ref: str
+    iteration_evidence_refs: tuple[tuple[str, str], ...]
     principle_path: str
     principle_sha256: str
     candidate_refs: tuple[tuple[str, str], ...]
+    source_ref_bindings: tuple[tuple[str, str], ...]
     ref_updates: tuple[tuple[str, str | None, str], ...]
     integration_commit_result_digest: str
     local_main_release_receipts: tuple[tuple[str, str, int, str], ...]
@@ -5689,6 +5702,7 @@ def apply_integration_commit(
         integrated_commit=integrated_commit,
         integrated_tree=plan.integrated_tree,
         commit_plan=plan,
+        commit_confirmation_token=confirmation_token,
         integrated_candidate=evidence,
         blockers=tuple(result_blockers),
         journal_path=str(journal_path),
@@ -5748,6 +5762,7 @@ def _commit_result_identity_digest(result: IntegrationCommitResult) -> str:
             "integrated_commit": result.integrated_commit,
             "integrated_tree": result.integrated_tree,
             "commit_plan_digest": result.commit_plan.commit_plan_digest,
+            "commit_confirmation_token_digest": result.commit_confirmation_token.token_digest,
             "integrated_evidence_digest": evidence.evidence_digest if evidence else None,
             "blockers": [item.as_dict() for item in result.blockers],
         }
@@ -5828,45 +5843,103 @@ def main_advance_plan_digest(plan: MainAdvancePlan) -> str:
     return digest(_advance_plan_payload(plan))
 
 
+def _integrated_evidence_registry_module():
+    try:
+        from . import harness_integrated_evidence as registry
+    except ImportError:  # pragma: no cover - direct execution
+        import harness_integrated_evidence as registry
+    return registry
+
+
 def plan_main_advance(
-    result: IntegrationCommitResult,
+    registered_evidence: "RegisteredIntegratedEvidence",
     *,
     principle_path: str = DEFAULT_PRINCIPLE_PATH,
 ) -> MainAdvancePlan:
-    """Plan the atomic main/integrated/final ref transaction without applying it."""
+    """Plan main advancement from canonical public integrated evidence only."""
 
-    repo = open_repository(result.project_root)
-    blockers: list[Blocker] = list(result.blockers)
-    evidence = result.integrated_candidate
-    if evidence is None:
-        blockers.append(Blocker("integrated-evidence-not-ready", "integration evidence is absent or needs identity rebind"))
-    elif not integrated_evidence_gate(evidence).allowed:
-        blockers.append(Blocker("integrated-evidence-invalid", "integrated evidence core gate rejected it"))
-    plan = result.commit_plan
-    current_main = _resolve_ref(repo, plan.main_ref)
-    if current_main != plan.target_main:
+    registry = _integrated_evidence_registry_module()
+    if not isinstance(registered_evidence, registry.RegisteredIntegratedEvidence):
+        raise TrainError(
+            "main advance requires RegisteredIntegratedEvidence; private integration journal evidence is insufficient"
+        )
+    repo = open_repository(registered_evidence.project_root)
+    blockers: list[Blocker] = list(
+        registry.registered_integrated_evidence_gate(repo.root, registered_evidence)
+    )
+    loaded = None
+    try:
+        loaded, load_blockers = registry.load_registered_integrated_evidence(
+            repo.root,
+            operation_id=registered_evidence.operation_id,
+        )
+    except registry.IntegratedEvidenceError as exc:
+        load_blockers = (Blocker("integrated-evidence-public-load", str(exc)),)
+    blockers.extend(load_blockers)
+    if loaded is None:
+        blockers.append(
+            Blocker(
+                "integrated-evidence-registration-required",
+                "canonical operation commit/evidence refs are absent or invalid",
+            )
+        )
+    elif loaded.registration_digest != registered_evidence.registration_digest:
+        blockers.append(
+            Blocker(
+                "integrated-evidence-registration-identity",
+                "supplied receipt differs from the canonical public registry",
+            )
+        )
+
+    envelope = registered_evidence.metadata
+    evidence = envelope.integrated_candidate
+    current_main = _resolve_ref(repo, envelope.main_ref)
+    if current_main != envelope.target_main:
         blockers.append(Blocker("main-advance-main-drift", "main changed after integration preparation"))
-    if not _commit_matches_plan(repo, result.integrated_commit, plan):
-        blockers.append(Blocker("main-advance-commit-drift", "integrated commit no longer matches commit plan"))
+    if _object_type(repo, envelope.integrated_commit) != "commit":
+        blockers.append(Blocker("main-advance-commit-missing", envelope.integrated_commit))
+    else:
+        try:
+            if (
+                _commit_tree(repo, envelope.integrated_commit) != envelope.integrated_tree
+                or _commit_parents(repo, envelope.integrated_commit) != envelope.parent_commits
+                or _commit_message(repo, envelope.integrated_commit) != envelope.commit_message
+            ):
+                blockers.append(
+                    Blocker("main-advance-commit-drift", "integrated commit differs from public evidence")
+                )
+        except TrainError as exc:
+            blockers.append(Blocker("main-advance-commit-unreadable", str(exc)))
     principle = _validate_repo_path(principle_path, "principle_path")
     principle_sha = "0" * 64
     try:
-        _, principle_raw = _blob_at(repo, plan.target_main, principle)
+        _, principle_raw = _blob_at(repo, envelope.target_main, principle)
         principle_sha = hashlib.sha256(principle_raw).hexdigest()
     except TrainError as exc:
         blockers.append(Blocker("main-advance-principle-unreadable", str(exc)))
-    if principle_sha != plan.principle_sha256:
+    if principle_sha != envelope.principle_sha256:
         blockers.append(Blocker("main-advance-principle-drift", "principle differs from integrated evidence"))
+
     candidate_refs: list[tuple[str, str]] = []
-    for candidate in plan.candidates:
+    source_ref_bindings: dict[str, str] = {}
+
+    def bind_source(reference: str, oid: str) -> None:
+        prior = source_ref_bindings.get(reference)
+        if prior is not None and prior != oid:
+            blockers.append(Blocker("main-advance-source-ref-conflict", reference))
+        else:
+            source_ref_bindings[reference] = oid
+
+    bind_source(registered_evidence.commit_ref, envelope.integrated_commit)
+    bind_source(registered_evidence.evidence_ref, registered_evidence.evidence_blob)
+    iteration_evidence_refs: list[tuple[str, str]] = []
+    for item in registered_evidence.iteration_evidence_refs:
+        bind_source(item.ref_name, registered_evidence.evidence_blob)
+        iteration_evidence_refs.append((item.ref_name, registered_evidence.evidence_blob))
+    for candidate in envelope.candidate_bindings:
         candidate_refs.append((candidate.candidate_ref, candidate.candidate_commit))
-        blockers.extend(
-            _registered_candidate_gate(
-                repo,
-                candidate,
-                current_principle_sha256=principle_sha,
-            )
-        )
+        bind_source(candidate.candidate_ref, candidate.candidate_commit)
+        bind_source(candidate.candidate_evidence_ref, candidate.candidate_evidence_blob)
         blockers.extend(
             _current_principle_audit_blockers(
                 repo,
@@ -5875,14 +5948,7 @@ def plan_main_advance(
         )
         if _resolve_ref(repo, candidate.candidate_ref) != candidate.candidate_commit:
             blockers.append(Blocker("main-advance-candidate-drift", candidate.candidate_ref))
-    blockers.extend(
-        _integration_dependency_blockers(
-            repo,
-            plan.candidates,
-            target_main=plan.target_main,
-        )
-    )
-    if _ref_checked_out(repo, plan.main_ref):
+    if _ref_checked_out(repo, envelope.main_ref):
         blockers.append(
             Blocker(
                 "main-ref-checked-out",
@@ -5892,47 +5958,56 @@ def plan_main_advance(
     release_receipts, release_blockers = _local_main_release_gate(repo)
     blockers.extend(release_blockers)
     updates: list[tuple[str, str | None, str]] = [
-        (plan.main_ref, plan.target_main, result.integrated_commit)
+        (envelope.main_ref, envelope.target_main, envelope.integrated_commit)
     ]
-    for iteration in dict.fromkeys(plan.dependency_order):
+    for iteration in dict.fromkeys(item.iteration for item in envelope.candidate_bindings):
         for suffix in ("integrated", "final"):
             reference = f"refs/project-harness/v2/iterations/{iteration}/{suffix}"
             old = _resolve_ref(repo, reference)
             if old is not None:
                 blockers.append(Blocker("main-advance-target-ref-exists", reference))
-            updates.append((reference, None, result.integrated_commit))
-    evidence_digest = evidence.evidence_digest if evidence else "0" * 64
-    if evidence is not None:
-        gate = main_advance_gate(
-            evidence,
-            current_main=plan.target_main,
-            current_integrated_commit=result.integrated_commit,
-            current_integrated_tree=result.integrated_tree,
-            current_principle_sha256=principle_sha,
-            current_candidate_digests=tuple(
-                item.candidate_evidence.evidence_digest for item in plan.candidates
-            ),
-            current_identity_rebind_digests=evidence.identity_rebind_digests,
-            user_accepted_evidence_digest=evidence.evidence_digest,
-        )
-        if not gate.allowed:
-            blockers.append(Blocker("main-advance-core-gate", ", ".join(gate.blockers)))
+            updates.append((reference, None, envelope.integrated_commit))
+        final_evidence_ref = registry.iteration_final_evidence_ref(iteration)
+        old_final_evidence = _resolve_ref(repo, final_evidence_ref)
+        if old_final_evidence is not None:
+            blockers.append(Blocker("main-advance-target-ref-exists", final_evidence_ref))
+        updates.append((final_evidence_ref, None, registered_evidence.evidence_blob))
+    gate = main_advance_gate(
+        evidence,
+        current_main=envelope.target_main,
+        current_integrated_commit=envelope.integrated_commit,
+        current_integrated_tree=envelope.integrated_tree,
+        current_principle_sha256=principle_sha,
+        current_candidate_digests=tuple(
+            item.candidate_evidence_digest for item in envelope.candidate_bindings
+        ),
+        current_identity_rebind_digests=evidence.identity_rebind_digests,
+        user_accepted_evidence_digest=evidence.evidence_digest,
+    )
+    if not gate.allowed:
+        blockers.append(Blocker("main-advance-core-gate", ", ".join(gate.blockers)))
     provisional = MainAdvancePlan(
         schema_version=ADVANCE_PLAN_SCHEMA,
-        operation_id=result.operation_id,
-        project_root=result.project_root,
+        operation_id=registered_evidence.operation_id,
+        project_root=str(repo.root),
         git_common_dir=str(repo.common_dir),
-        integration_worktree=result.integration_worktree,
-        main_ref=plan.main_ref,
-        expected_main=plan.target_main,
-        integrated_commit=result.integrated_commit,
-        integrated_tree=result.integrated_tree,
-        integrated_evidence_digest=evidence_digest,
+        integration_worktree=str(envelope.commit_plan_snapshot.get("integration_worktree", "")),
+        main_ref=envelope.main_ref,
+        expected_main=envelope.target_main,
+        integrated_commit=envelope.integrated_commit,
+        integrated_tree=envelope.integrated_tree,
+        integrated_evidence_digest=registered_evidence.registration_digest,
+        integrated_evidence_metadata_digest=envelope.metadata_digest,
+        integrated_evidence_blob=registered_evidence.evidence_blob,
+        operation_commit_ref=registered_evidence.commit_ref,
+        operation_evidence_ref=registered_evidence.evidence_ref,
+        iteration_evidence_refs=tuple(iteration_evidence_refs),
         principle_path=principle,
         principle_sha256=principle_sha,
         candidate_refs=tuple(candidate_refs),
+        source_ref_bindings=tuple(source_ref_bindings.items()),
         ref_updates=tuple(updates),
-        integration_commit_result_digest=_commit_result_identity_digest(result),
+        integration_commit_result_digest=envelope.commit_result_digest,
         local_main_release_receipts=release_receipts,
         plan_digest="0" * 64,
         blockers=tuple(blockers),
@@ -6009,10 +6084,54 @@ def _all_ref_updates_applied(repo: Repository, plan: MainAdvancePlan) -> bool:
     return all(_resolve_ref(repo, reference) == new for reference, _old, new in plan.ref_updates)
 
 
+def _public_integrated_evidence_blockers(
+    repo: Repository,
+    plan: MainAdvancePlan,
+) -> tuple[Blocker, ...]:
+    registry = _integrated_evidence_registry_module()
+    try:
+        loaded, blockers = registry.load_registered_integrated_evidence(
+            repo.root,
+            operation_id=plan.operation_id,
+        )
+    except registry.IntegratedEvidenceError as exc:
+        return (Blocker("integrated-evidence-public-load", str(exc)),)
+    values = list(blockers)
+    if loaded is None:
+        values.append(
+            Blocker(
+                "integrated-evidence-registration-required",
+                "canonical operation commit/evidence refs are absent or invalid",
+            )
+        )
+        return tuple(dict.fromkeys(values))
+    expected_iteration_refs = tuple(
+        (item.ref_name, loaded.evidence_blob) for item in loaded.iteration_evidence_refs
+    )
+    comparisons = (
+        (loaded.registration_digest, plan.integrated_evidence_digest, "registration-digest"),
+        (loaded.metadata.metadata_digest, plan.integrated_evidence_metadata_digest, "metadata-digest"),
+        (loaded.evidence_blob, plan.integrated_evidence_blob, "evidence-blob"),
+        (loaded.commit_ref, plan.operation_commit_ref, "operation-commit-ref"),
+        (loaded.evidence_ref, plan.operation_evidence_ref, "operation-evidence-ref"),
+        (loaded.metadata.integrated_commit, plan.integrated_commit, "integrated-commit"),
+        (loaded.metadata.integrated_tree, plan.integrated_tree, "integrated-tree"),
+        (loaded.metadata.commit_result_digest, plan.integration_commit_result_digest, "commit-result"),
+        (expected_iteration_refs, plan.iteration_evidence_refs, "iteration-evidence-refs"),
+    )
+    for observed, expected, label in comparisons:
+        if observed != expected:
+            values.append(Blocker("integrated-evidence-plan-binding", label))
+    for reference, oid in plan.source_ref_bindings:
+        if _resolve_ref(repo, reference) != oid:
+            values.append(Blocker("main-advance-source-ref-drift", reference))
+    return tuple(dict.fromkeys(values))
+
+
 def _apply_ref_transaction(repo: Repository, plan: MainAdvancePlan) -> None:
     lines = ["start"]
-    for reference, commit in plan.candidate_refs:
-        lines.append(f"verify {reference} {commit}")
+    for reference, oid in plan.source_ref_bindings:
+        lines.append(f"verify {reference} {oid}")
     for reference, old, new in plan.ref_updates:
         if old is None:
             lines.append(f"create {reference} {new}")
@@ -6061,6 +6180,12 @@ def apply_main_advance(
     repo = open_repository(plan.project_root)
     if os.path.normcase(str(repo.common_dir)) != os.path.normcase(plan.git_common_dir):
         raise TrainError("Git common directory changed after main advance plan")
+    evidence_blockers = _public_integrated_evidence_blockers(repo, plan)
+    if evidence_blockers:
+        raise TrainError(
+            "main advance public evidence changed: "
+            + "; ".join(item.code for item in evidence_blockers)
+        )
     if _ref_checked_out(repo, plan.main_ref):
         raise TrainError("main ref became checked out after main advance plan")
     current_releases, release_blockers = _local_main_release_gate(repo)
@@ -6127,6 +6252,13 @@ def apply_main_advance(
             "confirmation_id": confirmation_token.authorization_id,
             "expected_main": plan.expected_main,
             "integrated_commit": plan.integrated_commit,
+            "integrated_evidence_digest": plan.integrated_evidence_digest,
+            "integrated_evidence_metadata_digest": plan.integrated_evidence_metadata_digest,
+            "integrated_evidence_blob": plan.integrated_evidence_blob,
+            "operation_commit_ref": plan.operation_commit_ref,
+            "operation_evidence_ref": plan.operation_evidence_ref,
+            "iteration_evidence_refs": [list(item) for item in plan.iteration_evidence_refs],
+            "source_ref_bindings": [list(item) for item in plan.source_ref_bindings],
             "project_root": plan.project_root,
             "integration_worktree": plan.integration_worktree,
             "ref_updates": [list(item) for item in plan.ref_updates],

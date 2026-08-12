@@ -273,6 +273,17 @@ def iteration_evidence_ref(iteration: str, generation: str) -> str:
     )
 
 
+def iteration_final_evidence_ref(iteration: str) -> str:
+    """Return the stable evidence ref created with an iteration's final ref.
+
+    The registry publishes generation-scoped integrated evidence first.  Main
+    advancement later creates this stable binding to the exact same metadata
+    blob in the transaction that creates ``integrated`` and ``final``.
+    """
+
+    return f"{REF_ROOT}/iterations/{_validate_iteration(iteration)}/final-evidence"
+
+
 def _git(
     repo: train.Repository,
     arguments: Sequence[str],
@@ -937,6 +948,10 @@ def plan_register_integrated_evidence(
         raise IntegratedEvidenceError("integration commit result schema is unsupported")
     if not result.evidence_ready or result.integrated_candidate is None:
         raise IntegratedEvidenceError("integration result has no verified IntegratedCandidate")
+    if result.commit_confirmation_token != commit_confirmation_token:
+        raise IntegratedEvidenceError(
+            "integration commit result and supplied confirmation token identities differ"
+        )
     repo = train.open_repository(result.project_root)
     operation = _validate_operation(result.operation_id)
     generation = _validate_generation(result.generation)
@@ -1751,6 +1766,7 @@ __all__ = [
     "integrated_evidence_plan_digest",
     "integration_commit_result_digest",
     "iteration_evidence_ref",
+    "iteration_final_evidence_ref",
     "journal_path",
     "load_registered_integrated_evidence",
     "metadata_digest",

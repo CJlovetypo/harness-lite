@@ -19,8 +19,15 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from harness_candidate import AcceptanceEvidence, CandidateInput, build_candidate  # noqa: E402
-from harness_governance import IterationRoutingState, PrincipleApproval, RootRoutingAuthority  # noqa: E402
+from harness_governance import (  # noqa: E402
+    IterationRoutingState,
+    PrincipleApproval,
+    RootRoutingAuthority,
+    parse_progress_events,
+)
 import harness_train  # noqa: E402
+import harness_progress  # noqa: E402
+import harness_train_governance as governance_adapter  # noqa: E402
 from harness_train import (  # noqa: E402
     CandidateVerificationReceipt,
     ConfirmationToken,
@@ -44,7 +51,9 @@ from harness_train_governance import (  # noqa: E402
     build_conflict_normalizer,
     build_readme_rebuild_authority,
     inspect_governance_resume,
+    materialize_train_progress_events,
     plan_premerge_normalization,
+    ProgressEvidenceResolution,
     resume_governance_callback,
 )
 
@@ -101,6 +110,63 @@ def l1(number: str, result: str) -> bytes:
 
 class MergeTrainGovernanceAdapterTests(unittest.TestCase):
     maxDiff = None
+
+    def test_conditional_train_progress_materializes_only_from_exact_public_binding(self) -> None:
+        operation_id = "OP-" + "a" * 32
+        event = harness_progress.integration_event(
+            integration_state="verified:i-test",
+            session_id="S-20260812-02",
+            iteration="001",
+            occurred_at="2026-08-12T12:00:00+08:00",
+            source_ref="refs/heads/main",
+            source_commit="1" * 40,
+            operation_id=operation_id,
+            causal_parent="S-20260812-01/OPEN",
+            evidence_refs=(
+                "refs/project-harness/v2/iterations/001/integrated-evidence/i-test",
+            ),
+            summary="Conditional integration verification proposal",
+        )
+        raw = event.render(b"\n")
+        provisional = governance_adapter.TrainProgressEventSpec(
+            schema_version=governance_adapter.TRAIN_PROGRESS_SPEC_SCHEMA,
+            transition="integration_verified",
+            iteration="001",
+            generation="i-test",
+            event=event,
+            event_bytes_b64=governance_adapter.base64.b64encode(raw).decode("ascii"),
+            event_sha256=hashlib.sha256(raw).hexdigest(),
+            evidence_ref=event.evidence_refs[0],
+            conditional=True,
+            spec_digest="0" * 64,
+        )
+        spec = replace(
+            provisional,
+            spec_digest=governance_adapter._digest(
+                governance_adapter._progress_spec_payload(provisional)
+            ),
+        )
+
+        absent = materialize_train_progress_events((spec,), resolver=lambda _ref: None)
+        self.assertFalse(absent[0].materialized)
+        self.assertEqual(absent[0].blocker, "public-evidence-ref-absent")
+        wrong = ProgressEvidenceResolution(
+            schema_version=governance_adapter.PROGRESS_EVIDENCE_RESOLUTION_SCHEMA,
+            ref_name=spec.evidence_ref,
+            object_id="2" * 40,
+            evidence_digest="3" * 64,
+            event_ids=("EV-unrelated",),
+        )
+        self.assertFalse(
+            materialize_train_progress_events((spec,), resolver=lambda _ref: wrong)[0].materialized
+        )
+        exact = replace(wrong, event_ids=(event.event_id,))
+        materialized = materialize_train_progress_events(
+            (spec,),
+            resolver=lambda _ref: exact,
+        )
+        self.assertTrue(materialized[0].materialized)
+        self.assertIsNone(materialized[0].blocker)
 
     def setUp(self) -> None:
         self.git_executable = shutil.which("git")
@@ -250,14 +316,43 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
     def registered(self, number: str, feature_ref: str, commit: str) -> RegisteredCandidate:
         self.assertEqual(self.oid(feature_ref), commit)
         generation = "g1"
+        operation_id = "OP-" + uuid.uuid4().hex
         pre_seal_tree = self.oid(f"{commit}^{{tree}}")
-        seal_commit = self.git(
-            "commit-tree",
-            pre_seal_tree,
-            "-p",
-            commit,
-            input_text=f"candidate(PRD-{number}): seal generation {generation}\n",
-        ).stdout.strip()
+        worktree = self.feature_a if number == "001" else self.feature_b
+        parsed_progress = parse_progress_events(
+            (worktree / "harness/progress.md").read_bytes(),
+            source=f"fixture:{number}",
+        )
+        self.assertFalse(parsed_progress.blockers)
+        candidate_parent = parsed_progress.events[-1].identity
+        candidate_progress = harness_progress.candidate_event(
+            generation=1,
+            candidate_state="sealed",
+            session_id="S-20260812-02",
+            iteration=number,
+            occurred_at="2026-08-12T12:00:00+08:00",
+            source_ref=feature_ref,
+            source_commit=commit,
+            operation_id=operation_id,
+            causal_parent=candidate_parent,
+            evidence_refs=(f"candidate:{number}:{generation}",),
+            summary=f"PRD-{number} candidate generation {generation} sealed",
+        )
+        sealed_progress, appended = harness_progress.append_progress_event_exact(
+            (worktree / "harness/progress.md").read_bytes(),
+            candidate_progress,
+        )
+        self.assertTrue(appended)
+        self.write_bytes("harness/progress.md", sealed_progress, root=worktree)
+        self.git("add", "--", "harness/progress.md", cwd=worktree)
+        self.git(
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            f"candidate(PRD-{number}): seal generation {generation}",
+            cwd=worktree,
+        )
+        seal_commit = self.oid("HEAD", cwd=worktree)
         seal_tree = self.oid(f"{seal_commit}^{{tree}}")
         candidate_ref = f"refs/project-harness/v2/iterations/{number}/candidates/{generation}"
         evidence_ref = (
@@ -288,6 +383,24 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
         pre_receipt = receipt("pre-seal", commit, pre_seal_tree)
         seal_receipt = receipt("seal", seal_commit, seal_tree)
         verification_identity = f"candidate-verification:{seal_receipt.receipt_digest}"
+        repo = harness_train.open_repository(self.root)
+        principle_binding, principle_blockers = harness_train._current_candidate_principle_gate_binding(
+            repo,
+            number,
+            authority_ref="refs/heads/main",
+        )
+        self.assertEqual(principle_blockers, ())
+        self.assertIsNotNone(principle_binding)
+        assert principle_binding is not None
+        dependency_bindings = ()
+        dependency_bindings_digest = harness_train._dependency_bindings_digest(
+            dependency_bindings
+        )
+        verification_identities = (
+            verification_identity,
+            harness_train._dependency_evidence_id(dependency_bindings_digest),
+            harness_train._principle_gate_evidence_id(principle_binding.binding_digest),
+        )
         included_paths = tuple(
             line
             for line in self.git(
@@ -309,10 +422,10 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
                     AcceptanceEvidence(
                         acceptance_id=f"AC-{number}-01",
                         evidence_ids=(f"evidence:{number}",),
-                        verification_ids=(verification_identity,),
+                        verification_ids=verification_identities,
                     ),
                 ),
-                verification_ids=(verification_identity,),
+                verification_ids=verification_identities,
                 prd_approved=True,
                 spec_approved=True,
                 implementation_authorized=True,
@@ -321,7 +434,6 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
             )
         )
         self.assertTrue(candidate_evidence.verified, candidate_evidence.blockers)
-        operation_id = "OP-" + uuid.uuid4().hex
         registration_plan_digest = hashlib.sha256(
             f"registration:{number}:{operation_id}".encode()
         ).hexdigest()
@@ -347,9 +459,16 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
             "seal_commit": seal_commit,
             "seal_tree": seal_tree,
             "parent_commits": [commit],
+            "progress_event": candidate_progress.as_dict(),
+            "progress_event_bytes_sha256": hashlib.sha256(
+                candidate_progress.render(b"\n")
+            ).hexdigest(),
             "authority_evidence_digest": authority_digest,
             "workspace_guard_digest": workspace_digest,
+            "principle_gate_binding": principle_binding.as_dict(),
             "depends_on": [],
+            "dependency_bindings": [],
+            "dependency_bindings_digest": dependency_bindings_digest,
             "upstream_evidence_ids": [f"evidence:{number}"],
             "pre_seal_verification_receipts": [pre_receipt.as_dict()],
             "seal_verification_receipts": [seal_receipt.as_dict()],
@@ -410,6 +529,9 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
             "seal_authorization_id": seal_authorization_id,
             "verification_receipts": [seal_receipt.as_dict()],
             "pre_seal_verification_receipts": [pre_receipt.as_dict()],
+            "principle_gate_binding": principle_binding.as_dict(),
+            "dependency_bindings": [],
+            "dependency_bindings_digest": dependency_bindings_digest,
             "authority_receipt": {
                 "evidence_digest": authority_digest,
                 "depends_on": [],
@@ -433,9 +555,12 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
             base_ref=base_ref,
             base_commit=self.base,
             principle_sha256=self.principle_sha256,
+            principle_gate_binding=principle_binding,
             authority_evidence_digest=authority_digest,
             workspace_guard_digest=workspace_digest,
             depends_on=(),
+            dependency_bindings=(),
+            dependency_bindings_digest=dependency_bindings_digest,
             candidate_evidence=candidate_evidence,
             verification_receipts=(seal_receipt,),
             seal_authorization_id=seal_authorization_id,
@@ -542,12 +667,59 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
         event_a, event_b, plan, context = self.union_case("union")
 
         callback = build_governance_callback(plan, readme_authority=self.readme_authority())
+        preview = callback.preview(context)
+        self.assertTrue(preview.ready, preview.blockers)
+        self.assertEqual(
+            [(item.iteration, item.transition) for item in preview.progress_events],
+            [
+                ("001", "integration_started"),
+                ("001", "integration_verified"),
+                ("001", "main_advanced"),
+                ("002", "integration_started"),
+                ("002", "integration_verified"),
+                ("002", "main_advanced"),
+            ],
+        )
+        first_event_step = next(
+            index
+            for index, label in enumerate(preview.reconciliation_labels)
+            if label.startswith("train-event-")
+        )
+        readme_step = next(
+            index
+            for index, label in enumerate(preview.reconciliation_labels)
+            if label.startswith("readme-")
+        )
+        self.assertTrue(
+            all(
+                label.startswith("candidate-")
+                for label in preview.reconciliation_labels[:first_event_step]
+            )
+        )
+        self.assertTrue(
+            all(
+                label.startswith("train-event-")
+                for label in preview.reconciliation_labels[first_event_step:readme_step]
+            )
+        )
         receipt = callback(context)
 
         worktree = Path(plan.worktree_path)
         merged_progress = (worktree / "harness/progress.md").read_bytes()
         self.assertEqual(merged_progress.count(event_a), 1)
         self.assertEqual(merged_progress.count(event_b), 1)
+        parsed = parse_progress_events(merged_progress, source="integrated-result")
+        self.assertFalse(parsed.blockers)
+        identities = [item.identity for item in parsed.events]
+        for spec in preview.progress_events:
+            self.assertEqual(identities.count(spec.event.event_id), 1)
+            self.assertFalse(any(harness_train.OID_RE.fullmatch(ref) for ref in spec.event.evidence_refs))
+        status = materialize_train_progress_events(
+            preview.progress_events,
+            resolver=lambda _ref: None,
+        )
+        self.assertEqual(sum(item.materialized for item in status), 2)
+        self.assertTrue(all(not item.materialized for item in status if item.conditional))
         rebuilt_l0 = (worktree / "harness/README.md").read_text(encoding="utf-8")
         self.assertIn("manual: must-survive", rebuilt_l0)
         self.assertIn("Feature A", rebuilt_l0)
@@ -568,6 +740,10 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
             )
         self.assertTrue(any(value.startswith("normalize:") for value in receipt.evidence_ids))
         self.assertGreaterEqual(sum(value.startswith("reconcile:") for value in receipt.evidence_ids), 3)
+        self.assertEqual(
+            sum(value.startswith("train-progress:") for value in receipt.evidence_ids),
+            6,
+        )
 
     def test_adapter_rejects_legacy_candidate_journal_schema(self) -> None:
         ref_a, commit_a = self.make_feature(
@@ -665,14 +841,14 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
         self.assertEqual(merged.count(event_a), 1)
         self.assertEqual(merged.count(event_b), 1)
 
-    def test_callback_resumes_after_first_candidate_reconcile_without_duplicate_event(self) -> None:
-        event_a, event_b, plan, context = self.union_case("resume-first-candidate")
+    def test_callback_resumes_after_first_train_event_without_duplicate_event(self) -> None:
+        event_a, event_b, plan, context = self.union_case("resume-first-train-event")
 
         def crash(phase: str) -> None:
-            if phase == "after-first-reconcile":
+            if phase.startswith("after-reconcile:train-event-001-integration_started-"):
                 raise InjectedGovernanceCrash(phase)
 
-        with self.assertRaisesRegex(InjectedGovernanceCrash, "after-first-reconcile"):
+        with self.assertRaisesRegex(InjectedGovernanceCrash, "integration_started"):
             build_governance_callback(
                 plan,
                 readme_authority=self.readme_authority(),
@@ -681,17 +857,21 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
 
         partial = (Path(plan.worktree_path) / "harness/progress.md").read_bytes()
         self.assertEqual(partial.count(event_a), 1)
-        self.assertEqual(partial.count(event_b), 0)
+        self.assertEqual(partial.count(event_b), 1)
+        started_summary = f"Integration {plan.operation_id} started for PRD-001".encode()
+        self.assertEqual(partial.count(started_summary), 1)
         state = inspect_governance_resume(
             plan,
             context,
             readme_authority=self.readme_authority(),
         )
         self.assertTrue(state.resumable, state.blockers)
-        self.assertEqual(len(state.completed_steps), 2)
+        self.assertEqual(len(state.completed_steps), 4)
         self.assertEqual(state.completed_steps[0], "normalization")
         self.assertTrue(state.completed_steps[1].startswith("candidate-0000-001-"))
-        self.assertTrue(state.next_step.startswith("candidate-0001-002-"))
+        self.assertTrue(state.completed_steps[2].startswith("candidate-0001-002-"))
+        self.assertTrue(state.completed_steps[3].startswith("train-event-001-integration_started-"))
+        self.assertTrue(state.next_step.startswith("train-event-001-integration_verified-"))
         self.assertIn(state.actual_index_tree, state.allowed_intermediate_trees)
 
         receipt = resume_governance_callback(
@@ -709,6 +889,7 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
         merged = (Path(plan.worktree_path) / "harness/progress.md").read_bytes()
         self.assertEqual(merged.count(event_a), 1)
         self.assertEqual(merged.count(event_b), 1)
+        self.assertEqual(merged.count(started_summary), 1)
 
     def test_same_event_identity_with_different_bytes_blocks_before_mutation(self) -> None:
         event_a = event("EV-COLLISION", "A bytes")

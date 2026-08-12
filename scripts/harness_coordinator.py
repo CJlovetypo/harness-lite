@@ -25,11 +25,13 @@ from typing import Mapping, Sequence
 try:
     from . import harness_workspace as workspace
     from . import harness_train as train
+    from . import harness_integrated_evidence as integrated_registry
     from . import project_harness as core
     from .harness_decision import AuthorizationState, DecisionInput, RiskVector, classify
 except ImportError:  # pragma: no cover - direct script execution
     import harness_workspace as workspace
     import harness_train as train
+    import harness_integrated_evidence as integrated_registry
     import project_harness as core
     from harness_decision import AuthorizationState, DecisionInput, RiskVector, classify
 
@@ -38,6 +40,9 @@ SCHEMA_V1 = "harness-lite.coordinator-plan/v1"
 ITERATION_RE = re.compile(r"[0-9]{3,}")
 OID_RE = re.compile(r"[0-9a-f]{40,64}")
 OP_RE = re.compile(r"OP-[0-9a-f]{32}")
+INTEGRATION_COMMIT_REF_RE = re.compile(
+    r"refs/project-harness/v2/integrations/op-([0-9a-f]{32})/commit"
+)
 STATUS_LINE = re.compile(
     r"^- (?P<label>[^：:\r\n]+)[：:]\s*(?:`(?P<quoted>[^`\r\n]+)`|(?P<plain>[^\r\n]+))\s*$",
     re.MULTILINE,
@@ -381,6 +386,100 @@ def _candidate_observations(
     return candidate_names, tuple(observations), tuple(blockers), tuple(verified), tuple(bindings)
 
 
+def _integrated_observation(
+    root: Path,
+    iteration: str,
+    refs: Mapping[str, str],
+) -> tuple[bool, str | None, tuple[str, ...]]:
+    """Authenticate integrated/final status exclusively from public Git refs."""
+
+    integrated_ref = f"refs/project-harness/v2/iterations/{iteration}/integrated"
+    final_ref = f"refs/project-harness/v2/iterations/{iteration}/final"
+    final_evidence_ref = integrated_registry.iteration_final_evidence_ref(iteration)
+    integrated_object = refs.get(integrated_ref)
+    final_object = refs.get(final_ref)
+    if integrated_object is None and final_object is None:
+        return False, None, ()
+
+    blockers: list[str] = []
+    if integrated_object is None:
+        blockers.append("integrated-ref-missing")
+    elif _object_type(root, integrated_object) != "commit":
+        blockers.append("integrated-object-not-commit")
+    if final_object is None:
+        blockers.append("integrated-final-ref-missing")
+    elif _object_type(root, final_object) != "commit":
+        blockers.append("integrated-final-object-not-commit")
+    if (
+        integrated_object is not None
+        and final_object is not None
+        and integrated_object != final_object
+    ):
+        blockers.append("integrated-final-identity-mismatch")
+    target = integrated_object or final_object
+    if target is None or _object_type(root, target) != "commit":
+        return False, integrated_object, tuple(dict.fromkeys(blockers))
+
+    operation_ids = []
+    for reference, oid in refs.items():
+        match = INTEGRATION_COMMIT_REF_RE.fullmatch(reference)
+        if match and oid == target:
+            operation_ids.append(f"OP-{match.group(1)}")
+    if not operation_ids:
+        blockers.append("integrated-evidence-operation-ref-missing")
+        return False, integrated_object, tuple(dict.fromkeys(blockers))
+
+    matches: list[integrated_registry.RegisteredIntegratedEvidence] = []
+    for operation_id in sorted(operation_ids):
+        try:
+            receipt, evidence_blockers = integrated_registry.load_registered_integrated_evidence(
+                root,
+                operation_id=operation_id,
+            )
+        except integrated_registry.IntegratedEvidenceError as exc:
+            blockers.append(f"integrated-evidence-public-load:{operation_id}:{exc}")
+            continue
+        blockers.extend(
+            f"integrated-evidence:{operation_id}:{item.code}:{item.message}"
+            for item in evidence_blockers
+        )
+        if receipt is None:
+            continue
+        candidate_iterations = {
+            item.iteration for item in receipt.metadata.candidate_bindings
+        }
+        if iteration not in candidate_iterations:
+            continue
+        expected_iteration_ref = integrated_registry.iteration_evidence_ref(
+            iteration,
+            receipt.metadata.generation,
+        )
+        if not any(
+            item.iteration == iteration and item.ref_name == expected_iteration_ref
+            for item in receipt.iteration_evidence_refs
+        ):
+            blockers.append(
+                f"integrated-evidence-iteration-binding-missing:{operation_id}:{iteration}"
+            )
+            continue
+        matches.append(receipt)
+
+    if len(matches) != 1:
+        blockers.append(
+            "integrated-evidence-envelope-missing"
+            if not matches
+            else "integrated-evidence-envelope-ambiguous"
+        )
+        return False, integrated_object, tuple(dict.fromkeys(blockers))
+    receipt = matches[0]
+    if target != receipt.metadata.integrated_commit:
+        blockers.append("integrated-evidence-commit-mismatch")
+    if refs.get(final_evidence_ref) != receipt.evidence_blob:
+        blockers.append("integrated-final-evidence-ref-missing-or-drifted")
+    integrated = not blockers
+    return integrated, integrated_object, tuple(dict.fromkeys(blockers))
+
+
 def derive_iteration_authority(root: Path, iteration: str) -> IterationAuthority:
     """Read approvals/dependencies from canonical files and identities from Git."""
 
@@ -446,14 +545,12 @@ def derive_iteration_authority(root: Path, iteration: str) -> IterationAuthority
         principle_sha256=str(snapshot["principle_sha256"]),
     )
     blockers.extend(candidate_blockers)
-    integrated_ref = f"refs/project-harness/v2/iterations/{number}/integrated"
-    integrated_object = refs.get(integrated_ref)
-    integrated = False
-    if integrated_object is not None:
-        if _object_type(root, integrated_object) != "commit":
-            blockers.append("integrated-object-not-commit")
-        else:
-            blockers.append("integrated-evidence-envelope-missing")
+    integrated, integrated_object, integrated_blockers = _integrated_observation(
+        root,
+        number,
+        refs,
+    )
+    blockers.extend(integrated_blockers)
     title_match = re.search(rf"^#\s+PRD-{re.escape(number)}[：:]\s*(.+?)\s*$", prd, re.MULTILINE)
     title = title_match.group(1).strip() if title_match else f"PRD-{number}"
     active = _active_workspace_iterations(root)
