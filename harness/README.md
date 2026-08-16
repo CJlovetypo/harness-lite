@@ -11,8 +11,8 @@
 
 <!-- project-harness:focus:start -->
 - 当前迭代：[001](iterations/001/README.md) — 并行 PRD 编排与全局治理无感化。
-- 当前门禁：PRD-001 / SPEC-001 实施中；本地 WIP checkpoint `c515bfc` 已提交且未 push。candidate dependency/principle evidence、lifecycle 通知恢复与 public integrated evidence registry 已形成可恢复底座，但 registry 尚未接入 main advance/coordinator。
-- 下一步：接通 integrated evidence、integration/main progress 与统一 lifecycle facade，再运行完整多 PRD merge-train E2E。
+- 当前门禁：PRD-001 待验收 / SPEC-001 已完成；本地实现 checkpoint `603e2e1` 已提交且未 push。产品级真实临时 Git E2E、single-CAS final acceptance、ordered merge train、治理重建与崩溃恢复均已通过，开放偏差为 0。
+- 下一步：用户校核完整产物并明确是否最终验收；Harness 不自行把实现完成解释为验收。
 <!-- project-harness:focus:end -->
 
 ## 迭代索引
@@ -20,7 +20,7 @@
 | 迭代 | 标题 | PRD | SPEC | 开放偏差 | 一句话结果 | 下一步 | 入口 |
 |---|---|---|---|---:|---|---|---|
 <!-- project-harness:iterations:start -->
-| [001](iterations/001/README.md) | 并行 PRD 编排与全局治理无感化 | 实施中 | 实施中 | 0 | `c515bfc` 已提交；候选、train 与 evidence registry 底座已验证 | 接通 evidence/progress/facade 并跑全链 E2E | [进入](iterations/001/README.md) |
+| [001](iterations/001/README.md) | 并行 PRD 编排与全局治理无感化 | 待验收 | 已完成 | 0 | 完整 lifecycle / merge train / final acceptance 产品链与回归已通过，未 push | 用户校核并明确最终验收 | [进入](iterations/001/README.md) |
 <!-- project-harness:iterations:end -->
 
 ## 渐进阅读路由

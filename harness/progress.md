@@ -13,7 +13,7 @@
 | 迭代 | PRD 状态 | SPEC 状态 | 下一步 |
 |---|---|---|---|
 <!-- project-harness:progress-index:start -->
-| [001](iterations/001/README.md) | 实施中 | 实施中 | 接通 integrated evidence、progress 与统一 lifecycle facade |
+| [001](iterations/001/README.md) | 待验收 | 已完成 | 用户校核完整产物并明确最终验收 |
 <!-- project-harness:progress-index:end -->
 
 ## 事件
@@ -162,3 +162,18 @@
 - evidence_refs: ["git:commit:c515bfcd415ba835b3a10d35047fe21354a92dda","validator:project-harness:0-errors","test:candidate-dependency-generation","test:lifecycle-notification-recovery","test:integrated-evidence-registry"]
 - corrects: `none`
 - summary: "Created a local non-authoritative WIP checkpoint for lifecycle, progress, principle audit, candidate/train, integrated evidence, upgrade, UX, and workspace code; no worktree or v2 ref was created and nothing was pushed."
+
+## EV-I001-implementation-2855afa8594ecee5c4165434f781769d1bca6385f8c666e5b41de9d1595397e5 / CHECKPOINT / 2026-08-16T17:12:14+08:00
+
+- schema_version: `harness-lite.progress-event/v2`
+- session_id: `S-20260816-01`
+- iteration: `001`
+- scope: `implementation`
+- operation_id: `OP-fd85d57bed786dbeb3300457afc390e0`
+- event_key: `implementation-ready:603e2e1`
+- source_ref: `refs/heads/main`
+- source_commit: `603e2e1b8a9576222da8df990518411ede73b33d`
+- causal_parent: `EV-I001-implementation-2c50898f8f61091c6d5e0b59d20e43c9a96fb5918bcab723981638562d7ae960`
+- evidence_refs: ["git:commit:603e2e1","test:product-e2e:1-pass:1518.265s","test:harness-train:30-pass:5882.303s","test:train-governance:11-pass-plus-targeted-1-pass","test:final-acceptance:12-pass","test:lifecycle:25-pass","validator:project-harness:0-errors:0-warnings"]
+- corrects: `none`
+- summary: "PRD-001 implementation and acceptance evidence are complete; product E2E and security/recovery regressions pass, no deviation is open, nothing was pushed, and explicit user final acceptance remains the next gate."

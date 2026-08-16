@@ -4,7 +4,7 @@
 ## 文档元数据
 
 - SPEC ID：`SPEC-001`
-- 状态：`实施中`
+- 状态：`已完成`
 - 创建日期：`2026-08-11`
 - 对应需求：[`prd-001.md`](prd-001.md)
 - 对应偏差：[`deviation-001.md`](deviation-001.md)
@@ -419,3 +419,4 @@ iteration 元数据增加 `depends_on`、`conflicts_with`、integration target�
 - 2026-08-12：用户授权协调器在后续非最终 WIP 切片完成精确范围与验证复核后自主创建本地 checkpoint，并在完成后报告 hash、范围与 `pushed=false`；最终 candidate/integrated 产物仍由用户校核。该 standing authorization 不包含 push、main integration、历史改写、破坏性 Git、candidate/final 权威或最终验收。
 - 2026-08-12：完成治理/candidate/upgrade/UX 纯门禁切片：principle 三方 gate、progress immutable union、README managed preview、candidate/identity-rebind/integrated evidence、legacy upgrade 零写计划与版本化交互 envelope。默认 `merge --no-ff`；非默认策略只有在显式声明、生成新 integrated identity、重新验证并重绑新 evidence 后才可继续。本切片不执行 merge/main advance/push，不构成 candidate/final。
 - 2026-08-12：完成 validator/workspace/authority/v2 bundle/governance apply 执行底座：统一 live/commit-tree 语义校验与 v2 allocation anchor；从权威文档/refs 推导批准、实施和依赖；reserve 后可用 accepted digest 安全创建四件套；实现 1→N additive worktree、sticky draining、writer guard 与 B-first 原地 branch binding；reconcile apply 以 journal/file CAS 落盘 principle/progress/README。本切片不执行当前仓库 worktree/refs 变更，不 commit/merge/push，merge train 留待下一切片。
+- 2026-08-16：完成 lifecycle facade、原则影响审计、v2 progress、双/三基线候选证据、依赖 stale/refresh、ordered latest-main merge train、README 权威重建、public integrated/final evidence、single-CAS main advance、保守 cleanup、legacy upgrade 与精确崩溃恢复。产品级真实临时 Git E2E 通过，开放偏差为 0；SPEC 状态改为已完成，PRD 进入待验收；未执行 push，未自行授予最终验收。
