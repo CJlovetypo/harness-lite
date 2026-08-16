@@ -5,13 +5,15 @@
 
 这是项目 Harness 的 L0 轻量路由页。先用本页定位当前任务，再读取相关迭代的 `README.md`；不要为了了解状态默认加载所有 PRD、SPEC、偏差和完整历史。
 
-本页是派生摘要，不批准需求、技术方案或例外。基线权威为：已批准原则 > 已批准 PRD > 已批准 SPEC。deviation 只记录实现完成后的 as-built 事实差异，不是基线、批准源或实施授权；`progress.md` 只保存历史证据。
+本页是派生摘要，不批准需求、技术方案或例外。基线权威为：main 上已批准原则 > 已批准 PRD > 已批准 SPEC。deviation 只记录实现完成后的 as-built 事实差异；`progress.md` 保存不可改写的事件历史。managed 区域必须从原则、四件套、事件、refs 与本机状态投影确定性重建。
 
 ## 当前焦点
 
 <!-- project-harness:focus:start -->
 - 当前迭代：尚无。
-- 下一步：确认项目长期原则，或在出现明确产品目标时创建首轮迭代。
+- 当前拓扑：`IDLE`；无 writer、linked worktree 或 integration candidate。
+- 当前原则：读取 committed `principle.md` 的精确 hash；有 drift 时先完成影响审计。
+- 下一道门禁：确认项目长期原则，或在出现明确产品目标时创建首轮迭代。
 <!-- project-harness:focus:end -->
 
 ## 迭代索引
@@ -29,6 +31,9 @@
 | 了解某轮结果或下一步 | 对应 `iterations/NNN/README.md` |
 | 判断目标、范围、验收或是否新建迭代 | 迭代 README → PRD；有决策性歧义则 grill，小且明确可联合起草，明确但不小则 PRD 先行；涉及长期取舍再读 `principle.md` |
 | 设计、实现、测试、迁移或代码评审 | 迭代 README → PRD + SPEC |
+| 判断为什么 Local/worktree/串行 | 本页状态投影 → PRD 的 depends/conflicts/resource claims → SPEC workspace 契约 |
+| 判断原则漂移 | committed `principle.md` + PRD `principle_base_hash` + 定向 progress impact-audit 事件 |
+| 判断 candidate 或集成结果 | 迭代 README → candidate/integrated evidence identity → 目标验证事件 |
 | 评估风险、批准或实现前已知变化 | 迭代 README → PRD + SPEC；变化先修订并重新批准基线 |
 | 判断实现后的事实偏差或验收阻塞 | 迭代 README → deviation + 被引用的 PRD/SPEC 条款 |
 | 追溯某次决策 | 用迭代 README 的事件 ID 定向读取 `progress.md` |
@@ -44,8 +49,9 @@ L0  harness/README.md
 ```
 
 - README 只做导航与摘要；发现冲突时从权威正文和证据重建摘要。
-- `progress.md` 事件只追加；README 只引用事件 ID，不复制完整日志。
+- `progress.md` 事件按 identity/bytes 做 immutable union；同 ID 异文阻塞。README 只引用事件/证据 ID，不复制完整日志。
 - 新迭代一次性创建同号目录四件套。
-- 状态、开放偏差、结果或下一步改变时更新 L1；影响全局路由时再更新 L0。
+- 单 writer 使用 primary checkout 的 Local；第二个及后续 writer 才创建 sibling linked worktree；并发下降后 survivor 原地 drain。
+- 状态、开放偏差、结果或下一门禁改变时重建 L1；影响全局路由时重建 L0。分支 README 副本不能用 ours/theirs 决定全局状态。
 
 最后初始化：{{DATE}}

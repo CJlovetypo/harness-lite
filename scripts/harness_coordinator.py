@@ -26,12 +26,14 @@ try:
     from . import harness_workspace as workspace
     from . import harness_train as train
     from . import harness_integrated_evidence as integrated_registry
+    from . import harness_final_acceptance as final_registry
     from . import project_harness as core
     from .harness_decision import AuthorizationState, DecisionInput, RiskVector, classify
 except ImportError:  # pragma: no cover - direct script execution
     import harness_workspace as workspace
     import harness_train as train
     import harness_integrated_evidence as integrated_registry
+    import harness_final_acceptance as final_registry
     import project_harness as core
     from harness_decision import AuthorizationState, DecisionInput, RiskVector, classify
 
@@ -302,22 +304,21 @@ def _candidate_observations(
     tuple[str, ...],
     tuple[dict[str, str], ...],
 ]:
-    del refs  # the dependency registry is re-read atomically enough for CAS-style drift detection below
     candidate_prefix = f"refs/project-harness/v2/iterations/{number}/candidates/"
     evidence_prefix = f"refs/project-harness/v2/iterations/{number}/candidate-evidence/"
     observations: list[tuple[str, str]] = []
     verified: list[str] = []
     bindings: list[dict[str, str]] = []
     blockers: list[str] = []
-    executable = shutil.which("git")
-    if not executable:
-        raise CoordinatorError("Git is required")
-    context = workspace.RepositoryContext(git=executable, project_root=root, common_dir=_common_dir(root))
-    registry = workspace.dependency_registry_snapshot(context, number)
-    registry_digest = str(registry["digest"])
-    registry_entries = registry.get("refs")
-    if not isinstance(registry_entries, list):
-        raise CoordinatorError(f"candidate registry for PRD-{number} is unreadable")
+    # ``refs`` is the exact all-ref snapshot owned by the surrounding
+    # AuthorityValidationContext.  Reusing it avoids two extra Git scans while
+    # the context's exit check still rejects every concurrent ref mutation.
+    registry_entries = [
+        {"ref": reference, "oid": oid}
+        for reference, oid in sorted(refs.items())
+        if reference.startswith((candidate_prefix, evidence_prefix))
+    ]
+    registry_digest = workspace.digest(registry_entries)
     registry_refs = {
         str(item["ref"]): str(item["oid"])
         for item in registry_entries
@@ -378,11 +379,6 @@ def _candidate_observations(
                 "registry_digest": registry_digest,
             }
         )
-    final_registry = workspace.dependency_registry_snapshot(context, number)
-    if final_registry["digest"] != registry_digest:
-        blockers.append("candidate-registry-changed-during-read")
-        verified.clear()
-        bindings.clear()
     return candidate_names, tuple(observations), tuple(blockers), tuple(verified), tuple(bindings)
 
 
@@ -391,11 +387,11 @@ def _integrated_observation(
     iteration: str,
     refs: Mapping[str, str],
 ) -> tuple[bool, str | None, tuple[str, ...]]:
-    """Authenticate integrated/final status exclusively from public Git refs."""
+    """Authenticate accepted status exclusively from public final evidence."""
 
     integrated_ref = f"refs/project-harness/v2/iterations/{iteration}/integrated"
     final_ref = f"refs/project-harness/v2/iterations/{iteration}/final"
-    final_evidence_ref = integrated_registry.iteration_final_evidence_ref(iteration)
+    final_evidence_ref = final_registry.iteration_final_evidence_ref(iteration)
     integrated_object = refs.get(integrated_ref)
     final_object = refs.get(final_ref)
     if integrated_object is None and final_object is None:
@@ -429,58 +425,57 @@ def _integrated_observation(
         blockers.append("integrated-evidence-operation-ref-missing")
         return False, integrated_object, tuple(dict.fromkeys(blockers))
 
-    matches: list[integrated_registry.RegisteredIntegratedEvidence] = []
+    matches: list[final_registry.RegisteredFinalAcceptance] = []
     for operation_id in sorted(operation_ids):
         try:
-            receipt, evidence_blockers = integrated_registry.load_registered_integrated_evidence(
+            receipt, evidence_blockers = final_registry.load_registered_final_acceptance(
                 root,
                 operation_id=operation_id,
             )
-        except integrated_registry.IntegratedEvidenceError as exc:
-            blockers.append(f"integrated-evidence-public-load:{operation_id}:{exc}")
+        except final_registry.FinalAcceptanceError as exc:
+            blockers.append(f"final-acceptance-public-load:{operation_id}:{exc}")
             continue
         blockers.extend(
-            f"integrated-evidence:{operation_id}:{item.code}:{item.message}"
+            f"final-acceptance:{operation_id}:{item.code}:{item.message}"
             for item in evidence_blockers
         )
         if receipt is None:
             continue
-        candidate_iterations = {
-            item.iteration for item in receipt.metadata.candidate_bindings
-        }
+        candidate_iterations = {item.iteration for item in receipt.metadata.accepted_candidates}
         if iteration not in candidate_iterations:
             continue
-        expected_iteration_ref = integrated_registry.iteration_evidence_ref(
-            iteration,
-            receipt.metadata.generation,
-        )
+        expected_iteration_ref = final_registry.iteration_final_evidence_ref(iteration)
         if not any(
             item.iteration == iteration and item.ref_name == expected_iteration_ref
             for item in receipt.iteration_evidence_refs
         ):
             blockers.append(
-                f"integrated-evidence-iteration-binding-missing:{operation_id}:{iteration}"
+                f"final-acceptance-iteration-binding-missing:{operation_id}:{iteration}"
             )
             continue
         matches.append(receipt)
 
     if len(matches) != 1:
         blockers.append(
-            "integrated-evidence-envelope-missing"
+            "final-acceptance-envelope-missing"
             if not matches
-            else "integrated-evidence-envelope-ambiguous"
+            else "final-acceptance-envelope-ambiguous"
         )
         return False, integrated_object, tuple(dict.fromkeys(blockers))
     receipt = matches[0]
-    if target != receipt.metadata.integrated_commit:
-        blockers.append("integrated-evidence-commit-mismatch")
+    if target != receipt.metadata.accepted_main:
+        blockers.append("final-acceptance-commit-mismatch")
     if refs.get(final_evidence_ref) != receipt.evidence_blob:
-        blockers.append("integrated-final-evidence-ref-missing-or-drifted")
+        blockers.append("final-acceptance-evidence-ref-missing-or-drifted")
     integrated = not blockers
     return integrated, integrated_object, tuple(dict.fromkeys(blockers))
 
 
-def derive_iteration_authority(root: Path, iteration: str) -> IterationAuthority:
+def _derive_iteration_authority_snapshot(
+    root: Path,
+    iteration: str,
+    validation: train.AuthorityValidationContext,
+) -> IterationAuthority:
     """Read approvals/dependencies from canonical files and identities from Git."""
 
     number = iteration.strip()
@@ -521,7 +516,7 @@ def derive_iteration_authority(root: Path, iteration: str) -> IterationAuthority
         )
     except core.HarnessError as exc:
         raise CoordinatorError(f"canonical main governance is invalid: {exc}") from exc
-    refs = _refs(root)
+    refs = dict(validation.refs)
     base_ref, base_commit, source_base_ref, v2_blockers = _v2_base_identity(root, number, refs)
     blockers.extend(v2_blockers)
     if base_ref is None:
@@ -580,6 +575,16 @@ def derive_iteration_authority(root: Path, iteration: str) -> IterationAuthority
         active_writer=number in active,
         blockers=tuple(blockers),
     )
+
+
+def derive_iteration_authority(root: Path, iteration: str) -> IterationAuthority:
+    """Derive once from an exact ref/evidence snapshot and fail on drift."""
+
+    try:
+        with train.authority_validation_context(root) as validation:
+            return _derive_iteration_authority_snapshot(root, iteration, validation)
+    except train.TrainError as exc:
+        raise CoordinatorError(f"authority snapshot validation failed: {exc}") from exc
 
 
 def _risk(value: Mapping[str, object]) -> RiskVector:

@@ -301,6 +301,64 @@ class ProgressUnionTests(unittest.TestCase):
         self.assertFalse(plan.ready)
         self.assertIn("progress-candidate-reorders-base-history", blocker_codes(plan))
 
+    def test_verified_reconciliation_base_can_union_divergent_main_causal_history(self) -> None:
+        candidate_workspace = v2_event(
+            "EV-candidate-workspace-01",
+            "candidate workspace",
+            parent="S-20260812-01/OPEN",
+        )
+        dependency_candidate = v2_event(
+            "EV-dependency-candidate-01",
+            "dependency candidate",
+            parent="S-20260812-01/OPEN",
+        )
+        candidate_seal = v2_event(
+            "EV-candidate-seal-01",
+            "candidate seal",
+            parent="EV-candidate-workspace-01",
+        )
+        reconciliation_base = progress_document(
+            self.base_event,
+            candidate_workspace,
+            dependency_candidate,
+        )
+        latest_main = progress_document(self.base_event, dependency_candidate)
+        candidate = progress_document(
+            self.base_event,
+            candidate_workspace,
+            dependency_candidate,
+            candidate_seal,
+        )
+
+        strict = plan_progress_union(
+            branch_base=reconciliation_base,
+            latest_main=latest_main,
+            branch_candidate=candidate,
+        )
+        self.assertFalse(strict.ready)
+
+        plan = plan_progress_union(
+            branch_base=reconciliation_base,
+            latest_main=latest_main,
+            branch_candidate=candidate,
+            allow_divergent_main_history=True,
+        )
+
+        self.assertTrue(plan.ready, plan.blockers)
+        self.assertEqual(
+            plan.appended_event_identities,
+            (
+                "EV-candidate-workspace-01",
+                "EV-candidate-seal-01",
+            ),
+        )
+        assert plan.preview is not None
+        self.assertEqual(plan.preview.count(b"EV-dependency-candidate-01"), 1)
+        self.assertLess(
+            plan.preview.index(b"EV-candidate-workspace-01"),
+            plan.preview.index(b"EV-candidate-seal-01"),
+        )
+
     def test_causal_parent_must_precede_child(self) -> None:
         child = v2_event("EV-child-01", "child", parent="EV-parent-01")
         parent = v2_event("EV-parent-01", "parent", parent="S-20260812-01/OPEN")

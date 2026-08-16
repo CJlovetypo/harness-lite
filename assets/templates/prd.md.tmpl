@@ -8,6 +8,18 @@
 - 创建日期：`{{DATE}}`
 - Git 基线：`{{BASE_COMMIT}}`
 - Git 分支：`{{BASE_BRANCH}}`
+- lifecycle：待由 coordinator/upgrade disposition 绑定为 `v2` 或 `legacy-serial`；不得从模板推断。
+- allocation_base_commit：`{{BASE_COMMIT}}`
+- allocation_base_ref：待绑定；v2 使用 `refs/project-harness/v2/iterations/{{NUMBER}}/base`，legacy serial 保留其既有 base anchor。
+- implementation_start_commit：尚未绑定；必须是 allocation base 的后代，并在实施授权后的 workspace activation receipt 中精确记录。
+- implementation_start_ref：尚未绑定；独立 PRD 默认从精确 `refs/heads/main` 开始，stacked PRD 只能从已声明的稳定 candidate 开始。
+- principle_base_hash：尚未绑定；以 v2 allocation metadata 的 `principle_sha256` 与 committed main 原则快照为准，不得手工改写。
+- depends_on：无。
+- conflicts_with：无。
+- integration_target：`refs/heads/main`。
+- shared_contracts_or_schema：无。
+- resource_claims：无；如需端口、数据库/schema、缓存、容器、账号或外部环境，必须逐项声明独占/共享方式。
+- touched_area_hints：待在 SPEC 中声明责任范围；仅用于冲突/资源预检，不替代 exact included paths。
 - 对应规格：[`spec-{{NUMBER}}.md`](spec-{{NUMBER}}.md)
 - 对应偏差：[`deviation-{{NUMBER}}.md`](deviation-{{NUMBER}}.md)
 - 适用原则：[`../../principle.md`](../../principle.md)
@@ -39,10 +51,12 @@
 ## 产品约束
 
 - 记录产品、安全、兼容、时间、成本或合规约束；不要写代码步骤。
+- 声明依赖、冲突、集成目标与共享资源事实；未知或互斥资源必须阻塞实施或改为串行，不能靠 worktree 掩盖。
 
 ## 开放问题
 
 - 列出会改变范围、验收、约束或重要取舍且仍需用户决定的问题；先 grill 用户并解决，或由用户明确移出本轮范围并记录影响与下一道门禁，再把 PRD 提交批准。
+- 在批准前把 `principle_base_hash`、双基线、依赖、冲突、集成目标和资源 claims 与 allocation/activation 证据核对；草案占位不能进入 candidate gate。
 
 ## 批准与修订记录
 

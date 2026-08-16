@@ -867,6 +867,14 @@ class CoordinatorAuthorityTests(unittest.TestCase):
         self.assertEqual(lease_g2["generation"], 2)
         self.assertEqual(lease_g2["dependency_refresh_generation"], 1)
         self.assertEqual(lease_g2["dependency_bindings"], [selected_g2])
+        self.assertEqual(lease_g2["implementation_ref"], selected_g2["candidate_ref"])
+        self.assertEqual(lease_g2["implementation_commit"], candidate_commit_g2)
+        self.assertEqual(lease_g2["reconciliation_ref"], feature_ref)
+        self.assertEqual(
+            lease_g2["reconciliation_commit"],
+            self.git("rev-parse", "HEAD", cwd=feature_worktree).stdout.strip(),
+        )
+        self.assertNotEqual(lease_g2["reconciliation_commit"], candidate_commit_g2)
         old_generation_guard, _ = workspace.guard_lease(context, lease_g2, generation=1)
         self.assertTrue(any(item.code == "lease-generation-mismatch" for item in old_generation_guard))
         current_generation_guard, _ = workspace.guard_lease(context, lease_g2, generation=2)

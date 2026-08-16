@@ -6,15 +6,19 @@ import os
 import subprocess
 import tempfile
 import unittest
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from scripts import harness_bundle as bundle
 from scripts import harness_lifecycle as lifecycle
 from scripts import harness_principle_audit as principle_audit
 from scripts import harness_progress as progress
+from scripts import harness_train as train
 from scripts import harness_workspace as workspace
 from scripts import project_harness as core
+from scripts.tests.harness_authoritative_fixture import AuthoritativeIntegrationFixture
 
 
 class LifecycleFacadeTests(unittest.TestCase):
@@ -83,6 +87,435 @@ class LifecycleFacadeTests(unittest.TestCase):
             value["iteration"] = iteration
         value.update(extra)
         return value
+
+    def dependency_binding_fixture(self, iteration: str = "002") -> dict[str, str]:
+        generation = "g1"
+        return {
+            "schema_version": workspace.DEPENDENCY_BINDING_SCHEMA,
+            "iteration": iteration,
+            "generation": generation,
+            "candidate_ref": f"refs/project-harness/v2/iterations/{iteration}/candidates/{generation}",
+            "candidate_commit": "1" * 40,
+            "candidate_tree": "2" * 40,
+            "candidate_evidence_ref": f"refs/project-harness/v2/iterations/{iteration}/candidate-evidence/{generation}",
+            "candidate_evidence_blob": "3" * 40,
+            "candidate_evidence_digest": "4" * 64,
+            "candidate_evidence_metadata_digest": "5" * 64,
+            "registration_digest": "6" * 64,
+            "registry_digest": "7" * 64,
+        }
+
+    def test_stacked_route_extracts_only_coordinator_bound_dependency_identity(self) -> None:
+        binding = self.dependency_binding_fixture()
+        route = {
+            "coordinator": {
+                "planned_steps": [
+                    {"step": "authority-preflight", "writes": False},
+                    {
+                        "step": "workspace-plan",
+                        "implementation_ref": binding["candidate_ref"],
+                        "implementation_commit": binding["candidate_commit"],
+                        "dependency_bindings": [binding],
+                        "dependency_bindings_digest": workspace.dependency_bindings_digest((binding,)),
+                    },
+                ]
+            }
+        }
+
+        self.assertEqual(lifecycle._route_dependency_bindings(route), (binding,))
+        changed = json.loads(json.dumps(route))
+        changed["coordinator"]["planned_steps"][1]["implementation_commit"] = "8" * 40
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "implementation start"):
+            lifecycle._route_dependency_bindings(changed)
+        missing = json.loads(json.dumps(route))
+        missing["coordinator"]["planned_steps"][1]["dependency_bindings"] = []
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "stable dependency"):
+            lifecycle._route_dependency_bindings(missing)
+
+    def test_final_acceptance_stage_is_the_only_main_mutation_stage(self) -> None:
+        self.assertEqual(
+            lifecycle.STAGE_NEXT_GATE["final-acceptance-register"],
+            "plan-cleanup",
+        )
+        self.assertNotIn("main-advance", lifecycle.STAGE_ORDER)
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "second main mutation"):
+            lifecycle.plan_main_advance_stage(
+                object(),
+                lifecycle_operation_id=self.operation("f"),
+            )
+
+    def test_ordered_integration_is_the_only_public_prepare_entrypoint(self) -> None:
+        self.assertNotIn("integration-prepare", lifecycle.GENERIC_STAGE_ORDER)
+        self.assertNotIn("plan_integration_preparation_stage", lifecycle.__all__)
+        self.assertNotIn("apply_integration_preparation_stage", lifecycle.__all__)
+        self.assertFalse(hasattr(lifecycle, "plan_integration_preparation_stage"))
+        self.assertFalse(hasattr(lifecycle, "apply_integration_preparation_stage"))
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "unsupported lifecycle stage"):
+            lifecycle._stage_artifact_type("integration-prepare")
+
+    def test_candidate_seal_stage_uses_nested_registration_operation_identity(self) -> None:
+        registration = mock.Mock(
+            operation_id=self.operation("c"),
+            project_root=str(self.root),
+            candidate_ref="refs/project-harness/v2/iterations/001/candidates/g1",
+            candidate_evidence_ref=(
+                "refs/project-harness/v2/iterations/001/candidate-evidence/g1"
+            ),
+        )
+        seal = mock.Mock(spec=train.CandidateSealPlan)
+        seal.registration_plan = registration
+        sentinel = object()
+        with mock.patch.object(
+            lifecycle,
+            "_build_stage_plan",
+            return_value=sentinel,
+        ) as build:
+            result = lifecycle.plan_candidate_registration_stage(
+                seal,
+                lifecycle_operation_id=self.operation("d"),
+            )
+
+        self.assertIs(result, sentinel)
+        self.assertEqual(
+            build.call_args.kwargs["child_operation_id"],
+            registration.operation_id,
+        )
+
+    def test_final_cas_crash_recovers_from_durable_child_without_second_cas(self) -> None:
+        fixture = AuthoritativeIntegrationFixture()
+        try:
+            integrated = fixture.publish_integrated_evidence()
+            main_plan = fixture.plan_main_advance(integrated)
+            token = fixture.advance_token(main_plan)
+            lifecycle_operation = self.operation("a")
+            plan = lifecycle.plan_final_acceptance_stage(
+                integrated,
+                lifecycle_operation_id=lifecycle_operation,
+                main_confirmation_token=token,
+            )
+
+            def crash(stage: str) -> None:
+                if stage == "final-acceptance-after-refs":
+                    raise RuntimeError("crash after exact final CAS")
+
+            with self.assertRaisesRegex(RuntimeError, "after exact final CAS"):
+                lifecycle.apply_final_acceptance_stage(
+                    plan,
+                    integrated,
+                    accepted_plan_digest=plan.plan_digest,
+                    main_confirmation_token=token,
+                    failpoint=crash,
+                )
+            refs_after_cas = fixture.git(
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/project-harness/v2",
+            ).stdout
+            recovered = lifecycle.apply_final_acceptance_stage(
+                plan,
+                integrated,
+                accepted_plan_digest=plan.plan_digest,
+                main_confirmation_token=token,
+            )
+
+            self.assertIsInstance(recovered.child_result, train.MainAdvanceResult)
+            self.assertTrue(recovered.child_result.idempotent)
+            self.assertEqual(
+                fixture.git(
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "refs/project-harness/v2",
+                ).stdout,
+                refs_after_cas,
+            )
+            self.assertEqual(recovered.notification_receipts, ())
+        finally:
+            fixture.close()
+
+    def test_stage_plan_is_zero_write_digest_bound_and_requires_exact_acceptance(self) -> None:
+        @dataclass(frozen=True)
+        class FakePlan:
+            schema_version: str
+            operation_id: str
+            project_root: str
+            iteration: str
+            plan_digest: str
+            blockers: tuple[object, ...] = ()
+
+            def as_dict(self):
+                return {
+                    **self.__dict__,
+                    "blockers": [],
+                }
+
+        child = FakePlan(
+            "fake/v1",
+            self.operation("a"),
+            str(self.root),
+            "001",
+            "1" * 64,
+        )
+        before = list((self.root / ".git").rglob("*"))
+        plan = lifecycle._build_stage_plan(
+            project_root=self.root,
+            lifecycle_operation_id=self.operation("b"),
+            stage="candidate-preverify",
+            subject=child,
+            child=child,
+            child_digest_attribute="plan_digest",
+            action_level="silent",
+            confirmation_action=None,
+        )
+
+        self.assertEqual(before, list((self.root / ".git").rglob("*")))
+        lifecycle._validate_stage_plan(plan)
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "accepted lifecycle stage digest"):
+            lifecycle._apply_stage_transaction(
+                plan,
+                accepted_plan_digest="2" * 64,
+                subject=child,
+                replanned=plan,
+                execute=lambda _notify: child,
+            )
+        self.assertFalse(lifecycle._stage_journal_path(lifecycle._context(self.root), plan.operation_id).exists())
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "plan digest changed"):
+            lifecycle._validate_stage_plan(replace(plan, plan_digest="0" * 64))
+
+    def test_stage_journal_recovers_after_child_and_notification_without_duplicate(self) -> None:
+        @dataclass(frozen=True)
+        class Fake:
+            schema_version: str
+            operation_id: str
+            project_root: str
+            iteration: str
+            plan_digest: str
+
+            def as_dict(self):
+                return self.__dict__
+
+        @dataclass(frozen=True)
+        class FakeResult:
+            schema_version: str
+            evidence: str
+            idempotent: bool
+
+            def as_dict(self):
+                return self.__dict__
+
+        subject = Fake("fake/v1", self.operation("c"), str(self.root), "001", "3" * 64)
+        plan = lifecycle._build_stage_plan(
+            project_root=self.root,
+            lifecycle_operation_id=self.operation("d"),
+            stage="integration-cleanup",
+            subject=subject,
+            child=subject,
+            child_digest_attribute="plan_digest",
+            action_level="notify",
+            confirmation_action=None,
+        )
+        notifications: list[dict[str, object]] = []
+        execute_calls = 0
+
+        def execute(proxy):
+            nonlocal execute_calls
+            execute_calls += 1
+            proxy({"schema_version": "fake-notification/v1", "phase": "before"})
+            return FakeResult(
+                "fake-result/v1",
+                "stable",
+                # Runtime replay flags are deliberately not authority identity.
+                execute_calls >= 3,
+            )
+
+        def crash(stage):
+            if stage == "after-child-before-stage-journal":
+                raise RuntimeError("crash")
+
+        with self.assertRaisesRegex(RuntimeError, "crash"):
+            lifecycle._apply_stage_transaction(
+                plan,
+                accepted_plan_digest=plan.plan_digest,
+                subject=subject,
+                replanned=plan,
+                execute=execute,
+                notify=lambda item: notifications.append(item),
+                failpoint=crash,
+            )
+        resumed = lifecycle._apply_stage_transaction(
+            plan,
+            accepted_plan_digest=plan.plan_digest,
+            subject=subject,
+            replanned=plan,
+            execute=execute,
+            notify=lambda item: notifications.append(item),
+        )
+        replay = lifecycle._apply_stage_transaction(
+            plan,
+            accepted_plan_digest=plan.plan_digest,
+            subject=subject,
+            replanned=plan,
+            execute=execute,
+            notify=lambda item: notifications.append(item),
+        )
+
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual(len(resumed.notification_receipts), 1)
+        self.assertTrue(replay.idempotent_replay)
+        self.assertIsInstance(replay.child_result, FakeResult)
+        self.assertFalse(replay.child_result.idempotent)
+        status = lifecycle.lifecycle_stage_status(self.root)
+        self.assertEqual(status["next_gate"], "iteration-close-or-next-candidate")
+
+    def test_stage_cli_help_and_dispatch_do_not_print_token(self) -> None:
+        parser = lifecycle.build_parser()
+        planned = parser.parse_args(
+            [
+                "plan-stage",
+                "--project-root",
+                str(self.root),
+                "--stage",
+                "candidate-preverify",
+                "--operation-id",
+                self.operation("e"),
+                "--artifact",
+                "artifact.json",
+                "--json",
+            ]
+        )
+        applied = parser.parse_args(
+            [
+                "apply-stage",
+                "--plan",
+                "plan.json",
+                "--artifact",
+                "artifact.json",
+                "--accept-plan-digest",
+                "4" * 64,
+                "--token",
+                "secret-token.json",
+                "--json",
+            ]
+        )
+        self.assertEqual(planned.command, "plan-stage")
+        self.assertEqual(applied.command, "apply-stage")
+        with mock.patch("sys.stdout") as stdout:
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["plan-stage", "--help"])
+        rendered = "".join(str(call) for call in stdout.write.call_args_list)
+        self.assertIn("--artifact", rendered)
+        self.assertNotIn("secret-token.json", rendered)
+
+    def test_completed_stage_replay_cannot_clear_later_active_stage(self) -> None:
+        @dataclass(frozen=True)
+        class Fake:
+            schema_version: str
+            operation_id: str
+            project_root: str
+            iteration: str
+            plan_digest: str
+
+            def as_dict(self):
+                return self.__dict__
+
+        lifecycle_operation = self.operation("b")
+        first = Fake("fake/v1", self.operation("1"), str(self.root), "001", "1" * 64)
+        second = Fake("fake/v1", self.operation("2"), str(self.root), "001", "2" * 64)
+        first_plan = lifecycle._build_stage_plan(
+            project_root=self.root,
+            lifecycle_operation_id=lifecycle_operation,
+            stage="candidate-preverify",
+            subject=first,
+            child=first,
+            child_digest_attribute="plan_digest",
+            action_level="silent",
+            confirmation_action=None,
+        )
+        second_plan = lifecycle._build_stage_plan(
+            project_root=self.root,
+            lifecycle_operation_id=lifecycle_operation,
+            stage="candidate-register",
+            subject=second,
+            child=second,
+            child_digest_attribute="plan_digest",
+            action_level="confirm",
+            confirmation_action="create-candidate-seal",
+        )
+        lifecycle._apply_stage_transaction(
+            first_plan,
+            accepted_plan_digest=first_plan.plan_digest,
+            subject=first,
+            replanned=first_plan,
+            execute=lambda _proxy: first,
+        )
+
+        def crash(stage: str) -> None:
+            if stage == "after-child-before-stage-journal":
+                raise RuntimeError("later stage crash")
+
+        with self.assertRaisesRegex(RuntimeError, "later stage crash"):
+            lifecycle._apply_stage_transaction(
+                second_plan,
+                accepted_plan_digest=second_plan.plan_digest,
+                subject=second,
+                replanned=second_plan,
+                execute=lambda _proxy: second,
+                failpoint=crash,
+            )
+        context = workspace.resolve_repository(self.root)
+        before = lifecycle._load_stage_journal(context, lifecycle_operation)
+        assert before is not None
+        self.assertEqual(
+            lifecycle.digest(before["active_plan"]),
+            lifecycle.digest(second_plan.as_dict()),
+        )
+
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "another stage is active"):
+            lifecycle._apply_stage_transaction(
+                first_plan,
+                accepted_plan_digest=first_plan.plan_digest,
+                subject=first,
+                replanned=first_plan,
+                execute=lambda _proxy: first,
+            )
+        after = lifecycle._load_stage_journal(context, lifecycle_operation)
+        self.assertEqual(after, before)
+
+        drift_child = replace(second, plan_digest="3" * 64)
+        drift_plan = lifecycle._build_stage_plan(
+            project_root=self.root,
+            lifecycle_operation_id=lifecycle_operation,
+            stage="candidate-register",
+            subject=second,
+            child=drift_child,
+            child_digest_attribute="plan_digest",
+            action_level="confirm",
+            confirmation_action="create-candidate-seal",
+        )
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "child plan changed"):
+            lifecycle._apply_stage_transaction(
+                second_plan,
+                accepted_plan_digest=second_plan.plan_digest,
+                subject=second,
+                replanned=drift_plan,
+                execute=lambda _proxy: second,
+            )
+        self.assertEqual(lifecycle._load_stage_journal(context, lifecycle_operation), before)
+
+        recovered = lifecycle._apply_stage_transaction(
+            second_plan,
+            accepted_plan_digest=second_plan.plan_digest,
+            subject=second,
+            replanned=second_plan,
+            execute=lambda _proxy: second,
+        )
+        self.assertFalse(recovered.idempotent_replay)
+        final = lifecycle._load_stage_journal(context, lifecycle_operation)
+        assert final is not None
+        self.assertIsNone(final["active_plan"])
+        self.assertEqual(
+            [item["stage"] for item in final["completed_stages"]],
+            ["candidate-preverify", "candidate-register"],
+        )
 
     def refs(self) -> str:
         return self.git("for-each-ref", "--format=%(refname) %(objectname)").stdout
@@ -560,6 +993,115 @@ class LifecycleFacadeTests(unittest.TestCase):
         journal = lifecycle._load_lifecycle_journal(workspace.resolve_repository(self.root), op_b)
         self.assertIsNotNone(journal)
         self.assertEqual(journal["notification_receipts"], receipts)
+
+    def test_local_main_release_stage_records_progress_once_and_recovers_after_progress(self) -> None:
+        a = self.reserve_underlying_local_writer()
+        operation_b = self.operation("6")
+        title_b = "Earlier integration B"
+        b = self.reserve_and_bundle(title_b, operation_b)
+        self.approve_and_commit(b)
+        self.start_workspace(b, title_b, operation_b)
+
+        (self.root / "app.txt").write_text("A dirty implementation\n", encoding="utf-8")
+        (self.root / "a-index.txt").write_text("A staged bytes\n", encoding="utf-8")
+        self.git("add", "--", "a-index.txt")
+        (self.root / "a-untracked.txt").write_text("A untracked bytes\n", encoding="utf-8")
+        index_before = (self.root / ".git" / "index").read_bytes()
+        feature_before = (self.root / "app.txt").read_bytes()
+        untracked_before = (self.root / "a-untracked.txt").read_bytes()
+        head_before = self.git("rev-parse", "HEAD").stdout.strip()
+        main_before = self.git("rev-parse", "refs/heads/main").stdout.strip()
+
+        context = workspace.resolve_repository(self.root)
+        lease = workspace.load_lease(context, a)
+        assert lease is not None
+        bind = workspace.build_bind_local_branch_plan(
+            self.root,
+            iteration=a,
+            owner=str(lease["owner"]),
+            lease_generation=int(lease["generation"]),
+            worktree_path=self.root,
+            base_commit=self.git(
+                "rev-parse", f"refs/project-harness/v2/iterations/{a}/base"
+            ).stdout.strip(),
+            new_branch_ref=f"refs/heads/harness/prd-{a}",
+            operation_id=self.operation("5"),
+        )
+        self.assertEqual(bind.blockers, (), bind.blockers)
+        parsed = progress.parse_progress_events(
+            (self.root / "harness" / "progress.md").read_bytes(),
+            source="local-main-release-before",
+        )
+        self.assertFalse(parsed.blockers, parsed.blockers)
+        parent = parsed.events[-1].identity if parsed.events else None
+        lifecycle_operation = self.operation("4")
+        stage_plan = lifecycle.plan_local_main_release_stage(
+            bind,
+            lifecycle_operation_id=lifecycle_operation,
+            session_id="S-20260812-09",
+            occurred_at="2026-08-12T09:00:00+08:00",
+            causal_parent=parent,
+        )
+        self.assertTrue(stage_plan.ready, stage_plan.blockers)
+        notifications: list[object] = []
+
+        def crash(stage: str) -> None:
+            if stage == "local-main-release-after-progress":
+                raise BaseException("power loss after progress")
+
+        with self.assertRaisesRegex(BaseException, "after progress"):
+            lifecycle.apply_local_main_release_stage(
+                stage_plan,
+                bind,
+                accepted_plan_digest=stage_plan.plan_digest,
+                session_id="S-20260812-09",
+                occurred_at="2026-08-12T09:00:00+08:00",
+                causal_parent=parent,
+                notify=notifications.append,
+                failpoint=crash,
+            )
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual(self.git("symbolic-ref", "HEAD").stdout.strip(), f"refs/heads/harness/prd-{a}")
+        self.assertEqual(self.git("rev-parse", "refs/heads/main").stdout.strip(), main_before)
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), head_before)
+        self.assertEqual((self.root / ".git" / "index").read_bytes(), index_before)
+        self.assertEqual((self.root / "app.txt").read_bytes(), feature_before)
+        self.assertEqual((self.root / "a-untracked.txt").read_bytes(), untracked_before)
+        planned_event_id = next(
+            ref for ref in stage_plan.evidence_refs if ref.startswith("EV-")
+        )
+        self.assertEqual(len(self.progress_event_blocks(self.root, planned_event_id)), 1)
+
+        recovered = lifecycle.apply_local_main_release_stage(
+            stage_plan,
+            bind,
+            accepted_plan_digest=stage_plan.plan_digest,
+            session_id="S-20260812-09",
+            occurred_at="2026-08-12T09:00:00+08:00",
+            causal_parent=parent,
+            notify=notifications.append,
+        )
+        self.assertEqual(recovered.child_result["phase"], "succeeded")
+        event_id = recovered.child_result["progress"]["event_id"]
+        self.assertEqual(len(self.progress_event_blocks(self.root, event_id)), 1)
+        self.assertEqual([item["phase"] for item in notifications], ["before", "after"])
+        self.assertEqual((self.root / ".git" / "index").read_bytes(), index_before)
+        self.assertEqual((self.root / "app.txt").read_bytes(), feature_before)
+        self.assertEqual((self.root / "a-untracked.txt").read_bytes(), untracked_before)
+
+        replay = lifecycle.apply_local_main_release_stage(
+            stage_plan,
+            bind,
+            accepted_plan_digest=stage_plan.plan_digest,
+            session_id="S-20260812-09",
+            occurred_at="2026-08-12T09:00:00+08:00",
+            causal_parent=parent,
+            notify=notifications.append,
+        )
+        self.assertTrue(replay.idempotent_replay)
+        self.assertEqual(len(notifications), 2)
+        self.assertEqual(len(self.progress_event_blocks(self.root, event_id)), 1)
+        self.assertEqual(replay.child_result_digest, recovered.child_result_digest)
 
     def test_crash_after_workspace_child_retries_idempotently_without_duplicate_worktree(self) -> None:
         self.reserve_underlying_local_writer()

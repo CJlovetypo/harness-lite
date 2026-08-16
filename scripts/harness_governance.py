@@ -625,6 +625,7 @@ def plan_progress_union(
     branch_base: bytes,
     latest_main: bytes,
     branch_candidate: bytes,
+    allow_divergent_main_history: bool = False,
 ) -> ProgressReconcilePlan:
     """Plan an append-only semantic union of progress event blocks."""
 
@@ -635,14 +636,32 @@ def plan_progress_union(
     main = parse_progress_events(main_raw, source="latest-main")
     candidate = parse_progress_events(candidate_raw, source="branch-candidate")
     blockers = [*base.blockers, *main.blockers, *candidate.blockers]
-    blockers.extend(_check_base_history(base.events, main.events, current_name="main"))
+    if allow_divergent_main_history:
+        main_by_identity_for_base = {event.identity: event for event in main.events}
+        for event in base.events:
+            existing = main_by_identity_for_base.get(event.identity)
+            if existing is not None and existing.exact_bytes != event.exact_bytes:
+                blockers.append(
+                    Blocker(
+                        "progress-main-rewrites-base-event",
+                        f"latest-main changed the exact bytes of reconciliation event {event.identity}.",
+                        event.identity,
+                    )
+                )
+    else:
+        blockers.extend(_check_base_history(base.events, main.events, current_name="main"))
     blockers.extend(_check_base_history(base.events, candidate.events, current_name="candidate"))
 
     main_by_identity = {event.identity: event for event in main.events}
     base_identities = {event.identity for event in base.events}
     appended: list[ProgressEvent] = []
     deduplicated: list[str] = []
-    for event in candidate.events[len(base.events) :]:
+    candidate_events = (
+        candidate.events
+        if allow_divergent_main_history
+        else candidate.events[len(base.events) :]
+    )
+    for event in candidate_events:
         existing = main_by_identity.get(event.identity)
         if existing is None:
             appended.append(event)
@@ -655,7 +674,7 @@ def plan_progress_union(
                     event.identity,
                 )
             )
-        elif event.identity not in base_identities:
+        elif allow_divergent_main_history or event.identity not in base_identities:
             deduplicated.append(event.identity)
 
     final_events = [*main.events, *appended]

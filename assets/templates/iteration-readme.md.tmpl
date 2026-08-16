@@ -3,21 +3,29 @@
 
 > 本页是 L1 派生摘要，只用于路由与状态恢复；PRD、SPEC、deviation 和 progress 事件才承载相应事实。
 
+## 本轮目标
+
+围绕“{{TITLE}}”明确产品问题、范围、验收与实施基线。
+
+<!-- project-harness:iteration-routing:start -->
 ## 状态卡
 
 - 迭代：`{{NUMBER}}`
 - PRD 状态：`草案`
 - SPEC 状态：`受 PRD 阻塞`
 - 开放偏差：`0`
+- principle_base_hash：尚未绑定；以 allocation metadata 为准。
+- 执行拓扑：尚未激活 writer（Local/worktree/stacked/serialize 待三轴路由）。
+- lifecycle / allocation base：待由 coordinator/upgrade disposition 绑定 / `{{BASE_COMMIT}}`；ref 以实际 v2 allocation 或 legacy anchor 为准。
+- implementation start：尚未绑定。
+- depends_on / conflicts_with：无 / 无。
+- candidate / integration：无 / 无。
+- 下一道门禁：完成三轴分类并取得所需产品批准；拓扑判断不授权实施。
 - 摘要更新时间：`{{DATE}}`
-
-## 本轮目标
-
-围绕“{{TITLE}}”明确产品问题、范围、验收与实施基线。
 
 ## 当前结果
 
-已创建治理四件套；下一步先评估需求清晰度与规模，再选择 grill、联合起草或 PRD 先行路径，尚未授权实施。
+已创建治理四件套；下一步分别判断治理路径、执行拓扑和授权状态，尚未授权实施，也尚未创建 worktree/candidate。
 
 ## 最近进展
 
@@ -28,7 +36,8 @@
 ## 开放事项与下一步
 
 - 开放偏差：无。
-- 下一步：先解决决策性歧义；小且明确可同轮完成 [`prd-{{NUMBER}}.md`](prd-{{NUMBER}}.md) 与 [`spec-{{NUMBER}}.md`](spec-{{NUMBER}}.md) 草案，明确但不小则 PRD 先行，有歧义才 grill 用户。
+- 下一步：先解决决策性歧义；小且明确可同轮完成 [`prd-{{NUMBER}}.md`](prd-{{NUMBER}}.md) 与 [`spec-{{NUMBER}}.md`](spec-{{NUMBER}}.md) 草案，明确但不小则 PRD 先行，有歧义才 grill 用户；实施获准后，若它是唯一 writer 则 Local，第二个起才创建 sibling worktree。
+<!-- project-harness:iteration-routing:end -->
 
 ## 文档地图与按需阅读
 
@@ -36,6 +45,8 @@
 |---|---|
 | 目标、范围、验收 | [`prd-{{NUMBER}}.md`](prd-{{NUMBER}}.md) |
 | 架构、实现、测试、迁移 | PRD + [`spec-{{NUMBER}}.md`](spec-{{NUMBER}}.md) |
+| 双基线、依赖、工作区和资源隔离 | PRD metadata + SPEC workspace/resource 契约 + 目标 activation/guard evidence |
+| candidate、集成和验收 | PRD/SPEC/deviation + exact candidate/integrated evidence + 目标 progress 事件 |
 | 风险、批准或实现前已知变化 | PRD + SPEC；变化先修订并重新批准基线 |
 | 实现后的事实偏差或验收阻塞 | [`deviation-{{NUMBER}}.md`](deviation-{{NUMBER}}.md) + 被引用条款 |
 | 长期取舍 | [`../../principle.md`](../../principle.md) + PRD |

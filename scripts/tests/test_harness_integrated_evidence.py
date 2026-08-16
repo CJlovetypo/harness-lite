@@ -109,6 +109,10 @@ class IntegratedEvidenceRegistryTests(unittest.TestCase):
                     "EV-I001-integration_verified-registry",
                     "refs/project-harness/v2/progress/registry-integration-verified",
                 ),
+                (
+                    "EV-" + "a" * 64,
+                    registry.iteration_final_evidence_ref("001"),
+                ),
             ),
         )
 
@@ -362,7 +366,7 @@ class IntegratedEvidenceRegistryTests(unittest.TestCase):
             self.assertEqual(self.helper.oid(reference), receipt.metadata.integrated_commit)
         self.assertEqual(
             self.helper.oid(registry.iteration_final_evidence_ref("001")),
-            receipt.evidence_blob,
+            recovered.final_acceptance_evidence_blob,
         )
 
         refs = coordinator._refs(self.root)

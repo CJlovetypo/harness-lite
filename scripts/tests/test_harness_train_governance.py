@@ -18,17 +18,17 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from harness_candidate import AcceptanceEvidence, CandidateInput, build_candidate  # noqa: E402
-from harness_governance import (  # noqa: E402
+from scripts.harness_candidate import AcceptanceEvidence, CandidateInput, build_candidate  # noqa: E402
+from scripts.harness_governance import (  # noqa: E402
     IterationRoutingState,
     PrincipleApproval,
     RootRoutingAuthority,
     parse_progress_events,
 )
-import harness_train  # noqa: E402
-import harness_progress  # noqa: E402
-import harness_train_governance as governance_adapter  # noqa: E402
-from harness_train import (  # noqa: E402
+from scripts import harness_train  # noqa: E402
+from scripts import harness_progress  # noqa: E402
+from scripts import harness_train_governance as governance_adapter  # noqa: E402
+from scripts.harness_train import (  # noqa: E402
     CandidateVerificationReceipt,
     ConfirmationToken,
     GovernanceContext,
@@ -42,7 +42,7 @@ from harness_train import (  # noqa: E402
     candidate_verification_receipt_digest,
     registered_candidate_digest,
 )
-from harness_train_governance import (  # noqa: E402
+from scripts.harness_train_governance import (  # noqa: E402
     DerivedReadme,
     GovernanceAdapterError,
     InjectedGovernanceCrash,
@@ -105,7 +105,16 @@ def root_readme(focus: str, row: str) -> bytes:
 
 
 def l1(number: str, result: str) -> bytes:
-    return OWNER + f"# Iteration {number}\n\n## Current result\n\n{result}\n".encode()
+    return (
+        OWNER
+        + f"# Iteration {number}\n\nmanual-shell-{number}\n\n".encode()
+        + governance_adapter.L1_START.encode("utf-8")
+        + b"\n## Current result\n\n"
+        + result.encode()
+        + b"\n"
+        + governance_adapter.L1_END.encode("utf-8")
+        + b"\n\nhandwritten-tail\n"
+    )
 
 
 class MergeTrainGovernanceAdapterTests(unittest.TestCase):
@@ -441,7 +450,33 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
             f"seal:{number}:{operation_id}".encode()
         ).hexdigest()
         authority_digest = hashlib.sha256(f"authority:{number}".encode()).hexdigest()
-        workspace_digest = hashlib.sha256(f"workspace:{number}".encode()).hexdigest()
+        workspace_guard = harness_train.WorkspaceGuardReceipt(
+            schema_version=harness_train.WORKSPACE_GUARD_SCHEMA,
+            iteration=number,
+            owner=f"owner-{number}",
+            generation=1,
+            operation_id=operation_id,
+            accepted_plan_digest=hashlib.sha256(
+                f"workspace-plan:{number}".encode()
+            ).hexdigest(),
+            worktree_path=str(self.root),
+            branch_ref=feature_ref,
+            base_commit=self.base,
+            implementation_ref="refs/heads/main",
+            implementation_commit=self.base,
+            reconciliation_ref="refs/heads/main",
+            reconciliation_commit=self.base,
+            dependency_refresh_generation=0,
+            dependency_bindings=(),
+            dependency_bindings_digest=dependency_bindings_digest,
+            lease_digest=hashlib.sha256(f"lease:{number}".encode()).hexdigest(),
+            guard_digest="0" * 64,
+        )
+        workspace_guard = replace(
+            workspace_guard,
+            guard_digest=harness_train.workspace_guard_digest(workspace_guard),
+        )
+        workspace_digest = workspace_guard.guard_digest
         seal_authorization_id = f"AUTH-CANDIDATE-{number}"
         metadata: dict[str, object] = {
             "schema_version": harness_train.CANDIDATE_EVIDENCE_METADATA_SCHEMA,
@@ -464,7 +499,9 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
                 candidate_progress.render(b"\n")
             ).hexdigest(),
             "authority_evidence_digest": authority_digest,
+            "workspace_guard": workspace_guard.as_dict(),
             "workspace_guard_digest": workspace_digest,
+            "implementation_commit": self.base,
             "principle_gate_binding": principle_binding.as_dict(),
             "depends_on": [],
             "dependency_bindings": [],
@@ -523,6 +560,7 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
             "pre_seal_tree": pre_seal_tree,
             "seal_commit": seal_commit,
             "seal_tree": seal_tree,
+            "implementation_commit": self.base,
             "candidate_evidence": candidate_evidence.as_dict(),
             "candidate_evidence_blob": evidence_blob,
             "candidate_evidence_metadata_digest": metadata["metadata_digest"],
@@ -536,6 +574,7 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
                 "evidence_digest": authority_digest,
                 "depends_on": [],
             },
+            "workspace_guard": workspace_guard.as_dict(),
         }
         journal_path.write_bytes(harness_train.canonical_json(journal) + b"\n")
         provisional = RegisteredCandidate(
@@ -554,9 +593,11 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
             candidate_tree=seal_tree,
             base_ref=base_ref,
             base_commit=self.base,
+            implementation_commit=self.base,
             principle_sha256=self.principle_sha256,
             principle_gate_binding=principle_binding,
             authority_evidence_digest=authority_digest,
+            workspace_guard=workspace_guard,
             workspace_guard_digest=workspace_digest,
             depends_on=(),
             dependency_bindings=(),
@@ -722,9 +763,15 @@ class MergeTrainGovernanceAdapterTests(unittest.TestCase):
         self.assertTrue(all(not item.materialized for item in status if item.conditional))
         rebuilt_l0 = (worktree / "harness/README.md").read_text(encoding="utf-8")
         self.assertIn("manual: must-survive", rebuilt_l0)
-        self.assertIn("Feature A", rebuilt_l0)
+        # Caller-supplied routing/L1 bytes are compatibility hints only.  The
+        # product view is rebuilt from exact committed PRD authority instead.
+        self.assertIn("Fixture", rebuilt_l0)
         self.assertNotIn("stale candidate", rebuilt_l0)
-        self.assertEqual((worktree / "harness/iterations/001/README.md").read_bytes(), l1("001", "authority rebuilt A"))
+        rebuilt_l1 = (worktree / "harness/iterations/001/README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("PRD \u72b6\u6001\uff1a`\u5b9e\u65bd\u4e2d`", rebuilt_l1)
+        self.assertNotIn("authority rebuilt A", rebuilt_l1)
         index_tree = self.git("write-tree", cwd=worktree).stdout.strip()
         self.assertEqual(receipt.result_tree, index_tree)
         self.assertEqual(governance_receipt_gate(receipt, context, actual_result_tree=index_tree), ())

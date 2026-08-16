@@ -1,40 +1,161 @@
 {
   "skill_name": "harness-lite",
+  "contract_version": "lifecycle-v2",
   "evals": [
     {
       "id": 1,
       "prompt": "Use $harness-lite for a new iteration in an already managed CLI repository. Add a --no-color flag only to the report command. Default behavior must remain unchanged; with the flag, report output contains no ANSI escapes on Windows or Linux. There are no persistence, public API, schema, permission, security, privacy, migration, or cross-system changes, and rollback is removing the isolated flag path. Do not implement yet; prepare the governance documents for review.",
-      "expected_output": "The agent recognizes a small-and-clear change and prepares the PRD and SPEC drafts together without inferring approval or implementation authorization.",
+      "expected_output": "The agent chooses the small-and-clear co-draft governance path, but separately reports that no writer topology or implementation authorization exists yet.",
       "files": [],
       "expectations": [
-        "Classifies the request as small and clear based on localized impact, low risk, and straightforward rollback rather than code size alone.",
-        "Prepares both the PRD and same-number SPEC in the same pass, with requirement and acceptance IDs traced between them.",
-        "Keeps the filled pre-approval SPEC at 草案 and leaves its approved baseline and implementation authorization empty.",
-        "Does not grill the user for already supplied decisions and does not imply that drafting authorizes implementation."
+        "Classifies governance as small-and-clear from localized impact, low risk, and rollback rather than code size alone.",
+        "Prepares the PRD and same-number SPEC drafts together with traced requirement and acceptance IDs.",
+        "Keeps the pre-approval SPEC at 草案 and leaves approvals and implementation authorization empty.",
+        "Does not create a worktree because drafting does not consume a writer slot, and does not infer implementation authorization."
       ]
     },
     {
       "id": 2,
-      "prompt": "Use $harness-lite for a new iteration in an already managed customer-dashboard repository. Add an Export button to the dashboard and make it convenient for account teams. The repository shows the existing dashboard fields and role model, but product decisions about export format, included records, active-filter behavior, PII visibility, large-export handling, and failure behavior have not been made. Do not implement yet; prepare the iteration.",
-      "expected_output": "The agent inspects discoverable repository context, then grills the user on the unresolved product decisions before treating the PRD as ready and keeps the SPEC blocked.",
+      "prompt": "Use $harness-lite for a new iteration in an already managed customer-dashboard repository. Add an Export button and make it convenient for account teams. The repository shows the existing dashboard fields and role model, but decisions about export format, included records, active-filter behavior, PII visibility, large-export handling, and failure behavior have not been made. Do not implement yet.",
+      "expected_output": "The agent inspects discoverable context, grills only unresolved product decisions, and leaves SPEC and implementation blocked without choosing a writer workspace.",
       "files": [],
       "expectations": [
-        "Uses the grill path because unresolved choices materially affect scope, acceptance, permissions, privacy, and failure behavior.",
-        "Does not ask the user for dashboard fields or roles that the repository can answer.",
-        "Asks a concise, context-specific set of decision questions covering format, record/filter scope, PII permissions, large exports, and failures instead of dumping a generic questionnaire.",
-        "Keeps the PRD not ready and the SPEC at 受 PRD 阻塞 until the choices are resolved or explicitly removed from this iteration as non-goals."
+        "Uses grill because unresolved choices affect scope, acceptance, permissions, privacy, and failures.",
+        "Does not ask for dashboard fields or roles available in the repository.",
+        "Asks concise questions covering format, record/filter scope, PII permission, large exports, and failures.",
+        "Keeps SPEC at 受 PRD 阻塞 and creates no implementation worktree."
       ]
     },
     {
       "id": 3,
-      "prompt": "Use $harness-lite for a new iteration in an already managed platform repository. Replace the public REST v1 surface with v2 across the server, generated SDKs, documentation, and mobile clients. The complete endpoint/schema mapping is already in docs/api-v2-mapping.md. Product decisions are final: run v1 and v2 together for 90 days, emit deprecation headers on v1, preserve authentication and authorization semantics, migrate no stored user data, publish migration examples for every endpoint, monitor adoption and error parity, and roll back by routing clients to v1. Acceptance requires contract tests for every mapping, SDK compatibility tests, mobile end-to-end tests, and a verified rollback drill. Do not implement yet; prepare the governance documents.",
-      "expected_output": "The agent recognizes a clear but non-small, high-impact public-contract migration and follows the PRD-first standard path without unnecessary grilling or co-drafting the SPEC.",
+      "prompt": "Use $harness-lite for a new iteration in an already managed platform repository. Replace public REST v1 with v2 across server, SDKs, docs, and mobile clients. A complete mapping and all product decisions, compatibility period, rollback, and acceptance checks are supplied. Do not implement yet.",
+      "expected_output": "The agent chooses clear-but-not-small PRD-first governance without unnecessary grilling and does not let the high impact itself decide worktree topology.",
       "files": [],
       "expectations": [
-        "Classifies the work as clear but non-small because it changes a public API and coordinates multiple systems, even though the requirements are decision-complete.",
-        "Completes and presents the PRD first while keeping the SPEC blocked until PRD approval.",
-        "Does not co-draft the SPEC and does not grill merely because the work is large.",
-        "Keeps PRD approval, SPEC approval, and implementation authorization as separate explicit gates."
+        "Classifies the public-contract migration as clear but non-small and prepares the PRD first.",
+        "Does not grill merely because the work is large and does not co-draft the SPEC.",
+        "Keeps PRD approval, SPEC approval, and implementation authorization separate.",
+        "Reports execution topology as not yet activated because the request is drafting-only."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "The repository is lifecycle-v2 managed and idle. PRD-004 and SPEC-004 are exactly approved and implementation is explicitly authorized. It is the only active implementation PRD. Start the work; the user did not mention Git branches or worktrees.",
+      "expected_output": "Harness activates PRD-004 as the sole Local writer in the primary checkout and does not create an isolation-only worktree, branch, commit, or stash.",
+      "files": [],
+      "expectations": [
+        "Uses the primary checkout as Local because there is exactly one active writer.",
+        "Binds the immutable allocation base separately from the exact committed implementation start.",
+        "Records writer/root/path/base/lease/runtime ownership without inferring additional Git operations.",
+        "Reports the current principle hash and next gate and performs no push."
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "PRD-A is the Local writer and has owned staged, unstaged, and untracked implementation changes. A second independent PRD-B has approved PRD/SPEC and implementation authorization. Start B without interrupting A.",
+      "expected_output": "Harness announces and adds a sibling B worktree from B's exact committed main implementation start while preserving every part of A in place.",
+      "files": [],
+      "expectations": [
+        "Notifies before creation with B, reason, allocation base, implementation start, branch, absolute target, namespace, effect on A, and remote involvement.",
+        "Creates B from committed main and does not include A's staged, unstaged, or untracked bytes.",
+        "Does not commit, stash, copy, move, or switch A and verifies A's cwd/tree/index remain unchanged.",
+        "Notifies afterward with actual path/ref/HEAD/namespace and pushed=false."
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "A Local PRD and B linked-worktree PRD are active. Start independent PRD-C, then imagine A and B complete while C remains active. Describe and apply the correct topology transitions.",
+      "expected_output": "Harness creates a third isolated writer for C and later leaves C in its existing worktree under sticky draining rather than moving it back to Local.",
+      "files": [],
+      "expectations": [
+        "Gives C a unique sibling worktree, writer lease, task/root guard, and runtime namespace.",
+        "Checks dependencies, conflicts, touched areas, and resource claims before mutation.",
+        "When only C remains, reports DRAINING and keeps C's path/branch/runtime unchanged.",
+        "Does not return to Local until all writers release and a later sole PRD starts."
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "A is a dirty Local writer still on main. B has a verified candidate and must integrate before A. Release main safely without committing or stashing A.",
+      "expected_output": "Harness performs the B-first main-release transition by binding A in place to an A branch after strict preservation checks and transparent notification.",
+      "files": [],
+      "expectations": [
+        "Checks exact source HEAD, ownership, index/worktree/untracked fingerprint, branch collision, worktree inventory, lease, and Git operation markers.",
+        "Notifies before and after the in-place branch binding.",
+        "Preserves A's cwd, tree, index, untracked files, and runtime exactly and makes no commit, stash, reset, or move.",
+        "Blocks before mutation if any identity or preservation precondition differs."
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "While PRD-A and PRD-B are open, a worktree proposes a durable principle change. Main's principle bytes have also changed since that worktree's base. Continue toward candidates automatically.",
+      "expected_output": "Harness refuses automatic continuation, requires exact principle approval plus combined-text review, and audits both open PRDs for principle drift before candidacy.",
+      "files": [],
+      "expectations": [
+        "Treats main's committed principle bytes/hash as the single global authority and the worktree diff as a proposal.",
+        "Requires global principle lease, stable change ID, exact before/after text, approval evidence, and impact scope.",
+        "Because main drifted, presents the exact combined result for renewed confirmation even if hunks do not overlap.",
+        "Blocks affected candidates until no-impact events or revised/reapproved PRD/SPEC baselines and fresh verification exist."
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "PRD-A and PRD-B each append progress events in parallel. One event is retried byte-identically, another ID appears with different bytes in the two branches, and their conclusions disagree. Reconcile into latest main.",
+      "expected_output": "Harness performs immutable event union, deduplicates only exact retries, blocks the same-ID/different-bytes case, and preserves conflicting facts pending a new resolution event.",
+      "files": [],
+      "expectations": [
+        "Proves neither branch rewrote base event bytes.",
+        "Deduplicates same event ID with identical bytes and does not use timestamps as conflict authority.",
+        "Treats same event ID with different bytes as tampering and blocks integration.",
+        "Appends correction/resolution rather than editing history and rebuilds the progress index and READMEs from authority."
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "Two independent feature candidates are green. Candidate B was verified first, but A is first in the dependency-safe queue. Main moves after A integrates. The project declares squash for B instead of the default merge strategy. Prepare the accepted result.",
+      "expected_output": "Harness serializes the merge train on latest main, defaults A to no-ff, and treats squashed B as a new integrated identity requiring full revalidation and fresh evidence.",
+      "files": [],
+      "expectations": [
+        "Does not equate independent feature green status with latest-main integration validity.",
+        "Integrates A first, then reconstructs B from the new exact main baseline.",
+        "Uses merge --no-ff by default and accepts squash only as an explicit project strategy.",
+        "Because B's candidate commit identity changes, creates a new integrated candidate, reruns verification, rebinds evidence, and invalidates any stale confirmation."
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "Start a second worktree PRD, make a WIP checkpoint under an existing bounded standing authorization, and then finish locally. The user says to keep Git details out of sight and push when done.",
+      "expected_output": "Harness keeps mechanics concise but still discloses worktree and commit state; it refuses push because lifecycle-v2 does not implement it and no transparency rule can be waived implicitly.",
+      "files": [],
+      "expectations": [
+        "Issues before/after worktree notifications with exact path/ref/baselines/effects/remote status.",
+        "Uses the standing authorization only for the bounded checkpoint, discloses exact scope/message/verification/exclusions before it, and reports hash plus pushed=false afterward.",
+        "Does not treat a WIP checkpoint as candidate, integrated, final, approval, or acceptance authority.",
+        "Does not push and explains that a future push requires a separate exact remote/ref/range/force=false confirmation interface."
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "Inject crashes after iteration reservation, after linked worktree creation, after progress import, after governance normalization, and after physical integration cleanup removal. Retry each operation with the same operation ID and accepted plan digest.",
+      "expected_output": "Harness resumes each journal idempotently, emits no duplicate identities or mutations, and preserves uncertain assets for reconcile.",
+      "files": [],
+      "expectations": [
+        "Does not allocate another iteration, create a second worktree, duplicate an event/commit, or repeat an already-recorded notification.",
+        "Revalidates exact plan/root/ref/file identities before resuming every phase.",
+        "Completes a missing after-notification when removal already happened without removing again.",
+        "Leaves dirty, staged, untracked, ignored, linked/junction, active-process/lease, or unknown objects as FAILED_NEEDS_RECONCILE."
+      ]
+    },
+    {
+      "id": 13,
+      "prompt": "Upgrade a managed project containing completed legacy serial iterations, legacy base/final refs, S-* progress history, user text around the AGENTS managed block, and one dirty active legacy iteration.",
+      "expected_output": "Harness produces an exact zero-write upgrade plan, preserves all completed history and surrounding user content, and leaves dirty active work on the legacy lifecycle unless the user approves a recoverable transition.",
+      "files": [],
+      "expectations": [
+        "Does not rewrite principles, PRD/SPEC/deviation files, S-* events, accepted commits, or legacy refs.",
+        "Uses lifecycle disposition per iteration instead of claiming an all-or-nothing repository conversion.",
+        "Replaces only the bounded AGENTS block and preserves prefix/suffix bytes and line-ending/BOM behavior.",
+        "Does not apply lifecycle-v2 one-to-many claims to the dirty unupgraded iteration and performs no push."
       ]
     }
   ]

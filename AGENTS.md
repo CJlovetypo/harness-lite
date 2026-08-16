@@ -3,55 +3,68 @@
 <!-- project-harness:start v1 -->
 ## Harness Lite governance
 
-Treat `harness/` as the only editable source of project-governance truth.
+Treat `harness/` as the only editable source of normative project-governance truth. Main's committed `harness/principle.md` is the single global principle authority; `progress.md` is immutable historical evidence; L0/L1 READMEs are derived routing; deviation records completed as-built facts and never grants approval or an exception.
 
-Before authorized project writes:
+Before authorized writes:
 
-1. Read `harness/README.md` (L0) and select the relevant iteration.
-2. Read that iteration's `README.md` (L1). For writable product/governance work, also read `harness/principle.md`.
-3. Read by intent: scope/acceptance -> PRD; design/implementation/test/migration or a known change -> PRD + SPEC; a completed as-built difference -> deviation + cited clauses; decision history -> targeted events in `harness/progress.md`.
-4. Classify the request as a new iteration, continuation of an approved iteration, or read-only work. Read-only work does not create governance logs.
-5. Preserve user changes and check the existing diff before editing when Git is present.
+1. Read L0 `harness/README.md`, the relevant L1, committed main principles, and then only the PRD/SPEC/deviation/events needed by task intent.
+2. Inspect Git root/status/worktrees/refs, active operation journals/leases, dirty/staged/untracked/ignored state, dependency candidates, and resource claims. Preserve user changes.
+3. Route independently on three axes:
+   - governance: grill the user on decision-bearing ambiguity; co-draft only small-and-clear work; otherwise PRD-first;
+   - topology: read-only/drafting, Local sole writer, sibling worktree for writer 2+, stacked stable dependency, or serialize conflicting resources/principles;
+   - authority: PRD approval, SPEC approval, implementation authorization, principle impact audit, integrated-result acceptance, and final closure are separate gates.
+4. Report reason codes, current principle identity/drift, topology, blockers, and next gate. Classification or notification never implies approval.
 
-Authority and divergence:
+Small-and-clear means decision-complete, localized, low risk, readily reversible, and without material cross-system coordination. For clear but non-small work, use PRD-first without grilling merely because it is large. Co-drafting changes timing only: never treat approval as implementation authorization.
 
-- Baseline authority is approved principles > approved PRD > approved SPEC.
-- A deviation records a factual difference between completed as-built work and the approved PRD/SPEC. It is never a baseline, approval source, or implementation authorization.
-- `harness/progress.md` is historical evidence. Root and iteration READMEs are derived routing, not approval sources.
-- Revise and reapprove the affected PRD/SPEC when a change is known before implementation. After implementation, record every material difference and obtain an explicit disposition before acceptance.
+Identity and lifecycle-v2:
 
-Requirement discovery gate:
+- Allocate monotonic iteration/event identities only through the coordinator; create every iteration's README/PRD/SPEC/deviation bundle together. A new task alone is not a new iteration.
+- Bind an immutable allocation base and a separate exact implementation start. The implementation start must descend from the allocation base and may include the committed approved-governance bundle. Editable PRD text cannot repoint either identity.
+- `0 → 1`: the only active implementation PRD uses the primary checkout as Local; do not create an isolation-only worktree/branch/commit/stash.
+- `1 → 2+`: add each later writer as a sibling linked worktree from its exact allowed committed start. Do not commit, stash, copy, move, or change the first Local PRD's cwd/files/index/runtime.
+- `N → 1`: sticky drain; survivors stay in place. Return to Local only after all writers release and a later single PRD starts.
+- If another PRD must advance main first, bind dirty Local A in place to its own branch only after exact ownership/Git preflight and before/after notification; preserve tree, index, cwd, and runtime and make no commit/stash.
+- Every mutation validates repository, absolute path, iteration, owner/task, branch, allocation base, implementation start, lease generation, and operation before writing. Worktrees are not security sandboxes; namespace and claim ports, databases/schema, caches, logs, containers, accounts, and external environments.
 
-- Inspect available project context before asking the user. Resolve clarity first, then assess size by product blast radius and risk rather than lines of code.
-- If a decision-bearing ambiguity remains, grill the user before treating the PRD as ready. Ask pointed, context-specific questions and challenge assumptions about the problem/users, scope/non-goals, acceptance/failure cases, constraints, compatibility/data/security/migration concerns, and meaningful trade-offs. Do not ask what the repository can answer. Resolve each ambiguity or have the user explicitly remove it from this iteration as a non-goal with its impact and next gate recorded; anything still affecting in-scope acceptance remains blocking, and the SPEC stays `受 PRD 阻塞`.
-- Small-and-clear additionally requires localized impact, low risk, straightforward rollback, and no material cross-system coordination. Public API/schema changes, data migration, permissions, security/privacy/compliance, irreversible behavior, and substantial compatibility impact are normally not small. Only this class is eligible for co-drafting; prefer completing and presenting both drafts together unless staged review has a concrete benefit. A filled pre-approval SPEC is `草案`, has no approved baseline, SPEC approval evidence, or implementation authorization, and traces the proposed PRD IDs.
-- For clear but non-small work, use the standard PRD-first path without grilling merely because the work is large. Co-drafting changes timing, not authority: do not turn guesses into requirements, put implementation details in the PRD, infer approval, or treat approval as implementation authorization.
+Authority and reconciliation:
 
-Iteration rules:
+- Baseline authority is approved principles > approved PRD > approved SPEC. Do not implement without exact PRD approval, SPEC approval, and separate implementation authorization.
+- A principle change needs the global lease, exact before/after text, stable change identity, explicit approval, and impact audit of all open PRDs. Hash drift blocks candidacy/integration until no-impact evidence or revised/reapproved baselines and revalidation exist.
+- New progress events use globally unique event IDs separate from session IDs. Preserve legacy `S-*` blocks. Union by identity and exact bytes: same/same is idempotent, same/different blocks; append correction/resolution events instead of rewriting history.
+- Rebuild README managed blocks and progress indexes from principles, bundles, events, refs, and bounded operational facts. Never use ours/theirs to make derived copies authoritative; preserve user-authored regions outside managed markers.
+- Only the coordinating agent mutates shared principles/progress/routing or allocates IDs. Subagents return scoped evidence.
 
-- Store each iteration at `harness/iterations/NNN/` with exactly `README.md`, `prd-NNN.md`, `spec-NNN.md`, and `deviation-NNN.md`.
-- Use a monotonic ID padded to at least three digits. Repair incomplete existing bundles before allocating `max + 1`; never reuse gaps or retired IDs.
-- Create a new iteration only for a new goal, scope, user-visible behavior, public contract, workflow, or acceptance target. A new chat alone is not a new iteration.
-- Keep implementation details out of PRD. Do not let SPEC add product scope absent from PRD.
-- Do not implement before explicit PRD approval, explicit SPEC approval, and separate implementation authorization. A single user response may supply all three, but generic approval of the drafts does not authorize implementation.
+Candidate, integration, and acceptance:
 
-Evidence and synchronization:
+- A feature candidate requires exact authority, current principle/impact audit, writer guard, AC verification, disposed material deviations, owned included paths/exclusions, and stable dependency identities. Persist evidence bound to exact ref/commit/tree, baselines, generation, principle hash, and receipt digests.
+- Integrate one candidate at a time from exact latest main: revalidate dependencies, reconcile principles/progress, merge implementation and bundle, rebuild derived views, run cross-PRD/full verification, and persist the exact integrated identity.
+- Implementation conflicts return to the owning PRD worktree. The integration lane may only apply deterministic, journaled governance normalization.
+- Default to `merge --no-ff`. If any allowed strategy changes candidate commit identity, create a new integrated candidate, rerun verification, and bind fresh evidence.
+- Advance main/final refs only after explicit confirmation of the exact latest-main integrated result; that confirmation may be final acceptance. Any main/tree/candidate/principle/evidence change invalidates it. Never auto-reset or rewrite accepted history.
 
-- Use progress events `OPEN`, `DECISION`, `CHECKPOINT`, `MERGE`, and `CLOSE` with IDs `S-YYYYMMDD-NN`; append corrections rather than rewriting historical events.
-- Record completed as-built differences as `DEV-NNN-SSS` in the owning iteration. Preserve resolved/closed entries and link cross-iteration transfers instead of copying them.
-- Update L1 when status, decisions, evidence, deviations, results, or next steps change. Update L0 only when global routing, focus, registry, or open-deviation facts change.
-- Only the coordinating agent allocates IDs or updates shared progress, deviation, and routing files; subagents report results to it.
+Git transparency and recovery:
 
-Completion and Git boundary:
+- Silent: reads, routing, validation, previews, evidence collection, and matching authorized replay.
+- Notify before and after: worktree create/remove, safe branch create, Local in-place binding, candidate queue changes, and manifest-owned local runtime lifecycle. Include PRD, reason, both baselines, branch, absolute path, namespace, effects on other PRDs, remote involvement, and actual result.
+- Confirm exact scope before approvals, commits, main advance/merge, risky cleanup, lease takeover, external/shared mutations, and final acceptance. A bounded standing authorization may cover WIP checkpoints, but each remains transparent and is recovery-only.
+- Before every commit show exact branch, paths/tree, message, verification/evidence, exclusions, and `pushed=false`; afterward report hash, actual HEAD, and still-unpushed state.
+- Push is not implemented in lifecycle-v2. Never push or imply push. A future push must be separate and explicitly confirmed with remote, source/target refs, exact range, and `force=false`.
+- Never auto-stash/reset/clean/force, force-delete a dirty worktree, or use TTL alone for lease takeover.
+- Every mutation uses an operation ID, exact accepted plan digest, journal, locks/leases, and ref/file CAS. Matching retries resume without duplicate IDs/events/worktrees/commits/notifications; drift stops for reconcile.
+- Cleanup is last. Preserve objects with active claims, Git markers, staged/dirty/untracked/ignored assets, path links/junctions, or manifest uncertainty as `FAILED_NEEDS_RECONCILE`.
 
-- Move work to `待验收` only when every acceptance ID has evidence, every material as-built difference is recorded and explicitly disposed, progress is closed, and summaries are current. Unresolved differences keep the iteration blocked. Only explicit user acceptance sets `已验收`.
-- Do not initialize nested Git or edit `.gitignore`. If the target has no Git repository, Harness bootstrap may initialize Git and create exactly one initial baseline commit only from the exact `BASELINE_PLAN_TOKEN` returned by a reviewed dry run; if Git already exists, initialization makes no commit.
-- Keep Git `HEAD` on the independently anchored PRD branch/baseline throughout the iteration. Work serially: finalize the current iteration before allocating another. Give each iteration exactly one final commit, and only after explicit user acceptance of the completed result; implementation approval is not acceptance, and any intermediate commit blocks automated finalization. Explicitly scope every dirty shared control file, run required checks before the deterministic no-hook finalizer, and preserve its base/final refs under `refs/project-harness/iterations/NNN/`. Do not push, create a PR, rewrite history, or perform destructive Git operations without separate authorization.
+Compatibility and completion:
+
+- Do not initialize nested Git or edit `.gitignore`. A no-Git bootstrap may create `main` and one exact reviewed baseline commit only from its matching `BASELINE_PLAN_TOKEN`; initialization of an existing repository creates no commit and absorbs no existing changes.
+- Preserve completed legacy serial iterations, principle/history bytes, deviation entries, and legacy refs. Upgrade only from an exact dry run and replace only this bounded block; dirty active legacy work remains legacy unless an explicitly approved recoverable transition exists.
+- Legacy one-active-iteration/one-final-commit rules apply only to unupgraded legacy iterations, not lifecycle-v2 work.
+- Move to candidate/integrated/accepted/closed only with the corresponding exact evidence. Validate structure, authority, leases, baselines, reconciliation, evidence, project checks, and recovery state; never claim acceptance, integration, cleanup, or remote state that is not proven.
 
 PRD-001 lifecycle-v2 bootstrap transition:
 
 - The user explicitly approved OQ-001-01 and OQ-001-06: preserve the pre-existing drafting-path changes and the approved PRD-001 governance baseline as two local checkpoint commits before new implementation. These checkpoints are recovery points only; they are not candidate, integrated, final, or acceptance authority, and they must not be pushed.
 - Preserve the legacy PRD-001 base anchor at `7376803cffb09269bc8a03346901b2e9e224d704`. Do not amend, squash, repoint, or hide the transition history, and do not use the legacy `commit-iteration` finalizer for PRD-001.
-- Checkpoint 1 is `6cc0104075b5394a3ed6c6933b59817832503aeb` and contains only the pre-PRD drafting-path work. Checkpoint 2 is `2d1be71c835ea5bc7ff784f09282af1837ffce41`; the v2 identity/reservation checkpoint is `ca8223bbe9d214b8c05d294b70d852e3dc57ddec`. On 2026-08-12 the user authorized the coordinator to create later non-final WIP checkpoints autonomously after exact-scope and verification review. Report each resulting hash, scope, and `pushed=false`; this standing authorization does not cover push, main integration, history rewrite, destructive Git, candidate/final authority, or final acceptance.
-- The v2 journal/lease requirements govern Harness orchestration mutations once their implementation slice is available and validated. Until then, PRD-001 source implementation remains single-writer Local work under exact checkpoint manifests; this narrow bootstrap allowance does not authorize worktree creation, main integration, remote writes, destructive Git operations, or bypassing product gates.
+- Approved local recovery checkpoints are `6cc0104075b5394a3ed6c6933b59817832503aeb`, `2d1be71c835ea5bc7ff784f09282af1837ffce41`, `ca8223bbe9d214b8c05d294b70d852e3dc57ddec`, `721c2913e0f21f7102b7825e85b49e94d9bf6552`, `91c92a491427483e5d2c0624b4fa7183e5df568a`, and `5dcec6947c3e25c45647f01871c75e5c25b97f17`. On 2026-08-12 the user authorized the coordinator to create later non-final WIP checkpoints autonomously after exact-scope and verification review. Report each resulting hash, scope, and `pushed=false`; this standing authorization does not cover push, main integration, history rewrite, destructive Git, candidate/final authority, or final acceptance.
+- The v2 journal/lease requirements govern Harness orchestration mutations once their implementation slice is available and validated. Until the complete lifecycle is accepted, PRD-001 source implementation remains single-writer Local work under exact checkpoint manifests; this narrow bootstrap allowance does not authorize actual worktree creation in this repository, main integration, remote writes, destructive Git operations, or bypassing product gates.
 <!-- project-harness:end -->

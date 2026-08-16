@@ -537,6 +537,7 @@ def plan_reconciliation(
     branch_candidate: GovernanceSnapshot,
     principle_approval: PrincipleApproval | None = None,
     principle_lease: GlobalPrincipleLease | None = None,
+    progress_allow_divergent_main_history: bool = False,
 ) -> GovernanceReconcilePlan:
     """Bind semantic previews from three explicit immutable file snapshots."""
 
@@ -620,9 +621,11 @@ def plan_reconciliation(
             branch_base=base_files[PROGRESS_PATH],
             latest_main=main_files[PROGRESS_PATH],
             branch_candidate=candidate_files[PROGRESS_PATH],
+            allow_divergent_main_history=progress_allow_divergent_main_history,
         )
         blockers.extend(_semantic_blockers(progress.blockers))
         progress_details = {
+            "allow_divergent_main_history": progress_allow_divergent_main_history,
             "base_sha256": progress.base_sha256,
             "latest_main_sha256": progress.latest_main_sha256,
             "candidate_sha256": progress.candidate_sha256,

@@ -617,6 +617,24 @@ class HarnessTrainTests(unittest.TestCase):
         self.assertEqual(int(self.git("rev-list", "--all", "--count").stdout.strip()), int(before) + 1)
         self.assertTrue(candidate.verification_receipts)
         self.assertTrue(all(item.exit_code == 0 for item in candidate.verification_receipts))
+        self.assertEqual(candidate.base_commit, self.base)
+        self.assertEqual(
+            candidate.implementation_commit,
+            candidate.workspace_guard.implementation_commit,
+        )
+        expected_included_paths = tuple(
+            line
+            for line in self.git(
+                "diff",
+                "--name-only",
+                candidate.implementation_commit,
+                candidate.candidate_commit,
+                "--",
+            ).stdout.splitlines()
+            if line
+        )
+        self.assertEqual(candidate.candidate_evidence.included_paths, expected_included_paths)
+        self.assertNotIn("harness/iterations/002/README.md", expected_included_paths)
         event = self.git("show", f"{candidate.candidate_commit}:harness/progress.md").stdout
         self.assertIn(candidate.candidate_ref, event)
         self.assertIn(candidate.candidate_evidence_ref, event)
@@ -630,6 +648,7 @@ class HarnessTrainTests(unittest.TestCase):
         self.assertEqual(blockers, ())
         assert loaded is not None
         self.assertEqual(loaded.registration_digest, candidate.registration_digest)
+        self.assertEqual(loaded.workspace_guard, candidate.workspace_guard)
         self.assertFalse(candidate.pushed)
 
     def test_candidate_principle_binding_records_exact_no_drift_identity(self) -> None:

@@ -2,186 +2,349 @@
 
 ## Contents
 
-1. Purpose and boundary
-2. Document model and authority
-3. Progressive disclosure
-4. Iteration identity and lifecycle
-5. Document contracts
-6. Update matrix
-7. Completion and validation
-8. What not to generalize
+1. Purpose and authority
+2. Document and state model
+3. Identity, refs, and dual baselines
+4. Three-axis routing and lifecycle
+5. Workspace and runtime isolation
+6. Document contracts
+7. Principle, progress, and derived-view reconciliation
+8. Candidate, integration, and acceptance evidence
+9. Interaction and Git transparency
+10. Journals, concurrency, recovery, and cleanup
+11. Legacy compatibility and upgrade
+12. Completion, validation, and update matrix
 
-## 1. Purpose and boundary
+## 1. Purpose and authority
 
-Use the Harness to preserve the chain from intent to evidence:
+Harness Lite preserves this chain for every product iteration, whether it runs in the primary checkout or a linked worktree:
 
 ```text
-durable principles
-  -> product promise (PRD)
-  -> approved implementation baseline (SPEC)
-  -> implementation and verification
-  -> as-built comparison and deviation disposition
-  -> acceptance and historical evidence
+committed global principles
+  -> approved PRD
+  -> approved SPEC
+  -> explicitly authorized implementation
+  -> feature candidate + verification evidence
+  -> latest-main integrated candidate + re-verification
+  -> exact-result acceptance
+  -> main/final identity + historical evidence
 ```
 
-The Harness governs project work; it is not a second implementation, issue tracker, chat archive, or generated-artifact store. Keep it small enough that the root router can answer “what is active and what should I read next?” without loading the full project history.
+Parallel work changes execution topology only. It never weakens the vertical `PRD → SPEC → implementation → acceptance evidence` chain.
 
-## 2. Document model and authority
+Authority order is:
 
-Use this structure:
+1. main's explicitly approved, committed `harness/principle.md`;
+2. the exact approved same-number PRD baseline;
+3. the exact approved same-number SPEC baseline;
+4. separately recorded implementation authorization;
+5. factual candidate/integrated verification evidence;
+6. explicit acceptance of an exact integrated result.
+
+`deviation-NNN.md` describes completed as-built differences. `progress.md` preserves history. READMEs route readers. None of those can approve scope, authorize implementation, or override a principle.
+
+When authorities conflict, stop only the affected scope. Do not silently union principles, expand/shrink a PRD, let a SPEC add product scope, or treat merge order as a decision. A known pre-implementation change returns to the affected PRD/SPEC approval gate. A completed factual difference enters the deviation ledger and needs an explicit disposition before acceptance.
+
+## 2. Document and state model
+
+Normative, Git-backed governance remains:
 
 ```text
 <project-root>/
 ├── AGENTS.md
 └── harness/
-    ├── README.md
-    ├── principle.md
-    ├── progress.md
+    ├── README.md                 # L0 derived router
+    ├── principle.md              # one global normative authority
+    ├── progress.md               # immutable event history + derived index
     └── iterations/
         └── NNN/
-            ├── README.md
+            ├── README.md         # L1 derived router
             ├── prd-NNN.md
             ├── spec-NNN.md
             └── deviation-NNN.md
 ```
 
-Assign authority and document roles as follows:
+Operational state belongs under the repository's Git common directory and is not committed as normative governance. It includes operation journals, locks/leases, worktree absolute paths, owner/task identities, runtime namespaces, queue state, and notification receipts. It must be reconstructible from Git refs, worktree inventory, governance bundles, and journals; it is never the sole product authority.
 
-1. `principle.md`: explicitly approved, durable project/product trade-offs.
-2. Approved `prd-NNN.md`: what outcome, scope, and acceptance promise the iteration makes.
-3. Approved `spec-NNN.md`: how the approved PRD will be implemented and verified.
-4. `deviation-NNN.md`: factual evidence of completed implementation that differs from the approved PRD/SPEC; never a baseline, approval source, or implementation authorization.
-5. `progress.md`: append-only decisions, actions, evidence, and next steps; historical, not normative.
-6. Root and iteration READMEs: derived routing and status summaries; never approval sources.
-
-When documents conflict, stop within the conflicting scope. Do not silently expand or shrink product intent. Revise and reapprove the affected PRD/SPEC when a change is known before implementation. After implementation, register every material as-built difference and obtain an explicit disposition before acceptance.
-
-## 3. Progressive disclosure
-
-Use four reading levels:
+Use progressive disclosure:
 
 | Level | Source | Read when |
 |---|---|---|
-| L0 | `harness/README.md` | Always first; locate active/relevant iterations and next reading step |
-| L1 | `iterations/NNN/README.md` | The user names an iteration or L0 routes the task there |
-| L2 | PRD, SPEC, deviation | Select by task intent |
-| L3 | Target events in `progress.md` | Approval evidence, decision reconstruction, conflict repair, audit, or merge |
+| L0 | `harness/README.md` | Always first; find relevant iterations, topology, drift, and next gate |
+| L1 | `iterations/NNN/README.md` | The request names or routes to the iteration |
+| L2 | PRD/SPEC/deviation/principle | Select by intent and authority gate |
+| L3 | Target `progress.md` events and evidence receipts | Approval reconstruction, conflict resolution, integration, recovery, or audit |
 
-Select L2 documents by intent:
+Do not load the entire history by default. Use iteration, event, operation, candidate, or evidence identity to select the necessary records.
 
-- Scope, goals, acceptance, or whether work is new: read the PRD.
-- Design, implementation, testing, migration, or code review: read PRD + SPEC.
-- Risk or a known pre-implementation change: read and revise the affected PRD/SPEC.
-- An as-built difference or acceptance blockage after implementation: read the deviation ledger and the cited PRD/SPEC clauses.
-- Long-term trade-off: read principles + the relevant PRD.
-- Status-only question: stop at L0/L1 when sufficient.
+## 3. Identity, refs, and dual baselines
 
-Do not load the whole append-only history by default. Use the session/event ID, iteration ID, or date supplied by L0/L1 to find the needed event block.
+### 3.1 Iteration identity
 
-## 4. Iteration identity and lifecycle
+Use decimal IDs padded to at least three digits. IDs are governance identities, not release numbers, branch names, task IDs, or phases. Allocate atomically with a global coordinator and compare-and-swap; never independently scan `max + 1` in multiple worktrees. Never reuse an abandoned, cancelled, completed, or partially allocated ID.
 
-Use decimal IDs padded to at least three digits: `001`, `002`, and so on. Treat them as governance identities, independent of release versions, sprint numbers, branch names, ticket IDs, or implementation phases.
+Create the four-file bundle together. Repair an incomplete reservation/bundle through its operation journal; do not allocate around it.
 
-Before allocating an ID:
+### 3.2 Lifecycle-v2 refs
 
-1. Scan all iteration directories and any legacy numbered PRD/SPEC documents being adopted.
-2. Repair an incomplete existing bundle before allocating another number.
-3. Allocate `max(existing IDs) + 1`.
-4. Never reuse cancelled, superseded, abandoned, or empty IDs.
-5. Create README, PRD, SPEC, and deviation together, even when there are no deviations.
+Lifecycle-v2 uses an independent namespace:
 
-Record the current full Git `HEAD` and attached `refs/heads/...` branch in the PRD when the bundle is created, and anchor both independently at `refs/project-harness/iterations/NNN/base/refs/heads/...`. The anchor, not editable PRD text, is the immutable authority. That commit must remain `HEAD` on the same branch until explicit acceptance; any intervening commit or branch switch breaks the one-final-commit invariant and blocks automated finalization. This lifecycle is serial: an existing iteration must have a reachable final marker and clean governance before another number is allocated.
+```text
+refs/project-harness/v2/allocations/NNN
+refs/project-harness/v2/iterations/NNN/base
+refs/project-harness/v2/iterations/NNN/candidates/GGG
+refs/project-harness/v2/iterations/NNN/integrated
+refs/project-harness/v2/iterations/NNN/final
+```
 
-Create a new iteration for a new product goal, scope, user-visible behavior, public contract, workflow, or acceptance target. Continue the current iteration for approved implementation, a defect within approved scope, verification, or documentation repair. A new chat alone creates neither a session record nor an iteration unless work is authorized.
+- The allocation ref points to immutable allocation metadata; the base ref points to the immutable allocation commit.
+- Candidate content changes create a new generation; never overwrite evidence already referenced by another iteration or integration.
+- Integrated and final refs bind exact evidence-bearing identities and move only through compare-and-swap with the corresponding main update.
+- Custom refs are local evidence unless a separate transport policy exists. Ordinary push/clone must not be described as synchronizing them.
 
-Before making a PRD ready for approval, inspect the relevant project context, resolve clarity first, and then choose one drafting path:
+Legacy refs under `refs/project-harness/iterations/NNN/...` remain read-only compatible. Do not rewrite them or create v2 direct refs under a namespace that conflicts with legacy nested `base/refs/heads/...` paths.
 
-1. **Grill path**: use whenever a decision-bearing ambiguity remains, regardless of apparent size. Inspect the repository first, then ask pointed, context-specific questions and challenge assumptions that affect the problem/users, scope/non-goals, acceptance/failure cases, constraints, compatibility/data/security/migration concerns, or meaningful trade-offs. Do not ask questions that local evidence can answer. Do not treat the PRD as ready until every material ambiguity is resolved or the user explicitly removes it from the iteration as a non-goal with its impact and next gate recorded. Anything still affecting in-scope acceptance remains blocking; keep the SPEC `受 PRD 阻塞` until then.
-2. **Small-and-clear fast path**: use only after clarity is established and the change has localized product impact, low risk, straightforward rollback, no material cross-system coordination, and no unresolved product or architecture choice. Judge size by impact rather than code volume. Public API/schema changes, data migration, permissions, security/privacy/compliance, irreversible behavior, and substantial compatibility impact are normally not small. The PRD and SPEC may be completed as drafts in the same pass and presented together. Mark the filled pre-approval SPEC `草案`, trace the proposed PRD IDs, and leave its approved baseline, SPEC approval evidence, and implementation authorization empty.
-3. **Clear-but-not-small standard path**: when the product baseline is decision-complete but the change is not small, complete and approve the PRD before completing and approving the SPEC. Size alone is not a reason to grill the user.
+### 3.3 Dual baselines
 
-Co-drafting changes timing, not authority. A draft SPEC based on a draft PRD is a review aid, not an approved baseline or implementation authorization. PRD authority still precedes SPEC authority, implementation details remain outside the PRD, and explicit approval is still required for the identified baselines. Implementation authorization is a separate explicit decision; it may accompany approval but is never inferred from it.
+Lifecycle-v2 separates two identities that serial Harness treated as one:
 
-Use these PRD statuses:
+| Identity | Meaning | Rule |
+|---|---|---|
+| Allocation base | The committed product/allocation snapshot at ID reservation | Immutable; anchored by the v2 base ref and allocation metadata |
+| Implementation start | The exact committed snapshot from which the writer/worktree starts | Must descend from allocation base; may include the approved PRD/SPEC governance commit |
 
-`草案`, `待批准`, `已批准`, `实施中`, `待验收`, `已验收`, `已取代`, `已取消`.
+The PRD exposes both fields for humans, but refs, allocation metadata, activation journal, and guard receipt are authoritative. Editing PRD text cannot repoint either identity.
 
-Use these SPEC statuses:
+For an independent PRD, implementation starts from an exact committed main snapshot. For stacked work, the allowed start is an explicitly declared stable dependency candidate. It must never be inferred from the caller's dirty cwd.
 
-`受 PRD 阻塞`, `草案`, `待批准`, `已批准`, `实施中`, `已完成`, `已取代`, `已取消`.
+Allocation metadata also binds the committed governance tree and `principle_base_hash`. A principle hash mismatch is drift, not a cosmetic metadata difference.
 
-Use `受 PRD 阻塞` while material product ambiguity prevents a decision-complete PRD. Use `草案` when a small-and-clear request has a filled SPEC co-drafted against the proposed same-number PRD but no approved PRD baseline yet.
+## 4. Three-axis routing and lifecycle
 
-Use these deviation statuses:
+Every request produces one decision record with three independent axes. No axis grants approval to another.
 
-`开放`, `待处置`, `已修复`, `基线已重批`, `已接受残余`, `已转后续迭代`, `已关闭`.
+### 4.1 Governance path
 
-An agent may mark implemented work `待验收` after evidence is complete. Only explicit user acceptance changes it to `已验收`.
+1. **Grill** when a decision-bearing ambiguity can change scope, acceptance, failure behavior, compatibility, schema/data, migration, permissions, security/privacy, external effects, irreversibility, or a meaningful trade-off. Inspect local evidence first and ask only questions whose answers could change the product baseline.
+2. **Co-draft** only for a decision-complete, localized, low-risk, reversible change without material coordination. The PRD and same-number SPEC may be drafted together, but remain unapproved and unauthorized.
+3. **PRD-first** for decision-complete work that is not small. Size alone is not ambiguity and does not justify generic questioning.
 
-## 5. Document contracts
+### 4.2 Execution topology
 
-### principle.md
+Topology depends on active writers, stable dependencies, dirty ownership, and resource conflicts—not on documentation size:
 
-Store only user-approved durable principles, conflict policies, approval control, and a change record. Do not invent project-specific principles during bootstrap. “No approved project-specific principles yet” is valid.
+```text
+IDLE -> SINGLE_LOCAL -> PARALLEL -> DRAINING -> IDLE
+                         ^    |
+                         +----+  new writer arrives
+```
 
-### prd-NNN.md
+- Drafting and read-only work do not consume writer topology.
+- The sole active implementation PRD uses `SINGLE_LOCAL` in the primary checkout.
+- The second and later active implementation PRDs use sibling linked worktrees unless dependency/resource rules require stacking or serialization.
+- When parallel work drains to one writer, the survivor stays in place. The topology does not migrate it back to Local.
+- Only after all writers release may the next single writer use Local again.
 
-Include metadata, background/problem, goals, in-scope requirements, acceptance criteria, non-goals, constraints, open questions, and approval/revision evidence. Give requirements and acceptance criteria stable IDs such as `R-003-01` and `AC-003-01`.
+### 4.3 Authorization state
 
-Describe what and why. Exclude functions, classes, algorithms, shell commands, dependency versions, file-by-file coding steps, and test implementation.
+Derive these gates separately from exact evidence:
 
-### spec-NNN.md
+```text
+CLASSIFIED
+  -> GRILL_BLOCKED | PRD_DRAFT | PRD_SPEC_CODRAFT
+  -> PRD_APPROVED
+  -> SPEC_APPROVED
+  -> IMPLEMENTATION_AUTHORIZED
+  -> IMPLEMENTING
+  -> CANDIDATE_VERIFIED
+  -> INTEGRATION_PENDING
+  -> INTEGRATED_VERIFIED
+  -> AWAITING_ACCEPTANCE
+  -> ACCEPTED
+  -> CLOSED
+```
 
-Always reference the same-number PRD. A co-drafted pre-approval SPEC in `草案` may trace proposed PRD IDs while its approved-baseline field remains empty. Before the SPEC moves to `待批准` or any later active state, identify the approved PRD baseline; before it moves to `已批准` or later, record explicit user approval of the SPEC itself. Include architecture/responsibility boundaries, requirement traceability, file/interface/data contracts, execution plan, compatibility/migration, rollback, risks, and verification.
+New ambiguity, principle drift, dependency/candidate drift, main drift, deviation, or failed verification returns the iteration to the relevant earlier gate. Never advance by editing a status label without its evidence.
 
-Do not introduce product scope or acceptance requirements that the PRD did not authorize. Return new product needs to the PRD approval gate.
+## 5. Workspace and runtime isolation
 
-### deviation-NNN.md
+### 5.1 Additive topology
 
-Record only factual differences between completed as-built implementation and the same-number approved PRD/SPEC. Use `DEV-NNN-SSS` IDs. Each entry includes status, discovery time, exact baseline references, original promise, observed as-built behavior, cause, impact, acceptance impact, explicit disposition and evidence, verification, and closure.
+- `0 → 1`: assign Local ownership in the primary checkout. Do not create an extra worktree or isolation-only branch, commit, or stash.
+- `1 → 2`: create B's branch and sibling linked worktree from B's exact implementation start. A remains in its original cwd with byte-identical worktree/index/untracked state and the same task/runtime.
+- `2 → 3+`: create one sibling worktree and writer lease per additional PRD after dependency and resource checks.
+- `N → 1`: sticky drain; no survivor migration.
+- `1 → 0`: release only after evidence and conservative cleanup gates.
 
-A deviation is not a change proposal, approval source, or implementation authorization. If a difference is known before implementation, revise and reapprove the affected PRD/SPEC instead. After implementation, register every material difference and explicitly dispose it before acceptance by correcting the implementation, revising and reapproving the baseline, accepting the residual fact, or transferring it as an acknowledged blocker. Keep resolved and closed entries; never erase them by rewriting the baseline. A cross-iteration transfer remains canonical in its original ledger and is linked from the receiving iteration rather than copied.
+If Local A occupies main and B must integrate first, the main-release operation may bind A's existing checkout in place to an A branch. It must prove exact source HEAD, full index/worktree preservation, A ownership, no Git operation markers, and no branch collision. It performs no commit, stash, reset, copy, or cwd change and requires before/after notification.
 
-### progress.md
+### 5.2 Writer guard
 
-Append conclusion-level events using `S-YYYYMMDD-NN` session IDs and event types `OPEN`, `DECISION`, `CHECKPOINT`, `MERGE`, and `CLOSE`. Record context, user goal, decisions and stated basis, execution, verification evidence, related deviations, and next steps.
+Before every mutation, validate at least:
 
-Do not record hidden reasoning, verbatim chat, tokens, secrets, or raw tool noise. Correct an old event with a new event instead of rewriting history.
+```text
+(repository common dir,
+ absolute worktree path,
+ iteration,
+ owner/task,
+ branch or detached state,
+ allocation base,
+ implementation start,
+ writer-lease generation,
+ expected operation)
+```
+
+A mismatch blocks before file or ref mutation. One PRD has at most one primary writer. The coordinator alone owns allocation, global principle, shared reconciliation, and merge-train mutations.
+
+### 5.3 Runtime claims
+
+Git worktrees isolate checkouts, not processes, credentials, ports, databases, caches, containers, logs, or external environments. Each implementation PRD declares resource claims and receives a deterministic local namespace. Project adapters may implement setup, candidate verification, integration verification, and teardown, but Harness records their inputs/results and does not assume a specific stack.
+
+Exclusive or incompatible claims create a serialization barrier. Unknown shared state blocks cleanup and may block implementation/integration.
+
+## 6. Document contracts
+
+### `principle.md`
+
+Store only explicitly approved durable principles, conflict policies, and change history. Main's committed bytes are the one current authority. Feature copies may propose an exact change but cannot become authority by merge.
+
+### `prd-NNN.md`
+
+Include metadata, both baselines, `principle_base_hash`, `depends_on`, `conflicts_with`, integration target, shared contract/schema hints, resource claims, background/problem, goals, stable requirement IDs, acceptance IDs, non-goals, constraints, open questions, and approval/revision evidence.
+
+Describe what and why. Exclude functions/classes, algorithms, shell commands, dependency versions, file-by-file coding steps, and test implementation.
+
+### `spec-NNN.md`
+
+Reference the same-number PRD and the exact approved PRD baseline. Include architecture/responsibility boundaries, requirement traceability, ownership/touched-area plan, interfaces/data contracts, workspace/runtime adapter expectations, execution slices, compatibility/migration, rollback, risks, and verification.
+
+A co-drafted pre-approval SPEC may be `草案` and trace proposed PRD IDs, but has no approved baseline, approval evidence, or implementation authorization. A material product need absent from the PRD returns to PRD revision and approval.
+
+### `deviation-NNN.md`
+
+Record only material differences discovered after implementation. Each `DEV-NNN-SSS` includes discovery time, exact PRD/acceptance/SPEC references, original promise, observed fact, cause, impact, acceptance impact, disposition authority, verification, and closure/transfer evidence. Keep resolved entries. A cross-iteration transfer remains canonical in the source ledger and is linked, not copied.
+
+### `progress.md`
+
+New events have a globally unique event ID separate from the session ID, iteration/scope, event type, occurred-at timestamp, operation ID, source identity, causal parent, authority/evidence refs, factual summary, and optional `corrects` link. Preserve legacy `S-YYYYMMDD-NN` blocks unchanged.
+
+Do not store hidden reasoning, verbatim chat, tokens, secrets, or raw tool noise.
 
 ### READMEs
 
-Keep the root README as a compact registry and routing page. Keep each iteration README as a compact result/status page with recent event IDs, open items, next step, and a task-to-document map.
+L0 is the compact cross-PRD registry; L1 is the compact iteration status/result route. Managed sections show topology, governance gates, principle identity/drift, dependencies, candidate/integration status, recent event IDs, open deviations, and next gate. Do not duplicate full requirements, designs, deviation bodies, or history.
 
-Do not duplicate full requirements, technical designs, deviation bodies, or event logs into READMEs.
+## 7. Principle, progress, and derived-view reconciliation
 
-## 6. Update matrix
+### 7.1 Global principle gate
 
-| Change | Iteration README | Root README | Progress | Deviation |
+1. Read base principle, latest committed main principle, and candidate principle.
+2. With no feature diff, use latest main and audit drift.
+3. With a feature diff, require the global principle lease, stable change ID, exact approved before/after bytes, and impact scope.
+4. If main drifted, display the exact combined result and obtain renewed confirmation even when text hunks do not overlap.
+5. For every open PRD with an older hash, append either a no-impact audit event or revise/reapprove affected PRD/SPEC and regenerate candidates.
+
+No automatic union, ours/theirs, latest-wins, or merge-order-wins policy is valid for principles.
+
+### 7.2 Immutable progress union
+
+For branch base, branch candidate, and latest main:
+
+1. prove that the branch did not change any base event bytes;
+2. extract new events absent from latest main;
+3. de-duplicate same ID/same bytes;
+4. block same ID/different bytes as tampering;
+5. preserve branch causal order while physical main order reflects integration order;
+6. retain contradictory facts and block authority-sensitive decisions until a new resolution event;
+7. rebuild the progress index rather than merging it as text.
+
+### 7.3 Derived rebuild
+
+Rebuild L0/L1 managed blocks from latest main principles, reconciled progress, PRD/SPEC/deviation states, refs, and bounded operational projections. Worktree copies are previews only. User-authored sections must be physically outside managed blocks and are preserved byte-for-byte unless a real user-content conflict needs resolution.
+
+## 8. Candidate, integration, and acceptance evidence
+
+### 8.1 Feature candidate
+
+Feature candidacy requires:
+
+- exact approved PRD/SPEC and implementation authorization;
+- current principle hash or completed drift audit;
+- acceptance evidence and project verification;
+- disposed material deviations;
+- writer/root/path/base/lease guard receipts;
+- owned included paths and explicit exclusions;
+- stable dependency candidate identities.
+
+Persist `CandidateEvidence` bound to iteration/generation, allocation base, implementation start, candidate ref/commit/tree, principle hash, included paths, dependencies, verification receipts, and authority/guard receipt digests. A raw ref or caller assertion is not evidence.
+
+### 8.2 Latest-main integration candidate
+
+The single merge train prepares from exact latest main, in declared dependency order. It revalidates identities, applies the principle gate, imports progress semantically, merges the iteration bundle and implementation, rebuilds derived views, and runs cross-PRD/full verification. Persist evidence bound to the exact integrated tree/commit and main base.
+
+Implementation conflicts return to the owning PRD and produce a new candidate. A deterministic governance normalizer may resolve only governed files when its exact plan, inputs, staged result tree, receipt, and crash replay are validated.
+
+### 8.3 Integration strategy and main advance
+
+Default to `merge --no-ff`. A project may explicitly declare another strategy. If squash, cherry-pick, rebase, conflict repair, or any other operation changes candidate commit identity, generate a new integrated candidate, rerun verification, and bind new evidence before acceptance.
+
+The user confirms the exact latest-main integrated result; on the normal path this is also final acceptance. Any change to main, candidate, tree, principles, dependencies, or evidence invalidates that confirmation. Main and integrated/final refs advance through one guarded compare-and-swap boundary. A post-advance failure never triggers automatic history rewrite.
+
+## 9. Interaction and Git transparency
+
+Actions use three levels:
+
+| Level | Examples | User-visible contract |
+|---|---|---|
+| Silent | Read/status, routing, validation, evidence collection, preview, authorized idempotent replay | No mutation hidden inside the action |
+| Notify | Worktree create/remove, safe branch create, in-place Local binding, queue/invalidations, manifest-owned local runtime | Before and after summaries |
+| Confirm | Approvals, principle change, commit, main advance/merge, cleanup with risk, lease takeover, external/shared mutation, final acceptance, future push | Exact scope shown before mutation |
+
+A worktree notice includes affected PRD(s), reason, allocation base and implementation start, branch, absolute path, runtime namespace, effect on existing PRDs, remote involvement, and before/after actual state.
+
+Every commit is transparent. Before it, show exact branch, paths/tree, message, verification/evidence IDs, exclusions, and `pushed=false`; after it, show the commit hash, actual HEAD, and still-unpushed state. A user may grant bounded standing authority for WIP checkpoint commits, but they remain recovery points only and still receive before/after disclosure.
+
+Push is not implemented in lifecycle-v2. The reserved interface is always separate from commit and would require remote, source/target refs, exact range, `force=false`, and explicit confirmation. Never imply that a local candidate, integration, or commit was pushed.
+
+Never silently stash, reset, clean, force, rewrite accepted history, delete branches, or force-remove worktrees.
+
+## 10. Journals, concurrency, recovery, and cleanup
+
+Each mutating workflow uses a unique operation ID, versioned canonical plan, accepted plan digest, expected refs, scoped locks/leases, and a durable phase journal. Plans bind exact roots, identities, bytes/hashes, notifications/confirmations, and rollback eligibility.
+
+A matching retry resumes idempotently. It must not allocate another ID, add a duplicate event/worktree/commit, repeat an already-recorded notification, or silently accept drift. Same name/different identity blocks.
+
+Allocation, principle change, writer ownership, and main integration are serialized with locks plus compare-and-swap, not time-of-check assumptions. Lease takeover needs journal/process/worktree proof; TTL alone is insufficient.
+
+Cleanup is last and conservative. Before and immediately under lock, reject active writer/runtime claims, Git operation markers, staged/dirty/untracked/ignored state, path links/junctions, nested worktree overlap, or manifest mismatch. Remove only exact operation-owned objects. If removal happened before a crash, replay completes the journal and missing after-notification without deleting again. Unknown state becomes `FAILED_NEEDS_RECONCILE` and is preserved.
+
+## 11. Legacy compatibility and upgrade
+
+Projects may contain legacy serial and lifecycle-v2 iterations together. Compatibility rules are per iteration:
+
+- completed legacy bundles, principle bytes, deviation ledgers, `S-*` events, and base/final refs remain unchanged and verifiable;
+- legacy readers/finalizer remain available only for iterations that have not adopted v2;
+- an exact upgrade dry run reports paths, refs, hashes, active/dirty state, and disposition before writes;
+- a clean active legacy iteration may adopt v2 through the accepted operation; a dirty one remains legacy unless the user explicitly approves a recoverable transition;
+- upgrade replaces only the bounded `AGENTS.md` block and preserves all surrounding user content;
+- never create a new v2 ref that collides with the legacy ref namespace.
+
+Legacy serial constraints—one active iteration, fixed branch at base, no intermediate commit, one acceptance-gated final commit—must not be applied to already-adopted lifecycle-v2 iterations. Conversely, v2 behavior must not be claimed for an unupgraded legacy iteration.
+
+## 12. Completion, validation, and update matrix
+
+Before feature candidacy, require every acceptance ID to have evidence, every completed material difference to be registered/disposed, current authority and writer receipts, and no unrelated included changes. Before integrated candidacy, also require latest-main governance reconciliation and full/cross-PRD verification. Only explicit confirmation of the exact integrated result sets `已验收`; only evidence-bound main/ref advancement permits `CLOSED`.
+
+The validator checks structure, IDs, statuses, markers, routing registration, duplicate event/deviation identities, forbidden flat governance files, links, and compatible refs. Lifecycle/workspace/train checks additionally prove authority, leases, baselines, candidate/integrated evidence, drift, and replay state. No validator can decide whether product requirements are good or fabricate user approval.
+
+| Change | Iteration README | Root README | Progress | Deviation/evidence |
 |---|---:|---:|---:|---:|
-| New iteration or renumbering | Yes | Yes | Yes | Create ledger |
-| PRD/SPEC status changes | Yes | Yes when routing/focus changes | Yes | Only when a reapproved baseline disposes a recorded as-built difference |
-| Decision, checkpoint, or close | Yes | Only if global routing changes | Append | If completed as-built work differs |
-| Open deviation count/status changes | Yes | Yes | Append | Update canonical entry |
-| Implementation detail within approved SPEC | When result/next step changes | No | At checkpoint/close | No |
+| Reserve/create iteration | Rebuild | Rebuild registry/focus | Append OPEN | Create ledger + allocation evidence |
+| PRD/SPEC/authorization gate | Rebuild | Rebuild if routing changes | Append DECISION | Bind exact authority receipt |
+| Worktree/topology/candidate state | Rebuild local/status projection | Rebuild operational projection | Append event when governance-significant | Persist lease/candidate receipt |
+| Principle change/drift audit | Rebuild all affected | Rebuild global view | Append decision/audit | Bind principle change/impact receipt |
+| Integration candidate/main advance | Rebuild from latest main | Rebuild from latest main | Append MERGE/CLOSE | Persist integrated/final evidence |
+| Completed as-built difference | Rebuild | Rebuild if open-count/routing changes | Append checkpoint/decision | Update canonical deviation entry |
 | Read-only status question | No | No | No | No |
 
-README drift is repaired from authoritative documents and evidence. Do not rewrite old progress events to make them appear consistent with current knowledge.
-
-## 7. Completion and validation
-
-Before moving an iteration to `待验收`, require:
-
-1. Every acceptance ID has test, static-check, artifact, or manual-review evidence.
-2. Implementation matches the approved PRD/SPEC or every material as-built difference is recorded.
-3. Every recorded deviation identifies its discovery time, exact requirement/acceptance and SPEC references, cause, impact, and acceptance impact. Every resolved entry also has an explicit disposition, evidence, completed verification, and closure/transfer time: implementation fixed, baseline revised and reapproved, residual fact accepted, or transfer/blocker acknowledged.
-4. Progress contains verification, residual risks, and a CLOSE event.
-5. L1 is current; L0 is current when routing facts changed.
-6. The working diff contains no unrelated user changes in the proposed iteration scope.
-
-The bundled validator checks structure, IDs, statuses, ownership markers, routing registration, duplicate event/deviation identities, forbidden flat governance files, and local Markdown links. It cannot determine whether requirements are good, approvals are genuine, summaries are semantically accurate, or tests actually prove acceptance.
-
-## 8. What not to generalize
-
-Do not carry domain-specific implementation paths, artifact folders, pipeline phases, dependency policies, or ignore rules from a reference project into a new project.
-
-Do not generalize project-specific authorization for automatic Git operations. If the target has no Git repository, Harness bootstrap may initialize Git and create exactly one initial baseline commit; this is the bootstrap exception. The preceding dry-run manifest is bound by an exact `BASELINE_PLAN_TOKEN`, and apply must reject any changed path, byte, target root, or rendered Harness before writes. If Git already exists, Harness initialization does not commit. Each product iteration receives exactly one final commit, and only after explicit user acceptance of the completed result. Its same-number bundle is automatic scope; every dirty shared control file requires exact explicit inclusion. Finalization binds the reviewed staged tree to the independent base anchor and writes `refs/project-harness/iterations/NNN/final` atomically with the branch update. Commit and reference-transaction hooks are not run, so their required checks must be executed and recorded beforehand. Pushing, creating PRs, rewriting history, editing `.gitignore`, or installing dependencies remains separately authorized and repository-specific.
+README drift is repaired from authoritative inputs. Historical progress or accepted evidence is never rewritten merely to match today's derived view.

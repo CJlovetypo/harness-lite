@@ -11,6 +11,10 @@
 - 当前批准基线：尚无；等待 PRD-{{NUMBER}} 批准。
 - 批准依据：尚无；当前仅建立规格草案。
 - 实施授权：尚无。
+- 对应 principle_base_hash：见 PRD-{{NUMBER}} 与 v2 allocation metadata；实施前必须一致。
+- depends_on / conflicts_with：见 PRD-{{NUMBER}}；SPEC 只能细化执行顺序，不能新增产品依赖语义。
+- integration_target：见 PRD-{{NUMBER}}；默认 `refs/heads/main`。
+- resource_claims：见 PRD-{{NUMBER}}；本规格需给出本机 namespace、独占/共享策略与清理门禁。
 
 ## 1. 架构与职责边界
 
@@ -26,26 +30,35 @@
 
 列出会创建或修改的责任路径、公共接口、输入输出、Schema 与不变量。
 
-## 4. 执行计划
+## 4. Workspace、依赖与资源契约
+
+- 记录 Local / independent worktree / stacked / serialize 的计划与 reason codes；拓扑选择不构成实施授权。
+- 记录 allocation base 与 implementation start 的 exact ref/commit、writer root/path/branch/lease guard，以及 `depends_on` 稳定 candidate identity。
+- 列出 touched-area ownership、共享契约/schema、端口、数据库、缓存、日志、容器、账号和外部环境 claims；说明 namespace、冲突策略和安全 teardown。
+- 第二个及后续 writer 使用 sibling linked worktree；第一个 Local writer 不因并行被 commit、stash、移动或复制；并发下降后 survivor 原地 drain。
+
+## 5. 执行计划
 
 把实施拆成可验证切片或工作包；每个切片说明依赖、输出与停止条件。
 
-## 5. 兼容与迁移
+## 6. 兼容与迁移
 
 说明向后兼容、数据迁移、部署顺序和用户资产保护。
 
-## 6. 回滚
+## 7. 回滚
 
 说明失败时如何安全恢复，不改写历史或丢弃用户数据。
 
-## 7. 风险与变更门禁
+## 8. 风险与变更门禁
 
 列出主要技术/交付风险。实现前已知会偏离批准基线的变化，先修订并重新批准受影响的 PRD/SPEC；deviation 只在实现完成后记录 as-built 事实差异。
 
-## 8. 验证计划
+## 9. 验证计划
 
 按风险定义单元、集成、端到端、静态或人工验证，并逐项映射验收 ID。
 
-## 9. 批准与修订记录
+验证至少区分 feature candidate 与 exact latest-main integrated candidate。若合并策略改变 candidate commit identity，必须生成新 integrated candidate、重新验证并绑定新 evidence。
+
+## 10. 批准与修订记录
 
 - {{DATE}}：创建受 PRD 阻塞的规格骨架；尚未授权实施。

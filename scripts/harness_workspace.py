@@ -24,7 +24,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 try:
     from .harness_candidate import (
@@ -39,7 +39,8 @@ except ImportError:  # pragma: no cover - direct script execution
 PUBLIC_SCHEMA = "harness-lite.workspace-operation/v1"
 PLAN_SCHEMA = "harness-lite.workspace-plan/v1"
 JOURNAL_SCHEMA = "harness-lite.workspace-journal/v1"
-LEASE_SCHEMA = "harness-lite.writer-lease/v2"
+LEASE_SCHEMA = "harness-lite.writer-lease/v3"
+PREVIOUS_LEASE_SCHEMA = "harness-lite.writer-lease/v2"
 LEGACY_LEASE_SCHEMA = "harness-lite.writer-lease/v1"
 TOPOLOGY_SCHEMA = "harness-lite.workspace-topology/v1"
 ALLOCATION_SCHEMA = "harness-lite.allocation-metadata.v1"
@@ -47,7 +48,7 @@ DEPENDENCY_BINDING_SCHEMA = "harness-lite.dependency-candidate-binding/v1"
 DEPENDENCY_REFRESH_PLAN_SCHEMA = "harness-lite.dependency-refresh-plan/v1"
 DEPENDENCY_REFRESH_JOURNAL_SCHEMA = "harness-lite.dependency-refresh-journal/v1"
 DEPENDENCY_REFRESH_RECEIPT_SCHEMA = "harness-lite.dependency-refresh-receipt/v1"
-CANDIDATE_EVIDENCE_METADATA_SCHEMA = "harness-lite.candidate-evidence-metadata/v1"
+CANDIDATE_EVIDENCE_METADATA_SCHEMA = "harness-lite.candidate-evidence-metadata/v2"
 
 OPERATION_ID_RE = re.compile(r"OP-[0-9a-f]{32}")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -1131,10 +1132,14 @@ def build_dependency_refresh_plan(
     before_lease = lease_projection(lease)
     after_lease = dict(before_lease)
     after_lease["generation"] = generation + 1
-    after_lease["implementation_ref"] = after_bindings[-1]["candidate_ref"] if after_bindings else "refs/heads/main"
-    after_lease["implementation_commit"] = (
-        after_bindings[-1]["candidate_commit"] if after_bindings else lease["implementation_commit"]
-    )
+    # Ownership and semantic reconciliation have distinct baselines after an
+    # explicit dependency refresh.  The dependency candidate proves what the
+    # consumer owns; the verified adaptation HEAD preserves the already-unioned
+    # progress/governance history for later three-way reconciliation.
+    after_lease["implementation_ref"] = after_bindings[-1]["candidate_ref"]
+    after_lease["implementation_commit"] = after_bindings[-1]["candidate_commit"]
+    after_lease["reconciliation_ref"] = branch
+    after_lease["reconciliation_commit"] = head
     after_lease["dependency_bindings"] = [dict(item) for item in after_bindings]
     after_lease["dependency_bindings_digest"] = dependency_bindings_digest(after_bindings)
     after_lease["dependency_refresh_generation"] = int(lease.get("dependency_refresh_generation", 0)) + 1
@@ -1408,23 +1413,33 @@ LEGACY_LEASE_FIELDS = {
     "heartbeat",
 }
 
-LEASE_FIELDS = LEGACY_LEASE_FIELDS | {
+PREVIOUS_LEASE_FIELDS = LEGACY_LEASE_FIELDS | {
     "implementation_ref",
     "implementation_commit",
     "dependency_bindings",
     "dependency_bindings_digest",
     "dependency_refresh_generation",
 }
+LEASE_FIELDS = PREVIOUS_LEASE_FIELDS | {
+    "reconciliation_ref",
+    "reconciliation_commit",
+}
 
 
 def validate_lease(value: object, *, source: Path) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) not in {frozenset(LEASE_FIELDS), frozenset(LEGACY_LEASE_FIELDS)}:
-        raise WorkspaceError(f"writer lease fields do not match the v1 schema: {source}")
+    if not isinstance(value, dict) or set(value) not in {
+        frozenset(LEASE_FIELDS),
+        frozenset(PREVIOUS_LEASE_FIELDS),
+        frozenset(LEGACY_LEASE_FIELDS),
+    }:
+        raise WorkspaceError(f"writer lease fields do not match a supported schema: {source}")
     schema = value.get("schema_version")
-    if schema not in {LEASE_SCHEMA, LEGACY_LEASE_SCHEMA} or value.get("scope") != "iteration-writer":
+    if schema not in {LEASE_SCHEMA, PREVIOUS_LEASE_SCHEMA, LEGACY_LEASE_SCHEMA} or value.get("scope") != "iteration-writer":
         raise WorkspaceError(f"unsupported writer lease schema: {source}")
     if schema == LEASE_SCHEMA and set(value) != LEASE_FIELDS:
-        raise WorkspaceError(f"writer lease v2 fields are incomplete: {source}")
+        raise WorkspaceError(f"writer lease v3 fields are incomplete: {source}")
+    if schema == PREVIOUS_LEASE_SCHEMA and set(value) != PREVIOUS_LEASE_FIELDS:
+        raise WorkspaceError(f"writer lease v2 fields are invalid: {source}")
     if schema == LEGACY_LEASE_SCHEMA and set(value) != LEGACY_LEASE_FIELDS:
         raise WorkspaceError(f"writer lease v1 fields are invalid: {source}")
     if value.get("state") != "active":
@@ -1464,39 +1479,61 @@ def validate_lease(value: object, *, source: Path) -> dict[str, object]:
                 "schema_version": LEASE_SCHEMA,
                 "implementation_ref": "refs/heads/main",
                 "implementation_commit": value["base_commit"],
+                "reconciliation_ref": "refs/heads/main",
+                "reconciliation_commit": value["base_commit"],
                 "dependency_bindings": [],
                 "dependency_bindings_digest": dependency_bindings_digest(()),
                 "dependency_refresh_generation": 0,
             }
         )
         return normalized
-    implementation_ref = value.get("implementation_ref")
-    implementation_commit = value.get("implementation_commit")
+    if schema == PREVIOUS_LEASE_SCHEMA:
+        normalized.update(
+            {
+                "schema_version": LEASE_SCHEMA,
+                "reconciliation_ref": value["implementation_ref"],
+                "reconciliation_commit": value["implementation_commit"],
+            }
+        )
+    implementation_ref = normalized.get("implementation_ref")
+    implementation_commit = normalized.get("implementation_commit")
     if not isinstance(implementation_ref, str) or not (
-        implementation_ref == "refs/heads/main"
+        implementation_ref.startswith("refs/heads/")
         or implementation_ref.startswith("refs/project-harness/v2/iterations/")
     ):
         raise WorkspaceError(f"writer lease implementation_ref is invalid: {source}")
     if not isinstance(implementation_commit, str) or not OID_RE.fullmatch(implementation_commit):
         raise WorkspaceError(f"writer lease implementation_commit is invalid: {source}")
-    raw_dependencies = value.get("dependency_bindings")
+    raw_dependencies = normalized.get("dependency_bindings")
     if not isinstance(raw_dependencies, list):
         raise WorkspaceError(f"writer lease dependency_bindings are invalid: {source}")
     dependencies = normalize_dependency_bindings(raw_dependencies)
-    if value.get("dependency_bindings_digest") != dependency_bindings_digest(dependencies):
+    if normalized.get("dependency_bindings_digest") != dependency_bindings_digest(dependencies):
         raise WorkspaceError(f"writer lease dependency binding digest differs: {source}")
-    refresh_generation = value.get("dependency_refresh_generation")
+    refresh_generation = normalized.get("dependency_refresh_generation")
     if not isinstance(refresh_generation, int) or refresh_generation < 0 or refresh_generation > 2_147_483_647:
         raise WorkspaceError(f"writer lease dependency refresh generation is invalid: {source}")
     if dependencies:
         last = dependencies[-1]
-        if implementation_ref != last["candidate_ref"] or implementation_commit != last["candidate_commit"]:
-            # The original start remains immutable after an explicit refresh.
-            # A refreshed binding can therefore differ only once generation > 0.
-            if refresh_generation == 0:
+        if refresh_generation == 0:
+            if implementation_ref != last["candidate_ref"] or implementation_commit != last["candidate_commit"]:
                 raise WorkspaceError(f"writer lease implementation start differs from dependency baseline: {source}")
     elif implementation_ref != "refs/heads/main":
         raise WorkspaceError(f"independent writer lease implementation ref must be main: {source}")
+    reconciliation_ref = normalized.get("reconciliation_ref")
+    reconciliation_commit = normalized.get("reconciliation_commit")
+    if not isinstance(reconciliation_ref, str) or not (
+        reconciliation_ref.startswith("refs/heads/")
+        or reconciliation_ref.startswith("refs/project-harness/v2/iterations/")
+    ):
+        raise WorkspaceError(f"writer lease reconciliation_ref is invalid: {source}")
+    if not isinstance(reconciliation_commit, str) or not OID_RE.fullmatch(reconciliation_commit):
+        raise WorkspaceError(f"writer lease reconciliation_commit is invalid: {source}")
+    if refresh_generation == 0:
+        if reconciliation_ref != implementation_ref or reconciliation_commit != implementation_commit:
+            raise WorkspaceError(f"unrefreshed writer lease reconciliation baseline differs: {source}")
+    elif reconciliation_ref != branch:
+        raise WorkspaceError(f"refreshed writer lease reconciliation ref differs from its branch: {source}")
     normalized["dependency_bindings"] = [dict(item) for item in dependencies]
     return normalized
 
@@ -1669,6 +1706,8 @@ def lease_projection(lease: Mapping[str, object]) -> dict[str, object]:
         "base_commit": lease.get("base_commit"),
         "implementation_ref": lease.get("implementation_ref"),
         "implementation_commit": lease.get("implementation_commit"),
+        "reconciliation_ref": lease.get("reconciliation_ref"),
+        "reconciliation_commit": lease.get("reconciliation_commit"),
         "dependency_bindings": [
             dict(item) for item in lease.get("dependency_bindings", []) if isinstance(item, Mapping)
         ],
@@ -1693,6 +1732,8 @@ LEASE_PROJECTION_FIELDS = {
     "base_commit",
     "implementation_ref",
     "implementation_commit",
+    "reconciliation_ref",
+    "reconciliation_commit",
     "dependency_bindings",
     "dependency_bindings_digest",
     "dependency_refresh_generation",
@@ -2364,6 +2405,13 @@ JOURNAL_PHASES = {
     "FAILED_NEEDS_RECONCILE",
 }
 
+ACTIVATION_PHASES = {
+    "local": ("PLANNED", "LEASED", "READY"),
+    "worktree": ("PLANNED", "LEASED", "BRANCH_READY", "WORKTREE_READY", "READY"),
+}
+ACTIVATION_FAILPOINT_BRANCH_CREATED = "branch-created-before-worktree"
+ACTIVATION_FAILPOINT_WORKTREE_CREATED = "worktree-created-before-journal-advance"
+
 
 def validate_manifest(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or value.get("schema_version") != PLAN_SCHEMA:
@@ -2686,6 +2734,60 @@ def advance_journal(
     return updated
 
 
+def advance_activation_journal(
+    context: RepositoryContext,
+    journal: Mapping[str, object],
+    phase: str,
+    *,
+    topology: str,
+    created_objects: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Advance an activation journal exactly once and never move it backwards.
+
+    A process may disappear after Git has created a branch or worktree but
+    before the corresponding journal write.  Matching retries re-observe that
+    object and advance from the last durable phase.  Replaying an already
+    durable phase is a no-op, so history remains monotonic and contains one
+    entry per activation phase.
+    """
+
+    phases = ACTIVATION_PHASES.get(topology)
+    if phases is None or phase not in phases:
+        raise WorkspaceError(f"invalid activation journal target phase: {phase}")
+    current = str(journal.get("phase"))
+    if current not in phases:
+        raise WorkspaceError(f"activation journal cannot resume from phase: {current}")
+    current_index = phases.index(current)
+    target_index = phases.index(phase)
+    if current_index >= target_index:
+        return dict(journal)
+    if target_index != current_index + 1:
+        raise WorkspaceError(
+            f"activation journal cannot skip from {current} to {phase}"
+        )
+    return advance_journal(
+        context,
+        journal,
+        phase,
+        created_objects=created_objects,
+    )
+
+
+def run_activation_failpoint(
+    failure_injector: Callable[[str], None] | None,
+    name: str,
+) -> None:
+    """Invoke a test/recovery failure injector without converting its crash.
+
+    The callback is deliberately outside the WorkspaceError recovery path:
+    an exception models abrupt process loss and leaves the most recent durable
+    journal untouched for the next invocation to reconcile.
+    """
+
+    if failure_injector is not None:
+        failure_injector(name)
+
+
 def lease_from_manifest(manifest: Mapping[str, object]) -> dict[str, object]:
     base = manifest["base"]
     branch = manifest["branch"]
@@ -2709,6 +2811,8 @@ def lease_from_manifest(manifest: Mapping[str, object]) -> dict[str, object]:
         "base_commit": base["commit"],
         "implementation_ref": base["implementation_ref"],
         "implementation_commit": base["implementation_commit"],
+        "reconciliation_ref": base["implementation_ref"],
+        "reconciliation_commit": base["implementation_commit"],
         "dependency_bindings": [dict(item) for item in base["dependency_bindings"]],
         "dependency_bindings_digest": base["dependency_bindings_digest"],
         "dependency_refresh_generation": 0,
@@ -3180,6 +3284,7 @@ def apply_activation(
     operation_id: str,
     accepted_plan_digest: str,
     dependency_bindings: Sequence[Mapping[str, object]] = (),
+    failure_injector: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     context = resolve_repository(project_root)
     number = validate_iteration(iteration)
@@ -3297,10 +3402,11 @@ def apply_activation(
                     raise WorkspaceError("Local checkout changed after the accepted implementation start plan")
             lease, lease_created = acquire_matching_lease(context, plan.manifest)
             created_now = created_now or lease_created
-            journal = advance_journal(
+            journal = advance_activation_journal(
                 context,
                 journal,
                 "LEASED",
+                topology=topology_name,
                 created_objects={"writer_lease": str(lease_path(context, number))},
             )
             write_topology(context)
@@ -3320,10 +3426,16 @@ def apply_activation(
                     operation_id=operation,
                 )
                 created_now = created_now or branch_created
-                journal = advance_journal(
+                if branch_created:
+                    run_activation_failpoint(
+                        failure_injector,
+                        ACTIVATION_FAILPOINT_BRANCH_CREATED,
+                    )
+                journal = advance_activation_journal(
                     context,
                     journal,
                     "BRANCH_READY",
+                    topology=topology_name,
                     created_objects={"branch_ref": str(branch_manifest["ref"])},
                 )
                 worktree_created = add_worktree(
@@ -3333,10 +3445,16 @@ def apply_activation(
                     base_commit=str(base["implementation_commit"]),
                 )
                 created_now = created_now or worktree_created
-                journal = advance_journal(
+                if worktree_created:
+                    run_activation_failpoint(
+                        failure_injector,
+                        ACTIVATION_FAILPOINT_WORKTREE_CREATED,
+                    )
+                journal = advance_activation_journal(
                     context,
                     journal,
                     "WORKTREE_READY",
+                    topology=topology_name,
                     created_objects={"worktree_path": str(worktree_manifest["path"])},
                 )
                 before = plan.manifest["preconditions"]
@@ -3360,7 +3478,12 @@ def apply_activation(
             )
             if blockers:
                 raise WorkspaceError("; ".join(item.message for item in blockers))
-            journal = advance_journal(context, journal, "READY")
+            journal = advance_activation_journal(
+                context,
+                journal,
+                "READY",
+                topology=topology_name,
+            )
             current_topology = write_topology(context)
             return result_payload(
                 plan,

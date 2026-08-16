@@ -30,11 +30,20 @@ import tempfile
 import time
 from typing import Callable, Literal, Mapping, Sequence
 
-import harness_governance
-import harness_progress
-import harness_reconcile
-import harness_train
-import project_harness
+try:
+    from . import harness_governance
+    from . import harness_progress
+    from . import harness_readme_authority
+    from . import harness_reconcile
+    from . import harness_train
+    from . import project_harness
+except ImportError:  # pragma: no cover - direct script execution
+    import harness_governance
+    import harness_progress
+    import harness_readme_authority
+    import harness_reconcile
+    import harness_train
+    import project_harness
 
 
 ADAPTER_SCHEMA = "harness-lite.train-governance-adapter/v2"
@@ -43,7 +52,7 @@ NORMALIZATION_JOURNAL_SCHEMA = "harness-lite.train-governance-normalization-jour
 README_AUTHORITY_SCHEMA = "harness-lite.train-governance-readme-authority/v1"
 EXECUTION_JOURNAL_SCHEMA = "harness-lite.train-governance-execution-journal/v2"
 RESUME_STATE_SCHEMA = "harness-lite.train-governance-resume-state/v2"
-CANDIDATE_AUTHORITY_SCHEMA = "harness-lite.train-governance-candidate-authority/v2"
+CANDIDATE_AUTHORITY_SCHEMA = "harness-lite.train-governance-candidate-authority/v4"
 TRAIN_PROGRESS_SPEC_SCHEMA = "harness-lite.train-progress-event-spec/v1"
 PROGRESS_EVIDENCE_RESOLUTION_SCHEMA = "harness-lite.progress-evidence-resolution/v1"
 PROGRESS_MATERIALIZATION_SCHEMA = "harness-lite.train-progress-materialization/v1"
@@ -59,6 +68,12 @@ DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 MODE_RE = re.compile(r"100(?:644|755)")
 MAX_JSON_BYTES = 128 * 1024 * 1024
 REGISTRY_PARTS = ("project-harness", "train-governance", "v1")
+L1_START = harness_readme_authority.L1_START
+L1_END = harness_readme_authority.L1_END
+L0_MANAGED_PAIRS = (
+    (harness_governance.FOCUS_START, harness_governance.FOCUS_END),
+    (harness_governance.ITERATIONS_START, harness_governance.ITERATIONS_END),
+)
 
 
 class GovernanceAdapterError(RuntimeError):
@@ -90,13 +105,11 @@ class DerivedReadme:
 
 @dataclass(frozen=True)
 class ReadmeRebuildAuthority:
-    """Inputs required to rebuild L0 and candidate-owned L1 documents.
+    """Deprecated caller view retained only for source compatibility.
 
-    ``root`` is consumed by ``harness_governance.preview_root_readme``.  L1 has
-    no structured renderer in the current core, so callers provide its exact
-    authority-produced bytes and an evidence reference.  The adapter binds the
-    bytes into ``authority_digest`` and applies them through
-    ``harness_reconcile`` rather than accepting a branch-side text merge.
+    Its routing object and L1 bytes are never used as merge-train authority.
+    Product output is independently derived by ``harness_readme_authority``;
+    callers may assert that result only through an expected digest.
     """
 
     schema_version: str
@@ -182,6 +195,9 @@ class CandidateAuthorityBinding:
     candidate_ref: str
     candidate_commit: str
     candidate_tree: str
+    implementation_commit: str
+    reconciliation_commit: str
+    workspace_guard_digest: str
     candidate_evidence_ref: str
     candidate_evidence_blob: str
     candidate_evidence_metadata_digest: str
@@ -284,6 +300,7 @@ class GovernanceExecutionPreview:
     reconciliation_labels: tuple[str, ...]
     reconciliation_snapshots: tuple[harness_reconcile.GovernanceSnapshot, ...]
     progress_events: tuple["TrainProgressEventSpec", ...]
+    readme_authority: harness_readme_authority.DerivedReadmeAuthority | None
     final_snapshot: harness_reconcile.GovernanceSnapshot
     blockers: tuple[AdapterBlocker, ...]
 
@@ -387,6 +404,7 @@ class _CommitSnapshot:
 
 _ValidatedCandidate = tuple[
     harness_train.RegisteredCandidate,
+    _CommitSnapshot,
     _CommitSnapshot,
     _CommitSnapshot,
     CandidateAuthorityBinding,
@@ -624,6 +642,291 @@ def _semantic_candidate(
     return _snapshot_with_files(candidate, source_id=source_id, replacements=replacements)
 
 
+@dataclass(frozen=True)
+class _ReadmeManagedLayout:
+    shell: bytes
+    bodies: tuple[bytes, ...]
+    body_ranges: tuple[tuple[int, int], ...]
+
+
+def _marker_line_span(content: bytes, marker: str) -> tuple[int, int] | None:
+    target = marker.encode("utf-8")
+    matches: list[tuple[int, int]] = []
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        if line.rstrip(b"\r\n") == target:
+            matches.append((offset, offset + len(line)))
+        offset += len(line)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _readme_pairs(path: str) -> tuple[tuple[str, str], ...]:
+    if path == L0_PATH:
+        return L0_MANAGED_PAIRS
+    if L1_PATH_RE.fullmatch(path) is not None:
+        return ((L1_START, L1_END),)
+    raise GovernanceAdapterError(f"README outer merge received an unsupported path: {path}")
+
+
+def _readme_layout(path: str, content: bytes) -> _ReadmeManagedLayout | None:
+    pairs = _readme_pairs(path)
+    marker_bytes = tuple(
+        marker.encode("utf-8") for pair in pairs for marker in pair
+    )
+    marker_presence = tuple(marker in content for marker in marker_bytes)
+    if not any(marker_presence):
+        if path == L0_PATH:
+            raise GovernanceAdapterError("L0 README lacks its bounded managed markers")
+        # Legacy L1 documents were wholly derived.  They have no declared
+        # user-authored outer region and are upgraded by the authority renderer.
+        return None
+    if not all(marker_presence):
+        raise GovernanceAdapterError(
+            f"README managed markers are partial for {path}"
+        )
+
+    ranges: list[tuple[int, int]] = []
+    bodies: list[bytes] = []
+    for start, end in pairs:
+        start_span = _marker_line_span(content, start)
+        end_span = _marker_line_span(content, end)
+        if start_span is None or end_span is None or start_span[0] >= end_span[0]:
+            raise GovernanceAdapterError(
+                f"README managed markers are duplicated, missing, or reversed for {path}"
+            )
+        ranges.append((start_span[1], end_span[0]))
+        bodies.append(content[start_span[1] : end_span[0]])
+    ranges.sort()
+    if any(current[0] < previous[1] for previous, current in zip(ranges, ranges[1:])):
+        raise GovernanceAdapterError(f"README managed sections overlap for {path}")
+
+    shell = bytearray()
+    cursor = 0
+    for index, (begin, finish) in enumerate(ranges):
+        shell.extend(content[cursor:begin])
+        shell.extend(f"<harness-managed-body:{index}>".encode("ascii"))
+        cursor = finish
+    shell.extend(content[cursor:])
+    return _ReadmeManagedLayout(bytes(shell), tuple(bodies), tuple(ranges))
+
+
+def _transplant_managed_bodies(
+    source: bytes,
+    source_layout: _ReadmeManagedLayout,
+    bodies: Sequence[bytes],
+) -> bytes:
+    if len(source_layout.body_ranges) != len(bodies):
+        raise GovernanceAdapterError("README managed section arity changed")
+    output = bytearray()
+    cursor = 0
+    for (begin, finish), body in zip(source_layout.body_ranges, bodies):
+        output.extend(source[cursor:begin])
+        output.extend(body)
+        cursor = finish
+    output.extend(source[cursor:])
+    return bytes(output)
+
+
+def _merge_readme_outer_document(
+    path: str,
+    *,
+    base: bytes | None,
+    current: bytes | None,
+    candidate: bytes | None,
+) -> bytes | None:
+    """Three-way select marker-external bytes while retaining current bodies."""
+
+    if base is None:
+        if candidate is None:
+            return current
+        if current is None:
+            return candidate
+        current_layout = _readme_layout(path, current)
+        candidate_layout = _readme_layout(path, candidate)
+        if current_layout is None and candidate_layout is None:
+            if current != candidate:
+                raise GovernanceAdapterError(
+                    f"latest-main and candidate added different legacy README bytes: {path}"
+                )
+            return current
+        if current_layout is None or candidate_layout is None:
+            raise GovernanceAdapterError(
+                f"latest-main and candidate disagree on bounded README ownership: {path}"
+            )
+        if current_layout.shell != candidate_layout.shell:
+            raise GovernanceAdapterError(
+                f"latest-main and candidate added conflicting README outer bytes: {path}"
+            )
+        return current
+
+    if candidate is None:
+        raise GovernanceAdapterError(f"candidate deleted derived README: {path}")
+    if current is None:
+        raise GovernanceAdapterError(f"latest-main deleted derived README: {path}")
+
+    base_layout = _readme_layout(path, base)
+    current_layout = _readme_layout(path, current)
+    candidate_layout = _readme_layout(path, candidate)
+    layouts = (base_layout, current_layout, candidate_layout)
+    if all(item is None for item in layouts):
+        # Legacy L1 has no bounded user region.  Ignore its branch-derived bytes
+        # and let the independent authority renderer perform the one-way upgrade.
+        return current
+    if any(item is None for item in layouts):
+        raise GovernanceAdapterError(
+            f"README bounded-marker state changed ambiguously: {path}"
+        )
+    assert base_layout is not None
+    assert current_layout is not None
+    assert candidate_layout is not None
+    if candidate_layout.shell == base_layout.shell:
+        selected, selected_layout = current, current_layout
+    elif (
+        current_layout.shell == base_layout.shell
+        or current_layout.shell == candidate_layout.shell
+    ):
+        selected, selected_layout = candidate, candidate_layout
+    else:
+        raise GovernanceAdapterError(
+            f"latest-main and candidate changed README outer bytes differently: {path}"
+        )
+    return _transplant_managed_bodies(
+        selected,
+        selected_layout,
+        current_layout.bodies,
+    )
+
+
+def _snapshot_file_manifest(
+    snapshot: harness_reconcile.GovernanceSnapshot,
+) -> list[dict[str, object]]:
+    return [
+        {"path": path, "size": len(content), "sha256": _sha256(content)}
+        for path, content in sorted(snapshot.as_mapping().items())
+    ]
+
+
+def _plan_readme_outer_merge(
+    *,
+    repo: harness_train.Repository,
+    operation_id: str,
+    candidate_ref: str,
+    base: harness_reconcile.GovernanceSnapshot,
+    current: harness_reconcile.GovernanceSnapshot,
+    candidate: harness_reconcile.GovernanceSnapshot,
+) -> tuple[
+    harness_reconcile.GovernanceReconcilePlan | None,
+    harness_reconcile.GovernanceSnapshot,
+    tuple[AdapterBlocker, ...],
+]:
+    base_files = base.as_mapping()
+    current_files = current.as_mapping()
+    candidate_files = candidate.as_mapping()
+    paths = sorted(
+        {L0_PATH}
+        | {
+            path
+            for files in (base_files, current_files, candidate_files)
+            for path in files
+            if L1_PATH_RE.fullmatch(path) is not None
+        }
+    )
+    replacements: dict[str, bytes | None] = {}
+    blockers: list[AdapterBlocker] = []
+    selections: list[dict[str, object]] = []
+    for path in paths:
+        before = current_files.get(path)
+        try:
+            after = _merge_readme_outer_document(
+                path,
+                base=base_files.get(path),
+                current=before,
+                candidate=candidate_files.get(path),
+            )
+        except GovernanceAdapterError as exc:
+            blockers.append(
+                AdapterBlocker("readme-outer-three-way-conflict", str(exc), path)
+            )
+            continue
+        selections.append(
+            {
+                "path": path,
+                "base_sha256": _sha256(base_files[path]) if path in base_files else None,
+                "current_sha256": _sha256(before) if before is not None else None,
+                "candidate_sha256": (
+                    _sha256(candidate_files[path]) if path in candidate_files else None
+                ),
+                "result_sha256": _sha256(after) if after is not None else None,
+            }
+        )
+        if after != before:
+            replacements[path] = after
+    if blockers:
+        return None, current, tuple(blockers)
+    if not replacements:
+        return None, current, ()
+
+    desired = _snapshot_with_files(
+        current,
+        source_id=f"readme-outer:{candidate_ref}",
+        replacements=replacements,
+    )
+    previews = tuple(
+        harness_reconcile.FilePreview(
+            path=path,
+            category="l0" if path == L0_PATH else "l1",
+            before_exists=current_files.get(path) is not None,
+            before_sha256=(
+                _sha256(current_files[path]) if path in current_files else None
+            ),
+            after_sha256=_sha256(content),
+            content=content,
+        )
+        for path, content in sorted(replacements.items())
+        if content is not None
+    )
+    manifest: dict[str, object] = {
+        "schema_version": harness_reconcile.PLAN_SCHEMA,
+        "operation_id": operation_id,
+        "project_root": str(repo.root),
+        "git_common_dir": str(repo.common_dir),
+        "sources": {
+            "base": _snapshot_file_manifest(base),
+            "latest_main": _snapshot_file_manifest(current),
+            "candidate": _snapshot_file_manifest(candidate),
+        },
+        "principle": {},
+        "principle_lease": None,
+        "principle_lease_sha256": None,
+        "progress": {},
+        "target_observations": [
+            {
+                "path": item.path,
+                "exists": item.before_exists,
+                "sha256": item.before_sha256,
+            }
+            for item in previews
+        ],
+        "files": [item.manifest_dict() for item in previews],
+        "exclusions": list(harness_reconcile.EXCLUSIONS),
+        "readme_outer_merge": {
+            "candidate_ref": candidate_ref,
+            "selections": selections,
+        },
+    }
+    plan_digest = _sha256(_canonical_json(manifest))
+    plan = harness_reconcile.GovernanceReconcilePlan(
+        operation_id=operation_id,
+        project_root=str(repo.root),
+        git_common_dir=str(repo.common_dir),
+        plan_digest=plan_digest,
+        manifest=manifest,
+        previews=previews,
+        blockers=(),
+    )
+    return plan, desired, ()
+
+
 def _apply_previews_to_snapshot(
     snapshot: harness_reconcile.GovernanceSnapshot,
     plan: harness_reconcile.GovernanceReconcilePlan,
@@ -806,6 +1109,9 @@ def _candidate_authority_from_mapping(value: object) -> CandidateAuthorityBindin
         "candidate_ref",
         "candidate_commit",
         "candidate_tree",
+        "implementation_commit",
+        "reconciliation_commit",
+        "workspace_guard_digest",
         "candidate_evidence_ref",
         "candidate_evidence_blob",
         "candidate_evidence_metadata_digest",
@@ -844,6 +1150,9 @@ def _candidate_authority_from_mapping(value: object) -> CandidateAuthorityBindin
         candidate_ref=str(value["candidate_ref"]),
         candidate_commit=str(value["candidate_commit"]),
         candidate_tree=str(value["candidate_tree"]),
+        implementation_commit=str(value["implementation_commit"]),
+        reconciliation_commit=str(value["reconciliation_commit"]),
+        workspace_guard_digest=str(value["workspace_guard_digest"]),
         candidate_evidence_ref=str(value["candidate_evidence_ref"]),
         candidate_evidence_blob=str(value["candidate_evidence_blob"]),
         candidate_evidence_metadata_digest=str(value["candidate_evidence_metadata_digest"]),
@@ -858,6 +1167,7 @@ def _candidate_authority_from_mapping(value: object) -> CandidateAuthorityBindin
     )
     digest_fields = (
         binding.principle_sha256,
+        binding.workspace_guard_digest,
         binding.candidate_evidence_metadata_digest,
         binding.candidate_evidence_digest,
         binding.verification_binding_digest,
@@ -867,6 +1177,8 @@ def _candidate_authority_from_mapping(value: object) -> CandidateAuthorityBindin
     oid_fields = (
         binding.candidate_commit,
         binding.candidate_tree,
+        binding.implementation_commit,
+        binding.reconciliation_commit,
         binding.candidate_evidence_blob,
     )
     if (
@@ -921,12 +1233,26 @@ def _load_public_candidate_metadata(
         "pre_seal_tree": candidate.pre_seal_tree,
         "seal_commit": candidate.candidate_commit,
         "seal_tree": candidate.candidate_tree,
+        "implementation_commit": candidate.implementation_commit,
+        "workspace_guard_digest": candidate.workspace_guard_digest,
     }
     for field, expected_value in expected.items():
         if metadata.get(field) != expected_value:
             raise GovernanceAdapterError(
                 f"candidate public evidence identity differs: {candidate.candidate_ref} / {field}"
             )
+    try:
+        metadata_workspace_guard = harness_train._workspace_guard_from_mapping(
+            metadata.get("workspace_guard")
+        )
+    except harness_train.TrainError as exc:
+        raise GovernanceAdapterError(
+            f"candidate public workspace guard is invalid: {candidate.candidate_ref}: {exc}"
+        ) from exc
+    if metadata_workspace_guard != candidate.workspace_guard:
+        raise GovernanceAdapterError(
+            f"candidate public workspace guard differs: {candidate.candidate_ref}"
+        )
     pre_raw = metadata.get("pre_seal_verification_receipts")
     seal_raw = metadata.get("seal_verification_receipts")
     if not isinstance(pre_raw, list) or not isinstance(seal_raw, list):
@@ -1060,6 +1386,9 @@ def _public_candidate_authority(
         candidate_ref=loaded.candidate_ref,
         candidate_commit=loaded.candidate_commit,
         candidate_tree=loaded.candidate_tree,
+        implementation_commit=loaded.implementation_commit,
+        reconciliation_commit=loaded.workspace_guard.reconciliation_commit,
+        workspace_guard_digest=loaded.workspace_guard_digest,
         candidate_evidence_ref=loaded.candidate_evidence_ref,
         candidate_evidence_blob=loaded.candidate_evidence_blob,
         candidate_evidence_metadata_digest=loaded.candidate_evidence_metadata_digest,
@@ -1114,9 +1443,27 @@ def _validate_candidates(
         )
         if candidate.principle_sha256 != plan.principle_sha256:
             raise GovernanceAdapterError(f"candidate principle baseline is stale: {candidate.candidate_ref}")
-        base = _commit_snapshot(repo, candidate.base_commit, source_id=f"base:{candidate.base_commit}")
+        implementation_start = _commit_snapshot(
+            repo,
+            binding.implementation_commit,
+            source_id=f"implementation-start:{binding.implementation_commit}",
+        )
+        reconciliation_base = _commit_snapshot(
+            repo,
+            binding.reconciliation_commit,
+            source_id=f"reconciliation-base:{binding.reconciliation_commit}",
+        )
         branch = _commit_snapshot(repo, candidate.candidate_commit, source_id=f"candidate:{candidate.candidate_commit}")
-        validated.append((candidate, base, branch, binding, candidate_event))
+        validated.append(
+            (
+                candidate,
+                implementation_start,
+                reconciliation_base,
+                branch,
+                binding,
+                candidate_event,
+            )
+        )
     return main, tuple(validated)
 
 
@@ -1346,8 +1693,9 @@ def plan_premerge_normalization(
         blockers.append(AdapterBlocker("normalization-input-tree-unavailable", "an unmerged index cannot match a tree identity"))
 
     paths = set(main.files)
-    for _candidate, base, branch, _binding, _candidate_event in candidates:
-        paths.update(base.files)
+    for _candidate, ownership_base, reconciliation_base, branch, _binding, _candidate_event in candidates:
+        paths.update(ownership_base.files)
+        paths.update(reconciliation_base.files)
         paths.update(branch.files)
     tracked = _null_paths(_git(repo, ["ls-files", "-z", "--", "harness"], cwd=worktree).stdout)
     paths.update(path for path in tracked if _supported_path(path))
@@ -1383,7 +1731,7 @@ def plan_premerge_normalization(
         train_plan.target_main,
         train_plan.target_main,
         expected_input_tree if expected_input_tree is not None else actual_tree,
-        tuple(item[3] for item in candidates),
+        tuple(item[4] for item in candidates),
         tuple(entries),
         unmerged,
         "0" * 64,
@@ -1453,13 +1801,16 @@ def _approval_payload(value: harness_governance.PrincipleApproval) -> dict[str, 
 def _adapter_config_payload(
     *,
     candidate_authorities: Sequence[CandidateAuthorityBinding],
-    readme_authority: ReadmeRebuildAuthority | None,
+    expected_readme_authority_digest: str | None,
     principle_approvals: Mapping[str, harness_governance.PrincipleApproval],
     principle_leases: Mapping[str, harness_reconcile.GlobalPrincipleLease],
 ) -> dict[str, object]:
     return {
         "candidate_authorities": [item.as_dict() for item in candidate_authorities],
-        "readme_authority": _readme_authority_payload(readme_authority) if readme_authority else None,
+        # Caller-provided README bytes are deliberately absent.  A caller may
+        # assert only the digest independently derived by
+        # ``harness_readme_authority``.
+        "expected_readme_authority_digest": expected_readme_authority_digest,
         "principle_approvals": {
             key: _approval_payload(value)
             for key, value in sorted(principle_approvals.items())
@@ -1508,6 +1859,11 @@ def _execution_manifest(
             )
         ],
         "progress_events": [item.as_dict() for item in preview.progress_events],
+        "readme_authority_digest": (
+            preview.readme_authority.authority_digest
+            if preview.readme_authority is not None
+            else None
+        ),
         "final_snapshot": _snapshot_manifest(preview.final_snapshot),
     }
 
@@ -1828,7 +2184,7 @@ def _build_train_progress_specs(
     style = harness_progress._pure_eol_style(progress_content, "integrated progress history")
     newline = b"\r\n" if style == "crlf" else b"\n"
     specs: list[TrainProgressEventSpec] = []
-    for candidate, _base, _branch, _binding, candidate_event in validated:
+    for candidate, _ownership_base, _reconciliation_base, _branch, _binding, candidate_event in validated:
         integrated_ref = _integrated_progress_evidence_ref(
             candidate.iteration,
             train_plan.generation,
@@ -1990,8 +2346,8 @@ def _readme_differences(
     l0_changed = False
     changed_l1: set[str] = set()
     blockers: list[AdapterBlocker] = []
-    for candidate, base, branch, _binding, _candidate_event in validated:
-        base_files = base.semantic.as_mapping()
+    for candidate, implementation_start, _reconciliation_base, branch, _binding, _candidate_event in validated:
+        base_files = implementation_start.semantic.as_mapping()
         branch_files = branch.semantic.as_mapping()
         if base_files.get(L0_PATH) != branch_files.get(L0_PATH):
             l0_changed = True
@@ -2021,11 +2377,20 @@ def _plan_execution(
     context: harness_train.GovernanceContext,
     *,
     readme_authority: ReadmeRebuildAuthority | None,
+    expected_readme_authority_digest: str | None,
     principle_approvals: Mapping[str, harness_governance.PrincipleApproval],
     principle_leases: Mapping[str, harness_reconcile.GlobalPrincipleLease],
 ) -> GovernanceExecutionPreview:
     repo = _validate_train_plan(train_plan)
+    # Legacy caller-produced README authorities remain parseable for API
+    # compatibility, but their routing object and final L1 bytes are never
+    # consumed.  New callers may assert only the independent result digest.
     _validate_readme_authority(readme_authority)
+    if expected_readme_authority_digest is not None and (
+        not isinstance(expected_readme_authority_digest, str)
+        or DIGEST_RE.fullmatch(expected_readme_authority_digest) is None
+    ):
+        raise GovernanceAdapterError("expected README authority digest is invalid")
     if not isinstance(context, harness_train.GovernanceContext):
         raise TypeError("context must be GovernanceContext")
     expected_context = {
@@ -2045,12 +2410,12 @@ def _plan_execution(
         elif actual != expected:
             raise GovernanceAdapterError(f"governance context {field} differs from accepted train plan")
     main, validated = _validate_candidates(repo, train_plan)
-    candidate_authorities = tuple(item[3] for item in validated)
+    candidate_authorities = tuple(item[4] for item in validated)
     actual_index_tree = _write_tree(repo, Path(context.integration_worktree))
     config_digest = _digest(
         _adapter_config_payload(
             candidate_authorities=candidate_authorities,
-            readme_authority=readme_authority,
+            expected_readme_authority_digest=expected_readme_authority_digest,
             principle_approvals=principle_approvals,
             principle_leases=principle_leases,
         )
@@ -2091,23 +2456,25 @@ def _plan_execution(
             plan_digest=raw_normalization["plan_digest"],
         )
     blockers = list(normalization.blockers)
-    l0_changed, changed_l1, readme_blockers = _readme_differences(validated)
+    _l0_changed, _changed_l1, readme_blockers = _readme_differences(validated)
     blockers.extend(readme_blockers)
-    if l0_changed and (readme_authority is None or readme_authority.root is None):
-        blockers.append(AdapterBlocker("l0-rebuild-authority-missing", "candidate L0 changes require structured routing authority", L0_PATH))
-    supplied_l1 = {item.path for item in readme_authority.l1_documents} if readme_authority else set()
-    for path in sorted(changed_l1 - supplied_l1):
-        blockers.append(AdapterBlocker("l1-rebuild-authority-missing", "candidate L1 change requires exact derived authority bytes", path))
 
     current = main.semantic
     reconcile_plans: list[harness_reconcile.GovernanceReconcilePlan] = []
     labels: list[str] = []
     snapshots: list[harness_reconcile.GovernanceSnapshot] = []
-    for index, (candidate, base, branch, binding, _candidate_event) in enumerate(validated):
+    for index, (
+        candidate,
+        _implementation_start,
+        reconciliation_base,
+        branch,
+        binding,
+        _candidate_event,
+    ) in enumerate(validated):
         label = f"candidate-{index:04d}-{candidate.iteration}-{binding.authority_digest}"
         operation = _suboperation_id(context.operation_id, label)
         semantic_candidate = _semantic_candidate(
-            base.semantic,
+            reconciliation_base.semantic,
             branch.semantic,
             source_id=f"semantic:{candidate.candidate_commit}",
         )
@@ -2115,11 +2482,12 @@ def _plan_execution(
             project_root=context.integration_worktree,
             git_common_dir=repo.common_dir,
             operation_id=operation,
-            branch_base=base.semantic,
+            branch_base=reconciliation_base.semantic,
             latest_main=current,
             branch_candidate=semantic_candidate,
             principle_approval=principle_approvals.get(candidate.candidate_evidence.evidence_digest),
             principle_lease=principle_leases.get(candidate.candidate_evidence.evidence_digest),
+            progress_allow_divergent_main_history=True,
         )
         reconcile_plans.append(reconcile_plan)
         labels.append(label)
@@ -2127,6 +2495,21 @@ def _plan_execution(
         if not reconcile_plan.blockers:
             current = _apply_previews_to_snapshot(current, reconcile_plan, source_id=f"after:{label}")
         snapshots.append(current)
+        outer_label = f"{label}-readme-outer"
+        outer_plan, outer_snapshot, outer_blockers = _plan_readme_outer_merge(
+            repo=repo,
+            operation_id=_suboperation_id(context.operation_id, outer_label),
+            candidate_ref=candidate.candidate_ref,
+            base=reconciliation_base.semantic,
+            current=current,
+            candidate=branch.semantic,
+        )
+        blockers.extend(outer_blockers)
+        if outer_plan is not None:
+            reconcile_plans.append(outer_plan)
+            labels.append(outer_label)
+            current = outer_snapshot
+            snapshots.append(current)
 
     progress_specs: tuple[TrainProgressEventSpec, ...] = ()
     if not blockers:
@@ -2209,22 +2592,47 @@ def _plan_execution(
                 )
             )
 
-    if not blockers and readme_authority is not None:
-        replacements: dict[str, bytes | None] = {}
-        if readme_authority.root is not None:
-            preview = harness_governance.preview_root_readme(
-                current.as_mapping()[L0_PATH],
-                authority=readme_authority.root,
+    derived_readme_authority: harness_readme_authority.DerivedReadmeAuthority | None = None
+    if not blockers:
+        try:
+            derived_readme_authority = harness_readme_authority.derive_train_readme_authority(
+                train_plan,
+                semantic_snapshot=current,
+                governance_context=context,
             )
-            if not preview.ready or preview.preview is None:
-                blockers.extend(AdapterBlocker(item.code, item.message, item.subject) for item in preview.blockers)
-            else:
-                replacements[L0_PATH] = preview.preview
-        for document in readme_authority.l1_documents:
-            replacements[document.path] = document.content
+            if (
+                expected_readme_authority_digest is not None
+                and derived_readme_authority.authority_digest
+                != expected_readme_authority_digest
+            ):
+                raise GovernanceAdapterError(
+                    "independently derived README authority differs from expected digest"
+                )
+            replacements = harness_readme_authority.documents_by_path(
+                derived_readme_authority
+            )
+        except (
+            harness_readme_authority.ReadmeAuthorityError,
+            GovernanceAdapterError,
+        ) as exc:
+            blockers.append(
+                AdapterBlocker(
+                    "readme-authority-derivation-blocked",
+                    str(exc),
+                    L0_PATH,
+                )
+            )
+            replacements = {}
         if not blockers and replacements:
-            desired = _snapshot_with_files(current, source_id=f"readme:{readme_authority.authority_id}", replacements=replacements)
-            operation = _suboperation_id(context.operation_id, f"readme:{readme_authority.authority_digest}")
+            desired = _snapshot_with_files(
+                current,
+                source_id=f"readme:{derived_readme_authority.authority_id}",
+                replacements=replacements,
+            )
+            operation = _suboperation_id(
+                context.operation_id,
+                f"readme:{derived_readme_authority.authority_digest}",
+            )
             readme_plan = harness_reconcile.plan_reconciliation(
                 project_root=context.integration_worktree,
                 git_common_dir=repo.common_dir,
@@ -2234,7 +2642,7 @@ def _plan_execution(
                 branch_candidate=desired,
             )
             reconcile_plans.append(readme_plan)
-            labels.append(f"readme-{readme_authority.authority_digest}")
+            labels.append(f"readme-{derived_readme_authority.authority_digest}")
             blockers.extend(AdapterBlocker(item.code, item.message, item.subject) for item in readme_plan.blockers)
             if not readme_plan.blockers:
                 current = _apply_previews_to_snapshot(current, readme_plan, source_id="after:readme")
@@ -2248,6 +2656,7 @@ def _plan_execution(
         tuple(labels),
         tuple(snapshots),
         progress_specs,
+        derived_readme_authority,
         current,
         tuple(blockers),
     )
@@ -2512,14 +2921,23 @@ class MergeTrainGovernanceAdapter:
         train_plan: harness_train.IntegrationPreparePlan,
         *,
         readme_authority: ReadmeRebuildAuthority | None = None,
+        expected_readme_authority_digest: str | None = None,
         principle_approvals: Mapping[str, harness_governance.PrincipleApproval] | None = None,
         principle_leases: Mapping[str, harness_reconcile.GlobalPrincipleLease] | None = None,
         failpoint: Failpoint | None = None,
     ) -> None:
         _validate_train_plan(train_plan)
         _validate_readme_authority(readme_authority)
+        if expected_readme_authority_digest is not None and (
+            not isinstance(expected_readme_authority_digest, str)
+            or DIGEST_RE.fullmatch(expected_readme_authority_digest) is None
+        ):
+            raise GovernanceAdapterError("expected README authority digest is invalid")
         self.train_plan = train_plan
+        # Retained only so old callers do not become a source-compatibility
+        # trap.  These caller-produced bytes are never read during derivation.
         self.readme_authority = readme_authority
+        self.expected_readme_authority_digest = expected_readme_authority_digest
         self.principle_approvals = dict(principle_approvals or {})
         self.principle_leases = dict(principle_leases or {})
         self.failpoint = failpoint
@@ -2529,6 +2947,7 @@ class MergeTrainGovernanceAdapter:
             self.train_plan,
             context,
             readme_authority=self.readme_authority,
+            expected_readme_authority_digest=self.expected_readme_authority_digest,
             principle_approvals=self.principle_approvals,
             principle_leases=self.principle_leases,
         )
@@ -2572,7 +2991,7 @@ class MergeTrainGovernanceAdapter:
             config_digest=_digest(
                 _adapter_config_payload(
                     candidate_authorities=preview.normalization.candidate_authorities,
-                    readme_authority=self.readme_authority,
+                    expected_readme_authority_digest=self.expected_readme_authority_digest,
                     principle_approvals=self.principle_approvals,
                     principle_leases=self.principle_leases,
                 )
@@ -2661,8 +3080,10 @@ class MergeTrainGovernanceAdapter:
         expected_files = preview.final_snapshot.as_mapping()
         if actual_files != expected_files:
             raise GovernanceAdapterError("applied governance files differ from semantic preview")
-        if self.readme_authority is not None:
-            evidence_ids.append(f"readme-authority:{self.readme_authority.authority_digest}")
+        if preview.readme_authority is not None:
+            evidence_ids.append(
+                f"readme-authority:{preview.readme_authority.authority_digest}"
+            )
         receipt = harness_train.build_governance_receipt(
             context,
             mode="applied",
@@ -2689,6 +3110,7 @@ def build_governance_callback(
     train_plan: harness_train.IntegrationPreparePlan,
     *,
     readme_authority: ReadmeRebuildAuthority | None = None,
+    expected_readme_authority_digest: str | None = None,
     principle_approvals: Mapping[str, harness_governance.PrincipleApproval] | None = None,
     principle_leases: Mapping[str, harness_reconcile.GlobalPrincipleLease] | None = None,
     failpoint: Failpoint | None = None,
@@ -2696,6 +3118,7 @@ def build_governance_callback(
     return MergeTrainGovernanceAdapter(
         train_plan,
         readme_authority=readme_authority,
+        expected_readme_authority_digest=expected_readme_authority_digest,
         principle_approvals=principle_approvals,
         principle_leases=principle_leases,
         failpoint=failpoint,
@@ -2707,6 +3130,7 @@ def inspect_governance_resume(
     context: harness_train.GovernanceContext,
     *,
     readme_authority: ReadmeRebuildAuthority | None = None,
+    expected_readme_authority_digest: str | None = None,
     principle_approvals: Mapping[str, harness_governance.PrincipleApproval] | None = None,
     principle_leases: Mapping[str, harness_reconcile.GlobalPrincipleLease] | None = None,
 ) -> GovernanceResumeState:
@@ -2715,6 +3139,7 @@ def inspect_governance_resume(
     return build_governance_callback(
         train_plan,
         readme_authority=readme_authority,
+        expected_readme_authority_digest=expected_readme_authority_digest,
         principle_approvals=principle_approvals,
         principle_leases=principle_leases,
     ).inspect_resume(context)
@@ -2725,6 +3150,7 @@ def resume_governance_callback(
     context: harness_train.GovernanceContext,
     *,
     readme_authority: ReadmeRebuildAuthority | None = None,
+    expected_readme_authority_digest: str | None = None,
     principle_approvals: Mapping[str, harness_governance.PrincipleApproval] | None = None,
     principle_leases: Mapping[str, harness_reconcile.GlobalPrincipleLease] | None = None,
 ) -> harness_train.GovernanceReceipt:
@@ -2733,6 +3159,7 @@ def resume_governance_callback(
     adapter = build_governance_callback(
         train_plan,
         readme_authority=readme_authority,
+        expected_readme_authority_digest=expected_readme_authority_digest,
         principle_approvals=principle_approvals,
         principle_leases=principle_leases,
     )

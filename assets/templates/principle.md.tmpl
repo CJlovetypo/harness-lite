@@ -5,6 +5,8 @@
 
 本文件保存跨迭代、长期有效且经用户明确批准的产品/项目原则。原则约束 PRD 与 SPEC；不得为了配合某次实现而无痕改写。
 
+main 上本文件的 committed bytes 与 SHA-256 是所有 Local/worktree/candidate/integration 的唯一当前原则身份。worktree 中的差异只是 proposal。
+
 ## 已批准原则
 
 尚无已批准的项目专属原则。初始化 Harness 不等于授权 Agent 代替用户发明长期取舍。
@@ -26,7 +28,8 @@
 ## 变更控制
 
 - 只有用户明确批准后才能新增、修改、废止原则或调整优先级。
-- 保留原批准语义，通过变更记录说明变化；不要无痕重写历史基线。
+- 每次变化绑定 stable change ID、精确 before/after 文本、global principle lease、批准证据和所有开放 PRD 的影响审计。
+- 保留原批准语义，通过变更记录说明变化；不要无痕重写历史基线，也不要自动 union 或按合并顺序裁决。
 
 ## 变更记录
 

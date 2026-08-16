@@ -15,7 +15,7 @@ this module does not pretend that the current preview reconciler can apply it.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import base64
 import contextlib
 import contextvars
@@ -25,9 +25,10 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
-from typing import TYPE_CHECKING, Callable, Iterable, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 import uuid
 
 try:
@@ -94,9 +95,9 @@ TRAIN_SCHEMA = "harness-lite.train/v1"
 AUTHORITY_SCHEMA = "harness-lite.authority-receipt/v1"
 REGISTER_PLAN_SCHEMA = "harness-lite.candidate-register-plan/v1"
 SEAL_PLAN_SCHEMA = "harness-lite.candidate-seal-plan/v1"
-REGISTER_RESULT_SCHEMA = "harness-lite.candidate-registration/v1"
+REGISTER_RESULT_SCHEMA = "harness-lite.candidate-registration/v2"
 CANDIDATE_VERIFICATION_RECEIPT_SCHEMA = "harness-lite.candidate-verification-receipt/v1"
-CANDIDATE_EVIDENCE_METADATA_SCHEMA = "harness-lite.candidate-evidence-metadata/v1"
+CANDIDATE_EVIDENCE_METADATA_SCHEMA = "harness-lite.candidate-evidence-metadata/v2"
 PREPARE_PLAN_SCHEMA = "harness-lite.integration-prepare-plan/v1"
 GOVERNANCE_RECEIPT_SCHEMA = "harness-lite.governance-apply-receipt/v1"
 VERIFICATION_RECEIPT_SCHEMA = "harness-lite.verification-receipt/v1"
@@ -109,7 +110,7 @@ CLEANUP_RESULT_SCHEMA = "harness-lite.integration-cleanup-result/v1"
 CONFIRM_TOKEN_SCHEMA = "harness-lite.confirm-token/v1"
 JOURNAL_SCHEMA = "harness-lite.train-journal/v1"
 LEASE_SCHEMA = "harness-lite.main-integration-lease/v1"
-WORKSPACE_GUARD_SCHEMA = "harness-lite.workspace-guard-receipt/v1"
+WORKSPACE_GUARD_SCHEMA = "harness-lite.workspace-guard-receipt/v3"
 PRINCIPLE_GATE_BINDING_SCHEMA = "harness-lite.principle-gate-binding/v1"
 
 OID_RE = re.compile(r"[0-9a-f]{40,64}")
@@ -162,6 +163,48 @@ class Repository:
     git_exec_path: str
     root: Path
     common_dir: Path
+
+
+@dataclass
+class AuthorityValidationContext:
+    """One immutable authority snapshot shared by a single read derivation.
+
+    The context is process-local and cannot be supplied by a caller.  Cached
+    values are scoped to the exact Git-ref and operational-registry snapshot
+    captured on entry.  The context manager rechecks both snapshots before a
+    successful exit, so a concurrent mutation fails the whole derivation
+    instead of allowing a cached receipt to escape as current authority.
+    """
+
+    repo: Repository
+    refs: dict[str, str]
+    ref_object_types: dict[str, str]
+    refs_snapshot: bytes
+    operational_snapshot: tuple[tuple[str, str, int, str], ...]
+    snapshot_digest: str
+    candidate_cache: dict[
+        tuple[str, str, str, str],
+        tuple["RegisteredCandidate | None", tuple[Blocker, ...]],
+    ] = field(default_factory=dict)
+    object_type_cache: dict[str, str | None] = field(default_factory=dict)
+    commit_tree_cache: dict[str, str] = field(default_factory=dict)
+
+    def assert_unchanged(self) -> None:
+        refs, _objects, raw = _authority_ref_snapshot(self.repo)
+        if raw != self.refs_snapshot or refs != self.refs:
+            raise TrainError(
+                "authority validation snapshot drifted while deriving: Git refs changed"
+            )
+        operational = _authority_operational_snapshot(self.repo)
+        if operational != self.operational_snapshot:
+            raise TrainError(
+                "authority validation snapshot drifted while deriving: operational evidence changed"
+            )
+
+
+_AUTHORITY_VALIDATION_CONTEXT: contextvars.ContextVar[
+    AuthorityValidationContext | None
+] = contextvars.ContextVar("harness_train_authority_validation_context", default=None)
 
 
 @dataclass(frozen=True)
@@ -244,6 +287,11 @@ class WorkspaceGuardReceipt:
     worktree_path: str
     branch_ref: str
     base_commit: str
+    implementation_ref: str
+    implementation_commit: str
+    reconciliation_ref: str
+    reconciliation_commit: str
+    dependency_refresh_generation: int
     dependency_bindings: tuple[DependencyCandidateBinding, ...]
     dependency_bindings_digest: str
     lease_digest: str
@@ -308,9 +356,11 @@ class RegisteredCandidate:
     candidate_tree: str
     base_ref: str
     base_commit: str
+    implementation_commit: str
     principle_sha256: str
     principle_gate_binding: PrincipleGateBinding
     authority_evidence_digest: str
+    workspace_guard: WorkspaceGuardReceipt
     workspace_guard_digest: str
     depends_on: tuple[str, ...]
     dependency_bindings: tuple[DependencyCandidateBinding, ...]
@@ -645,6 +695,10 @@ class MainAdvanceResult:
     journal_path: str
     cleanup_worktree: str
     idempotent: bool
+    final_acceptance_digest: str | None = None
+    final_acceptance_evidence_blob: str | None = None
+    final_acceptance_evidence_ref: str | None = None
+    final_acceptance_iteration_evidence_refs: tuple[str, ...] = ()
     pushed: bool = False
 
     def as_dict(self) -> dict[str, object]:
@@ -821,7 +875,7 @@ def _git_without_hooks(
         )
 
 
-def open_repository(project_root: str | Path) -> Repository:
+def _open_repository_uncached(project_root: str | Path) -> Repository:
     git = shutil.which("git")
     if not git:
         raise TrainError("git is required")
@@ -864,6 +918,157 @@ def open_repository(project_root: str | Path) -> Repository:
     ):
         raise TrainError("workspace coordinator and Git repository identities disagree")
     return Repository(git=git, git_exec_path=git_exec_path, root=actual, common_dir=common)
+
+
+def open_repository(project_root: str | Path) -> Repository:
+    """Open the canonical repository, reusing only the active immutable context."""
+
+    supplied = Path(project_root).resolve()
+    context = _AUTHORITY_VALIDATION_CONTEXT.get()
+    if context is not None:
+        if os.path.normcase(str(supplied)) != os.path.normcase(str(context.repo.root)):
+            raise TrainError(
+                "authority validation context cannot be reused for another repository"
+            )
+        return context.repo
+    return _open_repository_uncached(supplied)
+
+
+def _authority_ref_snapshot(
+    repo: Repository,
+) -> tuple[dict[str, str], dict[str, str], bytes]:
+    """Read every ref/object identity in one deterministic Git subprocess."""
+
+    result = _git(
+        repo,
+        [
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname)%00%(objectname)%00%(objecttype)",
+        ],
+    )
+    raw = result.stdout
+    refs: dict[str, str] = {}
+    object_types: dict[str, str] = {}
+    for line in raw.splitlines():
+        parts = line.split(b"\0")
+        if len(parts) != 3:
+            raise TrainError("authority ref snapshot is malformed")
+        try:
+            reference = parts[0].decode("utf-8", errors="strict")
+            oid = parts[1].decode("ascii", errors="strict")
+            object_type = parts[2].decode("ascii", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise TrainError("authority ref snapshot contains invalid text") from exc
+        _validate_ref(reference, "authority snapshot ref")
+        _validate_oid(oid, f"authority snapshot object for {reference}")
+        if reference in refs:
+            raise TrainError(f"authority ref snapshot repeats {reference}")
+        refs[reference] = oid
+        previous = object_types.get(oid)
+        if previous is not None and previous != object_type:
+            raise TrainError(f"authority object type is inconsistent for {oid}")
+        object_types[oid] = object_type
+    return refs, object_types, raw
+
+
+def _authority_operational_snapshot(
+    repo: Repository,
+) -> tuple[tuple[str, str, int, str], ...]:
+    """Digest local operational evidence that public candidate gates consume."""
+
+    registry = repo.common_dir / "project-harness"
+    if not registry.exists():
+        return ()
+    if registry.is_symlink() or not registry.is_dir():
+        raise TrainError("authority operational registry is not a regular directory")
+    values: list[tuple[str, str, int, str]] = []
+    try:
+        for current, directories, files in os.walk(registry, followlinks=False):
+            directories.sort()
+            files.sort()
+            current_path = Path(current)
+            retained: list[str] = []
+            for name in directories:
+                path = current_path / name
+                relative = path.relative_to(registry).as_posix()
+                # OS lock files/directories coordinate concurrent writers but
+                # are not product authority.  On Windows, reading the byte
+                # locked file held by the calling lifecycle operation raises
+                # PermissionError and makes the operation reject itself.
+                # Exclude these ephemeral paths while continuing to bind all
+                # journals, leases, manifests, and evidence content.
+                if name == "locks" or name.endswith(".lock"):
+                    continue
+                metadata = path.lstat()
+                if stat.S_ISLNK(metadata.st_mode):
+                    values.append((relative, "link", metadata.st_size, os.readlink(path)))
+                elif stat.S_ISDIR(metadata.st_mode):
+                    retained.append(name)
+                else:
+                    values.append((relative, "special", metadata.st_size, ""))
+            directories[:] = retained
+            for name in files:
+                path = current_path / name
+                relative = path.relative_to(registry).as_posix()
+                if name.endswith(".lock") or "locks" in Path(relative).parts:
+                    continue
+                metadata = path.lstat()
+                if stat.S_ISLNK(metadata.st_mode):
+                    values.append((relative, "link", metadata.st_size, os.readlink(path)))
+                elif stat.S_ISREG(metadata.st_mode):
+                    raw = path.read_bytes()
+                    if len(raw) != metadata.st_size:
+                        raise TrainError(
+                            f"authority operational evidence changed while reading: {relative}"
+                        )
+                    values.append(
+                        (relative, "file", len(raw), hashlib.sha256(raw).hexdigest())
+                    )
+                else:
+                    values.append((relative, "special", metadata.st_size, ""))
+    except (OSError, ValueError) as exc:
+        raise TrainError(f"cannot snapshot authority operational evidence: {exc}") from exc
+    return tuple(sorted(values))
+
+
+@contextlib.contextmanager
+def authority_validation_context(
+    project_root: str | Path,
+) -> Iterator[AuthorityValidationContext]:
+    """Share safe read results inside one derivation and reject snapshot drift."""
+
+    supplied = Path(project_root).resolve()
+    active = _AUTHORITY_VALIDATION_CONTEXT.get()
+    if active is not None:
+        if os.path.normcase(str(supplied)) != os.path.normcase(str(active.repo.root)):
+            raise TrainError(
+                "nested authority validation belongs to another repository"
+            )
+        yield active
+        return
+
+    repo = _open_repository_uncached(supplied)
+    refs, object_types, raw_refs = _authority_ref_snapshot(repo)
+    operational = _authority_operational_snapshot(repo)
+    snapshot_digest = hashlib.sha256(
+        raw_refs + b"\0" + canonical_json(operational)
+    ).hexdigest()
+    context = AuthorityValidationContext(
+        repo=repo,
+        refs=refs,
+        ref_object_types=object_types,
+        refs_snapshot=raw_refs,
+        operational_snapshot=operational,
+        snapshot_digest=snapshot_digest,
+        object_type_cache=dict(object_types),
+    )
+    token = _AUTHORITY_VALIDATION_CONTEXT.set(context)
+    try:
+        yield context
+        context.assert_unchanged()
+    finally:
+        _AUTHORITY_VALIDATION_CONTEXT.reset(token)
 
 
 def _current_principle_audit_blockers(
@@ -1232,6 +1437,9 @@ def _assert_train_operational_path(repo: Repository, path: Path) -> None:
 
 def _resolve_ref(repo: Repository, reference: str) -> str | None:
     ref = _validate_ref(reference, "reference")
+    context = _AUTHORITY_VALIDATION_CONTEXT.get()
+    if context is not None and context.repo == repo:
+        return context.refs.get(ref)
     result = _git(repo, ["rev-parse", "--verify", "--quiet", ref], check=False)
     if result.returncode != 0 and not result.stdout.strip():
         return None
@@ -1243,15 +1451,30 @@ def _resolve_ref(repo: Repository, reference: str) -> str | None:
 
 def _commit_tree(repo: Repository, commit: str) -> str:
     oid = _validate_oid(commit, "commit")
+    context = _AUTHORITY_VALIDATION_CONTEXT.get()
+    if context is not None and context.repo == repo:
+        cached = context.commit_tree_cache.get(oid)
+        if cached is not None:
+            return cached
     result = _git(repo, ["rev-parse", f"{oid}^{{tree}}"])
-    return _validate_oid(result.stdout.decode("ascii").strip(), "commit tree")
+    tree = _validate_oid(result.stdout.decode("ascii").strip(), "commit tree")
+    if context is not None and context.repo == repo:
+        context.commit_tree_cache[oid] = tree
+    return tree
 
 
 def _object_type(repo: Repository, oid: str) -> str | None:
+    context = _AUTHORITY_VALIDATION_CONTEXT.get()
+    if context is not None and context.repo == repo and oid in context.object_type_cache:
+        return context.object_type_cache[oid]
     result = _git(repo, ["cat-file", "-t", oid], check=False)
     if result.returncode != 0:
-        return None
-    return result.stdout.decode("ascii", errors="strict").strip()
+        observed = None
+    else:
+        observed = result.stdout.decode("ascii", errors="strict").strip()
+    if context is not None and context.repo == repo:
+        context.object_type_cache[oid] = observed
+    return observed
 
 
 def _blob_at(repo: Repository, commit: str, path: str) -> tuple[str, bytes]:
@@ -1509,6 +1732,127 @@ def workspace_guard_digest(receipt: WorkspaceGuardReceipt) -> str:
     return digest(_workspace_guard_payload(receipt))
 
 
+def _workspace_guard_from_mapping(value: object) -> WorkspaceGuardReceipt:
+    required = {
+        "schema_version",
+        "iteration",
+        "owner",
+        "generation",
+        "operation_id",
+        "accepted_plan_digest",
+        "worktree_path",
+        "branch_ref",
+        "base_commit",
+        "implementation_ref",
+        "implementation_commit",
+        "reconciliation_ref",
+        "reconciliation_commit",
+        "dependency_refresh_generation",
+        "dependency_bindings",
+        "dependency_bindings_digest",
+        "lease_digest",
+        "guard_digest",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise TrainError("workspace guard receipt fields are invalid")
+    raw_bindings = value.get("dependency_bindings")
+    if not isinstance(raw_bindings, Sequence) or isinstance(raw_bindings, (str, bytes)):
+        raise TrainError("workspace guard dependency bindings are invalid")
+    bindings = _normalize_dependency_bindings(
+        raw_bindings,  # type: ignore[arg-type]
+        label="workspace guard dependency bindings",
+    )
+    generation = value.get("generation")
+    refresh_generation = value.get("dependency_refresh_generation")
+    worktree_path = value.get("worktree_path")
+    owner = value.get("owner")
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+        or not isinstance(refresh_generation, int)
+        or isinstance(refresh_generation, bool)
+        or refresh_generation < 0
+        or not isinstance(worktree_path, str)
+        or not Path(worktree_path).is_absolute()
+        or not isinstance(owner, str)
+        or not owner.strip()
+    ):
+        raise TrainError("workspace guard scalar identity is invalid")
+    iteration = _validate_iteration(str(value["iteration"]))
+    base_commit = _validate_oid(str(value["base_commit"]), "workspace guard base_commit")
+    implementation_commit = _validate_oid(
+        str(value["implementation_commit"]),
+        "workspace guard implementation_commit",
+    )
+    implementation_ref = _validate_ref(
+        str(value["implementation_ref"]),
+        "workspace guard implementation_ref",
+    )
+    reconciliation_commit = _validate_oid(
+        str(value["reconciliation_commit"]),
+        "workspace guard reconciliation_commit",
+    )
+    reconciliation_ref = _validate_ref(
+        str(value["reconciliation_ref"]),
+        "workspace guard reconciliation_ref",
+    )
+    branch_ref = _validate_ref(str(value["branch_ref"]), "workspace guard branch_ref")
+    if not branch_ref.startswith("refs/heads/"):
+        raise TrainError("workspace guard branch_ref is not a branch")
+    if not (
+        implementation_ref.startswith("refs/heads/")
+        or implementation_ref.startswith("refs/project-harness/v2/iterations/")
+    ):
+        raise TrainError("workspace guard implementation_ref is invalid")
+    bindings_digest = _dependency_bindings_digest(bindings)
+    if value.get("dependency_bindings_digest") != bindings_digest:
+        raise TrainError("workspace guard dependency binding digest differs")
+    if bindings:
+        last = bindings[-1]
+        if refresh_generation == 0:
+            if (
+                implementation_ref != last.candidate_ref
+                or implementation_commit != last.candidate_commit
+            ):
+                raise TrainError("workspace guard implementation start differs from its dependency baseline")
+    elif implementation_ref != "refs/heads/main":
+        raise TrainError("independent workspace guard implementation ref is not main")
+    if refresh_generation == 0:
+        if reconciliation_ref != implementation_ref or reconciliation_commit != implementation_commit:
+            raise TrainError("unrefreshed workspace guard reconciliation baseline differs")
+    elif reconciliation_ref != branch_ref:
+        raise TrainError("refreshed workspace guard reconciliation ref differs from its branch")
+    provisional = WorkspaceGuardReceipt(
+        schema_version=str(value["schema_version"]),
+        iteration=iteration,
+        owner=owner.strip(),
+        generation=generation,
+        operation_id=_validate_operation(str(value["operation_id"])),
+        accepted_plan_digest=_validate_digest(
+            str(value["accepted_plan_digest"]),
+            "workspace guard accepted_plan_digest",
+        ),
+        worktree_path=str(Path(worktree_path).resolve(strict=False)),
+        branch_ref=branch_ref,
+        base_commit=base_commit,
+        implementation_ref=implementation_ref,
+        implementation_commit=implementation_commit,
+        reconciliation_ref=reconciliation_ref,
+        reconciliation_commit=reconciliation_commit,
+        dependency_refresh_generation=refresh_generation,
+        dependency_bindings=bindings,
+        dependency_bindings_digest=bindings_digest,
+        lease_digest=_validate_digest(str(value["lease_digest"]), "workspace guard lease_digest"),
+        guard_digest=_validate_digest(str(value["guard_digest"]), "workspace guard guard_digest"),
+    )
+    if provisional.schema_version != WORKSPACE_GUARD_SCHEMA:
+        raise TrainError("workspace guard schema is unsupported")
+    if provisional.guard_digest != workspace_guard_digest(provisional):
+        raise TrainError("workspace guard receipt digest differs")
+    return provisional
+
+
 def _derive_workspace_guard(
     repo: Repository,
     *,
@@ -1578,6 +1922,30 @@ def _derive_workspace_guard(
                 "writer lease dependency binding digest differs",
             ),
         )
+    implementation_commit = str(lease["implementation_commit"])
+    if _object_type(repo, implementation_commit) != "commit" or not _is_ancestor(
+        repo,
+        base_commit,
+        implementation_commit,
+    ):
+        return None, (
+            Blocker(
+                "workspace-guard-implementation-start",
+                "writer lease implementation start is not a commit descended from the immutable allocation base",
+            ),
+        )
+    reconciliation_commit = str(lease["reconciliation_commit"])
+    if _object_type(repo, reconciliation_commit) != "commit" or not _is_ancestor(
+        repo,
+        implementation_commit,
+        reconciliation_commit,
+    ):
+        return None, (
+            Blocker(
+                "workspace-guard-reconciliation-base",
+                "writer lease reconciliation baseline is not a commit descended from its implementation baseline",
+            ),
+        )
     provisional = WorkspaceGuardReceipt(
         schema_version=WORKSPACE_GUARD_SCHEMA,
         iteration=iteration,
@@ -1588,6 +1956,11 @@ def _derive_workspace_guard(
         worktree_path=str(worktree_path.resolve()),
         branch_ref=branch_ref,
         base_commit=base_commit,
+        implementation_ref=str(lease["implementation_ref"]),
+        implementation_commit=implementation_commit,
+        reconciliation_ref=str(lease["reconciliation_ref"]),
+        reconciliation_commit=reconciliation_commit,
+        dependency_refresh_generation=int(lease["dependency_refresh_generation"]),
         dependency_bindings=dependency_bindings,
         dependency_bindings_digest=dependency_digest,
         lease_digest=digest(lease),
@@ -2218,10 +2591,6 @@ def plan_register_candidate(
     blockers.extend(_feature_worktree_gate(repo, resolved_feature_worktree, feature_commit))
     if not _is_ancestor(repo, base_commit, feature_commit):
         blockers.append(Blocker("candidate-base-not-ancestor", "immutable base is not an ancestor of candidate"))
-    included_paths = _diff_paths(repo, base_commit, feature_commit)
-    if not included_paths:
-        blockers.append(Blocker("candidate-empty", "candidate has no committed change from its base"))
-
     principle_blob, principle_raw = _blob_at(repo, main_commit, principle)
     principle_sha = hashlib.sha256(principle_raw).hexdigest()
     principle_gate_binding, principle_gate_blockers = (
@@ -2263,10 +2632,27 @@ def plan_register_candidate(
             worktree_path=str(resolved_feature_worktree),
             branch_ref=feature,
             base_commit=base_commit,
+            implementation_ref="refs/heads/main",
+            implementation_commit=base_commit,
+            reconciliation_ref="refs/heads/main",
+            reconciliation_commit=base_commit,
+            dependency_refresh_generation=0,
             dependency_bindings=(),
             dependency_bindings_digest=_dependency_bindings_digest(()),
             lease_digest="0" * 64,
             guard_digest="0" * 64,
+        )
+    included_paths = _diff_paths(
+        repo,
+        workspace_guard.implementation_commit,
+        feature_commit,
+    )
+    if not included_paths:
+        blockers.append(
+            Blocker(
+                "candidate-empty",
+                "candidate has no committed change from its implementation start",
+            )
         )
     dependency_bindings = workspace_guard.dependency_bindings
     dependency_bindings_digest = workspace_guard.dependency_bindings_digest
@@ -3106,7 +3492,11 @@ def _candidate_evidence_material(
             candidate_commit=plan.seal_commit,
             candidate_tree=plan.seal_tree,
             principle_sha256=registration.principle_sha256,
-            included_paths=_diff_paths(repo, registration.candidate.base_commit, plan.seal_commit),
+            included_paths=_diff_paths(
+                repo,
+                registration.workspace_guard.implementation_commit,
+                plan.seal_commit,
+            ),
             acceptance_ids=registration.authority.acceptance_ids,
             acceptance_evidence=tuple(acceptance_evidence),
             verification_ids=(
@@ -3153,7 +3543,9 @@ def _candidate_evidence_material(
             _decode_exact_b64(plan.progress_event_bytes_b64, "progress event bytes")
         ).hexdigest(),
         "authority_evidence_digest": registration.authority.evidence_digest,
+        "workspace_guard": registration.workspace_guard.as_dict(),
         "workspace_guard_digest": registration.workspace_guard.guard_digest,
+        "implementation_commit": registration.workspace_guard.implementation_commit,
         "principle_gate_binding": plan.principle_gate_binding.as_dict(),
         "depends_on": list(registration.authority.depends_on),
         "dependency_bindings": [
@@ -3212,9 +3604,11 @@ def _registered_from_material(
         candidate_tree=plan.seal_tree,
         base_ref=registration.base_ref,
         base_commit=registration.candidate.base_commit,
+        implementation_commit=registration.workspace_guard.implementation_commit,
         principle_sha256=registration.principle_sha256,
         principle_gate_binding=plan.principle_gate_binding,
         authority_evidence_digest=registration.authority.evidence_digest,
+        workspace_guard=registration.workspace_guard,
         workspace_guard_digest=registration.workspace_guard.guard_digest,
         depends_on=registration.authority.depends_on,
         dependency_bindings=registration.dependency_bindings,
@@ -3445,6 +3839,7 @@ def apply_register_candidate(
             "generation": registration.generation,
             "base_ref": registration.base_ref,
             "base_commit": registration.candidate.base_commit,
+            "implementation_commit": registration.workspace_guard.implementation_commit,
             "principle_sha256": registration.principle_sha256,
             "principle_gate_binding": plan.principle_gate_binding.as_dict(),
             "authority_evidence_digest": registration.authority.evidence_digest,
@@ -3644,6 +4039,31 @@ def _registered_candidate_gate(
         blockers.append(Blocker("registered-candidate-digest", "registered candidate receipt was changed"))
     if os.path.normcase(candidate.project_root) != os.path.normcase(str(repo.root)):
         blockers.append(Blocker("registered-candidate-project", "candidate belongs to another repository"))
+    try:
+        parsed_workspace_guard = _workspace_guard_from_mapping(candidate.workspace_guard.as_dict())
+    except TrainError as exc:
+        blockers.append(Blocker("registered-candidate-workspace-guard", str(exc)))
+    else:
+        if parsed_workspace_guard != candidate.workspace_guard:
+            blockers.append(
+                Blocker(
+                    "registered-candidate-workspace-guard-identity",
+                    "candidate workspace guard is not canonical",
+                )
+            )
+        if (
+            candidate.workspace_guard_digest != candidate.workspace_guard.guard_digest
+            or candidate.workspace_guard.iteration != candidate.iteration
+            or candidate.workspace_guard.base_commit != candidate.base_commit
+            or candidate.workspace_guard.implementation_commit
+            != candidate.implementation_commit
+        ):
+            blockers.append(
+                Blocker(
+                    "registered-candidate-workspace-guard-binding",
+                    "candidate workspace guard differs from its public candidate identity",
+                )
+            )
     principle_binding_blockers = _principle_gate_binding_gate(
         candidate.principle_gate_binding
     )
@@ -3730,6 +4150,32 @@ def _registered_candidate_gate(
                     blockers.append(Blocker("registered-candidate-evidence-candidate-ref", "metadata candidate ref differs"))
                 if parsed_metadata.get("candidate_evidence_ref") != candidate.candidate_evidence_ref:
                     blockers.append(Blocker("registered-candidate-evidence-ref", "metadata evidence ref differs"))
+                if parsed_metadata.get("implementation_commit") != candidate.implementation_commit:
+                    blockers.append(
+                        Blocker(
+                            "registered-candidate-evidence-implementation-start",
+                            "metadata implementation start differs",
+                        )
+                    )
+                try:
+                    metadata_workspace_guard = _workspace_guard_from_mapping(
+                        parsed_metadata.get("workspace_guard")
+                    )
+                except TrainError as exc:
+                    blockers.append(
+                        Blocker(
+                            "registered-candidate-evidence-workspace-guard",
+                            str(exc),
+                        )
+                    )
+                else:
+                    if metadata_workspace_guard != candidate.workspace_guard:
+                        blockers.append(
+                            Blocker(
+                                "registered-candidate-evidence-workspace-guard",
+                                "metadata workspace guard differs",
+                            )
+                        )
                 if parsed_metadata.get("principle_gate_binding") != (
                     candidate.principle_gate_binding.as_dict()
                 ):
@@ -3769,6 +4215,52 @@ def _registered_candidate_gate(
     base = _resolve_ref(repo, candidate.base_ref)
     if base != candidate.base_commit:
         blockers.append(Blocker("registered-candidate-base-drift", "candidate immutable base ref changed"))
+    if _object_type(repo, candidate.implementation_commit) != "commit":
+        blockers.append(
+            Blocker(
+                "registered-candidate-implementation-start-object",
+                "candidate implementation start is not a commit",
+            )
+        )
+    else:
+        if not _is_ancestor(repo, candidate.base_commit, candidate.implementation_commit):
+            blockers.append(
+                Blocker(
+                    "registered-candidate-implementation-start-base",
+                    "candidate implementation start is not descended from its immutable allocation base",
+                )
+            )
+        if not _is_ancestor(repo, candidate.implementation_commit, candidate.pre_seal_commit):
+            blockers.append(
+                Blocker(
+                    "registered-candidate-implementation-start-ancestry",
+                    "candidate pre-seal commit is not descended from its implementation start",
+                )
+            )
+        expected_included_paths = _diff_paths(
+            repo,
+            candidate.implementation_commit,
+            candidate.candidate_commit,
+        )
+        if candidate.candidate_evidence.included_paths != expected_included_paths:
+            blockers.append(
+                Blocker(
+                    "registered-candidate-included-paths",
+                    "candidate included paths differ from the exact implementation-start delta",
+                )
+            )
+    reconciliation_commit = candidate.workspace_guard.reconciliation_commit
+    if _object_type(repo, reconciliation_commit) != "commit" or not _is_ancestor(
+        repo,
+        candidate.implementation_commit,
+        reconciliation_commit,
+    ) or not _is_ancestor(repo, reconciliation_commit, candidate.pre_seal_commit):
+        blockers.append(
+            Blocker(
+                "registered-candidate-reconciliation-base",
+                "candidate reconciliation baseline is not an exact commit between its implementation baseline and pre-seal commit",
+            )
+        )
     gate = candidate_freshness_gate(
         candidate.candidate_evidence,
         current_base_commit=base or candidate.base_commit,
@@ -3842,6 +4334,20 @@ def _registered_candidate_gate(
     candidate_journal_path = Path(candidate.journal_path)
     _assert_train_operational_path(repo, candidate_journal_path)
     journal = _read_json(candidate_journal_path, repo)
+    try:
+        journal_workspace_guard = _workspace_guard_from_mapping(
+            journal.get("workspace_guard") if isinstance(journal, Mapping) else None
+        )
+    except TrainError:
+        journal_workspace_guard = None
+    try:
+        evidence_workspace_guard = _workspace_guard_from_mapping(
+            evidence_metadata.get("workspace_guard")
+            if isinstance(evidence_metadata, Mapping)
+            else None
+        )
+    except TrainError:
+        evidence_workspace_guard = None
     if (
         journal is None
         or journal.get("schema_version") != JOURNAL_SCHEMA
@@ -3866,6 +4372,8 @@ def _registered_candidate_gate(
         or evidence_metadata.get("generation") != candidate.generation
         or evidence_metadata.get("authority_evidence_digest") != candidate.authority_evidence_digest
         or evidence_metadata.get("workspace_guard_digest") != candidate.workspace_guard_digest
+        or evidence_workspace_guard != candidate.workspace_guard
+        or evidence_metadata.get("implementation_commit") != candidate.implementation_commit
         or evidence_metadata.get("principle_gate_binding")
         != candidate.principle_gate_binding.as_dict()
         or evidence_metadata.get("depends_on") != list(candidate.depends_on)
@@ -3880,6 +4388,8 @@ def _registered_candidate_gate(
         != [item.as_dict() for item in candidate.dependency_bindings]
         or journal.get("dependency_bindings_digest")
         != candidate.dependency_bindings_digest
+        or journal.get("implementation_commit") != candidate.implementation_commit
+        or journal_workspace_guard != candidate.workspace_guard
         or journal.get("principle_gate_binding")
         != candidate.principle_gate_binding.as_dict()
     ):
@@ -3979,6 +4489,29 @@ def _load_registered_candidate_impl(
         raise TrainError(f"candidate evidence verification receipts are missing: {evidence_ref}")
     receipts = tuple(_candidate_receipt_from_dict(item) for item in receipts_raw)
     candidate_evidence = _candidate_evidence_from_dict(metadata.get("candidate_evidence"))
+    implementation_commit = metadata.get("implementation_commit")
+    if (
+        not isinstance(implementation_commit, str)
+        or OID_RE.fullmatch(implementation_commit) is None
+    ):
+        raise TrainError(
+            f"candidate evidence implementation start is invalid: {evidence_ref}"
+        )
+    try:
+        workspace_guard = _workspace_guard_from_mapping(metadata.get("workspace_guard"))
+    except TrainError as exc:
+        raise TrainError(
+            f"candidate evidence workspace guard is invalid: {evidence_ref}: {exc}"
+        ) from exc
+    if (
+        workspace_guard.iteration != number
+        or workspace_guard.base_commit != candidate_evidence.base_commit
+        or workspace_guard.implementation_commit != implementation_commit
+        or metadata.get("workspace_guard_digest") != workspace_guard.guard_digest
+    ):
+        raise TrainError(
+            f"candidate evidence workspace guard identity differs: {evidence_ref}"
+        )
     principle_gate_binding = _principle_gate_binding_from_dict(
         metadata.get("principle_gate_binding")
     )
@@ -4033,9 +4566,11 @@ def _load_registered_candidate_impl(
         candidate_tree=str(metadata.get("seal_tree", "")),
         base_ref=str(metadata.get("base_ref", "")),
         base_commit=candidate_evidence.base_commit,
+        implementation_commit=implementation_commit,
         principle_sha256=candidate_evidence.principle_sha256,
         principle_gate_binding=principle_gate_binding,
         authority_evidence_digest=str(metadata.get("authority_evidence_digest", "")),
+        workspace_guard=workspace_guard,
         workspace_guard_digest=str(metadata.get("workspace_guard_digest", "")),
         depends_on=depends_on,
         dependency_bindings=dependency_bindings,
@@ -4072,6 +4607,10 @@ def load_registered_candidate(
 
     number = _validate_iteration(iteration)
     gen = _validate_generation(generation)
+    principle_sha = _validate_digest(
+        current_principle_sha256,
+        "current_principle_sha256",
+    )
     key = (number, gen)
     stack = _CANDIDATE_LOAD_STACK.get()
     if key in stack:
@@ -4081,14 +4620,35 @@ def load_registered_candidate(
                 f"candidate dependency evidence is cyclic: PRD-{number}/{gen}",
             ),
         )
+    validation = _AUTHORITY_VALIDATION_CONTEXT.get()
+    cache_key = (
+        validation.snapshot_digest,
+        number,
+        gen,
+        principle_sha,
+    ) if validation is not None else None
+    if validation is not None:
+        supplied = Path(project_root).resolve()
+        if os.path.normcase(str(supplied)) != os.path.normcase(
+            str(validation.repo.root)
+        ):
+            raise TrainError(
+                "authority validation candidate load belongs to another repository"
+            )
+        cached = validation.candidate_cache.get(cache_key)
+        if cached is not None:
+            return cached
     token = _CANDIDATE_LOAD_STACK.set((*stack, key))
     try:
-        return _load_registered_candidate_impl(
+        result = _load_registered_candidate_impl(
             project_root,
             iteration=number,
             generation=gen,
-            current_principle_sha256=current_principle_sha256,
+            current_principle_sha256=principle_sha,
         )
+        if validation is not None and cache_key is not None:
+            validation.candidate_cache[cache_key] = result
+        return result
     finally:
         _CANDIDATE_LOAD_STACK.reset(token)
 
@@ -5750,25 +6310,6 @@ def finalize_integration_evidence(
     return replace(result, integrated_candidate=integrated, blockers=())
 
 
-def _commit_result_identity_digest(result: IntegrationCommitResult) -> str:
-    evidence = result.integrated_candidate
-    return digest(
-        {
-            "schema_version": result.schema_version,
-            "operation_id": result.operation_id,
-            "project_root": result.project_root,
-            "integration_worktree": result.integration_worktree,
-            "generation": result.generation,
-            "integrated_commit": result.integrated_commit,
-            "integrated_tree": result.integrated_tree,
-            "commit_plan_digest": result.commit_plan.commit_plan_digest,
-            "commit_confirmation_token_digest": result.commit_confirmation_token.token_digest,
-            "integrated_evidence_digest": evidence.evidence_digest if evidence else None,
-            "blockers": [item.as_dict() for item in result.blockers],
-        }
-    )
-
-
 def _ref_checked_out(repo: Repository, reference: str) -> bool:
     raw = _git(repo, ["worktree", "list", "--porcelain"]).stdout.decode("utf-8", errors="strict")
     current_branch: str | None = None
@@ -5848,6 +6389,14 @@ def _integrated_evidence_registry_module():
         from . import harness_integrated_evidence as registry
     except ImportError:  # pragma: no cover - direct execution
         import harness_integrated_evidence as registry
+    return registry
+
+
+def _final_acceptance_registry_module():
+    try:
+        from . import harness_final_acceptance as registry
+    except ImportError:  # pragma: no cover - direct execution
+        import harness_final_acceptance as registry
     return registry
 
 
@@ -5967,11 +6516,6 @@ def plan_main_advance(
             if old is not None:
                 blockers.append(Blocker("main-advance-target-ref-exists", reference))
             updates.append((reference, None, envelope.integrated_commit))
-        final_evidence_ref = registry.iteration_final_evidence_ref(iteration)
-        old_final_evidence = _resolve_ref(repo, final_evidence_ref)
-        if old_final_evidence is not None:
-            blockers.append(Blocker("main-advance-target-ref-exists", final_evidence_ref))
-        updates.append((final_evidence_ref, None, registered_evidence.evidence_blob))
     gate = main_advance_gate(
         evidence,
         current_main=envelope.target_main,
@@ -6128,27 +6672,6 @@ def _public_integrated_evidence_blockers(
     return tuple(dict.fromkeys(values))
 
 
-def _apply_ref_transaction(repo: Repository, plan: MainAdvancePlan) -> None:
-    lines = ["start"]
-    for reference, oid in plan.source_ref_bindings:
-        lines.append(f"verify {reference} {oid}")
-    for reference, old, new in plan.ref_updates:
-        if old is None:
-            lines.append(f"create {reference} {new}")
-        else:
-            lines.append(f"update {reference} {new} {old}")
-    lines.extend(("prepare", "commit", ""))
-    result = _git(
-        repo,
-        ["update-ref", "--stdin"],
-        input_bytes="\n".join(lines).encode("ascii"),
-        check=False,
-    )
-    if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise TrainError(f"main/ref CAS transaction failed: {detail}")
-
-
 def apply_main_advance(
     plan: MainAdvancePlan,
     *,
@@ -6157,10 +6680,12 @@ def apply_main_advance(
     confirmation_token: ConfirmationToken,
     failpoint: Failpoint | None = None,
 ) -> MainAdvanceResult:
-    """Atomically advance main and per-iteration integrated/final refs.
+    """Atomically publish final acceptance and advance all accepted refs.
 
-    The exact integrated evidence acceptance and the independent main-advance
-    confirmation token are both mandatory.  No remote is contacted.
+    The final-acceptance registry writes a new canonical evidence blob that
+    binds the user's exact confirmation.  Its operation/per-iteration refs,
+    main, and every ``integrated``/``final`` ref share one CAS transaction.
+    No remote is contacted.
     """
 
     blockers = list(_advance_plan_gate(plan))
@@ -6186,6 +6711,36 @@ def apply_main_advance(
             "main advance public evidence changed: "
             + "; ".join(item.code for item in evidence_blockers)
         )
+    integrated_registry = _integrated_evidence_registry_module()
+    try:
+        registered_integrated, integrated_load_blockers = (
+            integrated_registry.load_registered_integrated_evidence(
+                repo.root,
+                operation_id=plan.operation_id,
+            )
+        )
+    except integrated_registry.IntegratedEvidenceError as exc:
+        raise TrainError(f"main advance cannot load integrated evidence: {exc}") from exc
+    if registered_integrated is None or integrated_load_blockers:
+        raise TrainError(
+            "main advance canonical integrated evidence is unavailable: "
+            + "; ".join(item.code for item in integrated_load_blockers)
+        )
+    final_registry = _final_acceptance_registry_module()
+    try:
+        final_plan = final_registry.plan_final_acceptance(
+            repo.root,
+            main_plan=plan,
+            integrated=registered_integrated,
+            confirmation=confirmation_token,
+        )
+    except final_registry.FinalAcceptanceError as exc:
+        raise TrainError(f"main advance final acceptance plan failed: {exc}") from exc
+    if final_plan.blockers:
+        raise TrainError(
+            "main advance final acceptance is blocked: "
+            + "; ".join(item.code for item in final_plan.blockers)
+        )
     if _ref_checked_out(repo, plan.main_ref):
         raise TrainError("main ref became checked out after main advance plan")
     current_releases, release_blockers = _local_main_release_gate(repo)
@@ -6198,30 +6753,93 @@ def apply_main_advance(
             journal.get("schema_version") != JOURNAL_SCHEMA
             or journal.get("kind") != "main-advance"
             or journal.get("operation_id") != plan.operation_id
-            or journal.get("plan_digest") != plan.plan_digest
         ):
             raise TrainError("main advance journal identity is invalid")
-        if _all_ref_updates_applied(repo, plan):
-            if journal.get("status") != "complete":
-                journal["status"] = "complete"
-                _replace_json(journal_path, journal, repo)
-            lease_path = _lease_path(repo)
-            lease = _read_json(lease_path, repo)
-            if lease is not None and lease.get("operation_id") == plan.operation_id:
-                lease_path.unlink(missing_ok=True)
-            return MainAdvanceResult(
-                schema_version=ADVANCE_RESULT_SCHEMA,
-                operation_id=plan.operation_id,
-                project_root=plan.project_root,
-                integration_worktree=plan.integration_worktree,
-                main_ref=plan.main_ref,
-                previous_main=plan.expected_main,
-                current_main=plan.integrated_commit,
-                updated_refs=tuple(item[0] for item in plan.ref_updates),
-                journal_path=str(journal_path),
-                cleanup_worktree="pending-explicit-cleanup",
-                idempotent=True,
-            )
+        journal_status = journal.get("status")
+        if journal_status not in {"planned", "complete"}:
+            raise TrainError("main advance journal status is invalid")
+        if journal_status == "complete" and (
+            journal.get("plan_digest") != plan.plan_digest
+            or journal.get("final_acceptance_plan_digest") != final_plan.plan_digest
+        ):
+            raise TrainError("main advance complete journal identity is invalid")
+    try:
+        existing_final, final_load_blockers = final_registry.load_registered_final_acceptance(
+            repo.root,
+            operation_id=plan.operation_id,
+        )
+    except final_registry.FinalAcceptanceError as exc:
+        raise TrainError(f"main advance cannot load final acceptance: {exc}") from exc
+    exact_final = (
+        existing_final is not None
+        and not final_load_blockers
+        and existing_final.metadata.metadata_digest == final_plan.metadata.metadata_digest
+        and existing_final.evidence_blob == final_plan.metadata_blob
+        and _all_ref_updates_applied(repo, plan)
+    )
+    if exact_final and existing_final is not None:
+        if journal is None or journal.get("status") != "complete":
+            journal = {
+                "schema_version": JOURNAL_SCHEMA,
+                "kind": "main-advance",
+                "operation_id": plan.operation_id,
+                "plan_digest": plan.plan_digest,
+                "accepted_plan_digest": accepted_plan_digest,
+                "accepted_integrated_evidence_digest": accepted_integrated_evidence_digest,
+                "confirmation_id": confirmation_token.authorization_id,
+                "confirmation_token_digest": confirmation_token.token_digest,
+                "expected_main": plan.expected_main,
+                "integrated_commit": plan.integrated_commit,
+                "integrated_evidence_digest": plan.integrated_evidence_digest,
+                "integrated_evidence_metadata_digest": plan.integrated_evidence_metadata_digest,
+                "integrated_evidence_blob": plan.integrated_evidence_blob,
+                "operation_commit_ref": plan.operation_commit_ref,
+                "operation_evidence_ref": plan.operation_evidence_ref,
+                "iteration_evidence_refs": [list(item) for item in plan.iteration_evidence_refs],
+                "source_ref_bindings": [list(item) for item in plan.source_ref_bindings],
+                "project_root": plan.project_root,
+                "integration_worktree": plan.integration_worktree,
+                "ref_updates": [list(item) for item in plan.ref_updates],
+                "final_acceptance_plan_digest": final_plan.plan_digest,
+                "final_acceptance_digest": existing_final.registration_digest,
+                "final_acceptance_evidence_blob": existing_final.evidence_blob,
+                "final_acceptance_evidence_ref": existing_final.evidence_ref,
+                "final_acceptance_iteration_evidence_refs": [
+                    item.ref_name for item in existing_final.iteration_evidence_refs
+                ],
+                "status": "complete",
+                "pushed": False,
+            }
+            _replace_json(journal_path, journal, repo)
+        lease_path = _lease_path(repo)
+        lease = _read_json(lease_path, repo)
+        if lease is not None and lease.get("operation_id") == plan.operation_id:
+            lease_path.unlink(missing_ok=True)
+        final_refs = (
+            existing_final.evidence_ref,
+            *(item.ref_name for item in existing_final.iteration_evidence_refs),
+        )
+        return MainAdvanceResult(
+            schema_version=ADVANCE_RESULT_SCHEMA,
+            operation_id=plan.operation_id,
+            project_root=plan.project_root,
+            integration_worktree=plan.integration_worktree,
+            main_ref=plan.main_ref,
+            previous_main=plan.expected_main,
+            current_main=plan.integrated_commit,
+            updated_refs=tuple(item[0] for item in plan.ref_updates) + final_refs,
+            journal_path=str(journal_path),
+            cleanup_worktree="pending-explicit-cleanup",
+            idempotent=True,
+            final_acceptance_digest=existing_final.registration_digest,
+            final_acceptance_evidence_blob=existing_final.evidence_blob,
+            final_acceptance_evidence_ref=existing_final.evidence_ref,
+            final_acceptance_iteration_evidence_refs=tuple(
+                item.ref_name for item in existing_final.iteration_evidence_refs
+            ),
+        )
+    if journal is not None and journal.get("status") == "complete":
+        raise TrainError("main advance complete journal has no exact public final authority")
     if _resolve_ref(repo, plan.main_ref) != plan.expected_main:
         raise TrainError("main drifted after final acceptance")
     for reference, commit in plan.candidate_refs:
@@ -6241,7 +6859,12 @@ def apply_main_advance(
         or lease.get("expected_main") != plan.expected_main
     ):
         raise TrainError("matching main integration lease is absent")
-    if journal is None:
+    # The final-acceptance registry owns the only pre-CAS recovery journal and
+    # its per-operation lock.  Keep this wrapper journal in memory until the
+    # public single-CAS result exists; otherwise checkout/lease drift between
+    # the wrapper preflight and the registry gate could leave a stale planned
+    # journal that blocks a later canonical plan for the same operation.
+    if journal is None or journal.get("status") == "planned":
         journal = {
             "schema_version": JOURNAL_SCHEMA,
             "kind": "main-advance",
@@ -6250,6 +6873,7 @@ def apply_main_advance(
             "accepted_plan_digest": accepted_plan_digest,
             "accepted_integrated_evidence_digest": accepted_integrated_evidence_digest,
             "confirmation_id": confirmation_token.authorization_id,
+            "confirmation_token_digest": confirmation_token.token_digest,
             "expected_main": plan.expected_main,
             "integrated_commit": plan.integrated_commit,
             "integrated_evidence_digest": plan.integrated_evidence_digest,
@@ -6262,16 +6886,34 @@ def apply_main_advance(
             "project_root": plan.project_root,
             "integration_worktree": plan.integration_worktree,
             "ref_updates": [list(item) for item in plan.ref_updates],
+            "final_acceptance_plan_digest": final_plan.plan_digest,
             "status": "planned",
             "pushed": False,
         }
-        try:
-            _write_new_json(journal_path, journal, repo)
-        except FileExistsError:
-            raise TrainError("main advance journal was created concurrently; retry")
+    # Preserve the historical failpoint name while keeping the wrapper plan
+    # in memory.  The authoritative final registry owns durable pre-CAS
+    # recovery; a crash here must leave no wrapper journal to poison retry.
     _trigger(failpoint, "main-advance-after-journal")
-    _apply_ref_transaction(repo, plan)
+    try:
+        final_receipt = final_registry.apply_final_acceptance(
+            final_plan,
+            accepted_plan_digest=final_plan.plan_digest,
+            confirmation=confirmation_token,
+            failpoint=(
+                None
+                if failpoint is None
+                else lambda stage: _trigger(failpoint, stage)
+            ),
+        )
+    except final_registry.FinalAcceptanceError as exc:
+        raise TrainError(f"main advance final acceptance failed: {exc}") from exc
     _trigger(failpoint, "main-advance-after-refs")
+    journal["final_acceptance_digest"] = final_receipt.registration_digest
+    journal["final_acceptance_evidence_blob"] = final_receipt.evidence_blob
+    journal["final_acceptance_evidence_ref"] = final_receipt.evidence_ref
+    journal["final_acceptance_iteration_evidence_refs"] = [
+        item.ref_name for item in final_receipt.iteration_evidence_refs
+    ]
     journal["status"] = "complete"
     _replace_json(journal_path, journal, repo)
     lease_path = _lease_path(repo)
@@ -6284,10 +6926,18 @@ def apply_main_advance(
         main_ref=plan.main_ref,
         previous_main=plan.expected_main,
         current_main=plan.integrated_commit,
-        updated_refs=tuple(item[0] for item in plan.ref_updates),
+        updated_refs=tuple(item[0] for item in plan.ref_updates)
+        + (final_receipt.evidence_ref,)
+        + tuple(item.ref_name for item in final_receipt.iteration_evidence_refs),
         journal_path=str(journal_path),
         cleanup_worktree="pending-explicit-cleanup",
         idempotent=False,
+        final_acceptance_digest=final_receipt.registration_digest,
+        final_acceptance_evidence_blob=final_receipt.evidence_blob,
+        final_acceptance_evidence_ref=final_receipt.evidence_ref,
+        final_acceptance_iteration_evidence_refs=tuple(
+            item.ref_name for item in final_receipt.iteration_evidence_refs
+        ),
     )
 
 
@@ -6579,6 +7229,7 @@ def apply_cleanup_integration(
 __all__ = [
     "ADVANCE_PLAN_SCHEMA",
     "AUTHORITY_SCHEMA",
+    "AuthorityValidationContext",
     "Blocker",
     "CandidateRegistrationPlan",
     "CandidateSealPlan",
@@ -6608,6 +7259,7 @@ __all__ = [
     "apply_register_candidate",
     "authority_evidence_digest",
     "authority_evidence_gate",
+    "authority_validation_context",
     "build_governance_receipt",
     "candidate_registration_plan_digest",
     "candidate_seal_plan_digest",

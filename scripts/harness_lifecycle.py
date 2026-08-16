@@ -2,20 +2,20 @@
 """Unified, fail-closed Harness Lite lifecycle orchestration.
 
 The lifecycle facade deliberately applies at most one already-planned child
-operation per accepted plan.  That constraint lets it compose the existing
-reservation, bundle, coordinator, and workspace safety slices without
-inventing a second approval path.  Re-run ``plan-start`` / ``start`` until the
-reported next gate is reached; a durable journal makes every accepted step
-idempotently resumable.
-
-This module never commits, pushes, merges, rebases, stashes, resets, cleans,
-removes worktrees, or deletes branches.
+operation per accepted plan.  It composes reservation, workspace, candidate,
+merge-train, public evidence, final acceptance, and conservative cleanup
+without inventing a second approval path.  Every Git mutation remains inside
+its public low-level adapter and requires the exact child digest, confirmation
+token, or notification boundary defined there.  The facade never infers an
+approval/token and never implements push, force, stash, reset, clean, rebase,
+history rewrite, or branch deletion.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import hashlib
 import json
 import os
@@ -23,10 +23,12 @@ import re
 import sys
 import tempfile
 import time
-from dataclasses import asdict
+import types
+import collections.abc
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence, get_args, get_origin, get_type_hints
 
 try:
     from . import harness_bundle as bundle
@@ -57,6 +59,13 @@ NOTIFICATION_RECEIPT_SCHEMA = "harness-lite.lifecycle-notification-receipt/v1"
 TRAIN_SCHEMA = "harness-lite.train/v1"
 ACTIVATION_PROGRESS_SCHEMA = "harness-lite.lifecycle-activation-progress/v1"
 PROGRESS_STATUS_SCHEMA = "harness-lite.lifecycle-progress-status/v1"
+STAGE_REQUEST_SCHEMA = "harness-lite.lifecycle-stage-request/v1"
+STAGE_PLAN_SCHEMA = "harness-lite.lifecycle-stage-plan/v1"
+ORDERED_PREPARATION_SCHEMA = "harness-lite.ordered-integration-preparation/v1"
+STAGE_RESULT_SCHEMA = "harness-lite.lifecycle-stage-result/v1"
+STAGE_JOURNAL_SCHEMA = "harness-lite.lifecycle-stage-journal/v1"
+STAGE_STATUS_SCHEMA = "harness-lite.lifecycle-stage-status/v1"
+STAGE_NOTIFICATION_RECEIPT_SCHEMA = "harness-lite.lifecycle-stage-notification-receipt/v1"
 
 OPERATION_RE = re.compile(r"OP-[0-9a-f]{32}")
 NOTIFICATION_ID_RE = re.compile(r"NT-[0-9a-f]{32}")
@@ -87,6 +96,35 @@ NEXT_GATE_AFTER_ACTION = {
     "activate-workspace": "implementation-ready",
 }
 
+STAGE_NEXT_GATE = {
+    "local-main-release": "main-released-progress-recorded",
+    "candidate-preverify": "confirm-candidate-seal",
+    "candidate-register": "plan-integration",
+    "integration-prepare": "confirm-integration-commit",
+    "integration-commit": "register-public-integrated-evidence",
+    "integrated-evidence-register": "plan-final-acceptance",
+    # The exact final-acceptance apply owns the atomic main/ref CAS.  There is
+    # no second main-advance mutation after this stage.
+    "final-acceptance-register": "plan-cleanup",
+    "integration-cleanup": "iteration-close-or-next-candidate",
+}
+
+STAGE_ORDER = tuple(STAGE_NEXT_GATE)
+# Integration preparation has a composite public authority (candidate order +
+# Git preparation plan).  It remains a durable lifecycle stage, but generic
+# stage dispatch must not accept the unwrapped child artifact.
+GENERIC_STAGE_ORDER = tuple(stage for stage in STAGE_ORDER if stage != "integration-prepare")
+STAGE_JOURNAL_FIELDS = {
+    "schema_version",
+    "operation_id",
+    "project_root",
+    "phase",
+    "active_plan",
+    "completed_stages",
+    "notification_receipts",
+    "last_error",
+}
+
 
 class LifecycleError(RuntimeError):
     """Raised when an orchestration fact cannot be proven safely."""
@@ -94,6 +132,83 @@ class LifecycleError(RuntimeError):
 
 Notify = Callable[[dict[str, object]], None]
 Failpoint = Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class LifecycleStagePlan:
+    schema_version: str
+    operation_id: str
+    project_root: str
+    stage: str
+    child_operation_id: str
+    child_schema_version: str
+    child_plan_digest: str
+    child_snapshot_digest: str
+    subject_digest: str
+    iterations: tuple[str, ...]
+    action_level: str
+    requires_confirmation: bool
+    confirmation_action: str | None
+    evidence_refs: tuple[str, ...]
+    next_gate: str
+    blockers: tuple[str, ...]
+    plan_digest: str
+    pushed: bool = False
+
+    @property
+    def ready(self) -> bool:
+        return not self.blockers
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class LifecycleStageResult:
+    schema_version: str
+    operation_id: str
+    project_root: str
+    stage: str
+    accepted_plan_digest: str
+    child_result: object
+    child_result_digest: str
+    evidence_refs: tuple[str, ...]
+    notification_receipts: tuple[Mapping[str, object], ...]
+    next_gate: str
+    idempotent_replay: bool
+    journal_path: str
+    pushed: bool = False
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            **asdict(self),
+            "child_result": _public_object_snapshot(self.child_result),
+            "notification_receipts": [dict(item) for item in self.notification_receipts],
+        }
+
+
+@dataclass(frozen=True)
+class OrderedIntegrationPreparationPlan:
+    schema_version: str
+    order_plan: object
+    order_plan_digest: str
+    ordered_iterations: tuple[str, ...]
+    integration_plan: object
+    lifecycle_plan: LifecycleStagePlan
+    plan_digest: str
+    pushed: bool = False
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "order_plan": _public_object_snapshot(self.order_plan),
+            "order_plan_digest": self.order_plan_digest,
+            "ordered_iterations": list(self.ordered_iterations),
+            "integration_plan": _public_object_snapshot(self.integration_plan),
+            "lifecycle_plan": self.lifecycle_plan.as_dict(),
+            "plan_digest": self.plan_digest,
+            "pushed": self.pushed,
+        }
 
 
 def canonical_json(value: object) -> bytes:
@@ -130,6 +245,1355 @@ def _single_line(value: object, label: str, *, maximum: int = 200) -> str:
 def _child_operation(operation_id: str, stage: str) -> str:
     identity = hashlib.sha256(f"{operation_id}\0{stage}".encode("utf-8")).hexdigest()[:32]
     return f"OP-{identity}"
+
+
+def _train_modules():
+    try:
+        from . import harness_integrated_evidence as integrated_registry
+        from . import harness_train as train
+        from . import harness_train_governance as train_governance
+    except ImportError:  # pragma: no cover - direct script execution
+        import harness_integrated_evidence as integrated_registry
+        import harness_train as train
+        import harness_train_governance as train_governance
+    return train, train_governance, integrated_registry
+
+
+def _final_acceptance_module():
+    try:
+        from . import harness_final_acceptance as final_acceptance
+    except ImportError:
+        try:
+            import harness_final_acceptance as final_acceptance
+        except ImportError:
+            return None
+    return final_acceptance
+
+
+def _public_object_snapshot(value: object) -> dict[str, object]:
+    if isinstance(value, Mapping):
+        snapshot = dict(value)
+    else:
+        serializer = getattr(value, "as_dict", None)
+        if not callable(serializer):
+            raise LifecycleError("lifecycle stage artifact lacks a public as_dict snapshot")
+        snapshot = serializer()
+    if not isinstance(snapshot, dict):
+        raise LifecycleError("lifecycle stage artifact snapshot is not an object")
+    try:
+        canonical_json(snapshot)
+    except (TypeError, ValueError) as exc:
+        raise LifecycleError("lifecycle stage artifact snapshot is not canonical JSON") from exc
+    return snapshot
+
+
+def _decode_typed_json(value: object, annotation: object) -> object:
+    """Strictly reconstruct a whitelisted public dataclass from JSON."""
+
+    if annotation in {Any, object}:
+        return value
+    origin = get_origin(annotation)
+    arguments = get_args(annotation)
+    if origin in {types.UnionType, getattr(__import__("typing"), "Union")}:
+        if value is None and type(None) in arguments:
+            return None
+        errors: list[Exception] = []
+        for choice in arguments:
+            if choice is type(None):
+                continue
+            try:
+                return _decode_typed_json(value, choice)
+            except (TypeError, ValueError, LifecycleError) as exc:
+                errors.append(exc)
+        raise LifecycleError("JSON value does not match its public union schema") from (errors[-1] if errors else None)
+    if origin is tuple:
+        if not isinstance(value, list):
+            raise LifecycleError("JSON tuple field must be an array")
+        if len(arguments) == 2 and arguments[1] is Ellipsis:
+            return tuple(_decode_typed_json(item, arguments[0]) for item in value)
+        if len(arguments) != len(value):
+            raise LifecycleError("JSON fixed tuple field length is invalid")
+        return tuple(_decode_typed_json(item, item_type) for item, item_type in zip(value, arguments))
+    if origin is list:
+        if not isinstance(value, list):
+            raise LifecycleError("JSON list field must be an array")
+        item_type = arguments[0] if arguments else object
+        return [_decode_typed_json(item, item_type) for item in value]
+    if origin in {dict, Mapping, collections.abc.Mapping}:
+        if not isinstance(value, dict):
+            raise LifecycleError("JSON mapping field must be an object")
+        key_type, item_type = arguments if len(arguments) == 2 else (str, object)
+        return {
+            _decode_typed_json(key, key_type): _decode_typed_json(item, item_type)
+            for key, item in value.items()
+        }
+    if origin is not None and str(origin).endswith("Literal"):
+        if value not in arguments:
+            raise LifecycleError("JSON literal field is invalid")
+        return value
+    if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
+        if not isinstance(value, dict):
+            raise LifecycleError(f"{annotation.__name__} JSON must be an object")
+        hints = get_type_hints(annotation)
+        expected = {field.name for field in dataclasses.fields(annotation)}
+        if set(value) != expected:
+            raise LifecycleError(f"{annotation.__name__} JSON fields are invalid")
+        return annotation(
+            **{
+                field.name: _decode_typed_json(value[field.name], hints.get(field.name, object))
+                for field in dataclasses.fields(annotation)
+            }
+        )
+    if annotation is bool:
+        if not isinstance(value, bool):
+            raise LifecycleError("JSON boolean field is invalid")
+        return value
+    if annotation is int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise LifecycleError("JSON integer field is invalid")
+        return value
+    if annotation is str:
+        if not isinstance(value, str):
+            raise LifecycleError("JSON string field is invalid")
+        return value
+    return value
+
+
+def _decode_public_artifact(path: str | Path, expected_type: type) -> object:
+    value = _read_json(Path(path).expanduser().resolve(), label=f"{expected_type.__name__} artifact")
+    return _decode_typed_json(value, expected_type)
+
+
+def _stage_artifact_type(stage: str) -> type:
+    train, _governance, registry = _train_modules()
+    types_by_stage: dict[str, type] = {
+        "candidate-preverify": train.CandidateRegistrationPlan,
+        "candidate-register": train.CandidateSealPlan,
+        "integration-commit": train.IntegrationCommitPlan,
+        "integrated-evidence-register": train.IntegrationCommitResult,
+        "final-acceptance-register": registry.RegisteredIntegratedEvidence,
+        "integration-cleanup": train.MainAdvanceResult,
+    }
+    if stage not in types_by_stage:
+        raise LifecycleError(f"unsupported lifecycle stage: {stage}")
+    return types_by_stage[stage]
+
+
+def _load_confirmation_token(path: str | Path | None) -> object:
+    if path is None:
+        raise LifecycleError("this lifecycle stage requires an exact confirmation token JSON file")
+    train, _governance, _registry = _train_modules()
+    return _decode_public_artifact(path, train.ConfirmationToken)
+
+
+def _object_digest(value: object) -> str:
+    return digest(_public_object_snapshot(value))
+
+
+_TRANSIENT_STAGE_RESULT_FIELDS = {
+    "appended",
+    "created_now",
+    "idempotent",
+    "idempotent_replay",
+    "resumed",
+}
+
+
+def _stage_result_identity(value: object) -> object:
+    """Remove runtime replay flags while preserving every authority-bearing byte."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _stage_result_identity(item)
+            for key, item in value.items()
+            if key not in _TRANSIENT_STAGE_RESULT_FIELDS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stage_result_identity(item) for item in value]
+    return value
+
+
+def _stage_plan_payload(value: LifecycleStagePlan) -> dict[str, object]:
+    payload = value.as_dict()
+    payload.pop("plan_digest", None)
+    return payload
+
+
+def _stage_child_digest(child: object, attribute: str) -> str:
+    value = child.get(attribute) if isinstance(child, Mapping) else getattr(child, attribute, None)
+    if not isinstance(value, str) or DIGEST_RE.fullmatch(value) is None:
+        raise LifecycleError(f"lifecycle child lacks exact {attribute}")
+    return value
+
+
+def lifecycle_stage_status(project_root: str | Path) -> dict[str, object]:
+    """Project durable post-implementation facade stages and evidence refs."""
+
+    context = _context(project_root)
+    root = _registry(context) / "stage-journal"
+    operations: list[dict[str, object]] = []
+    blockers: list[str] = []
+    evidence_refs: list[str] = []
+    if root.exists():
+        if not root.is_dir() or _is_link_or_junction(root):
+            blockers.append(f"lifecycle-stage-registry-unsafe:{root}")
+        else:
+            for path in sorted(root.glob("OP-*.json"), key=lambda item: item.name):
+                operation_id = path.stem
+                try:
+                    journal = _load_stage_journal(context, operation_id)
+                    assert journal is not None
+                    completed = journal["completed_stages"]
+                    assert isinstance(completed, list)
+                    active = journal.get("active_plan")
+                    for item in completed:
+                        if isinstance(item, Mapping):
+                            raw_refs = item.get("evidence_refs", [])
+                            if isinstance(raw_refs, list):
+                                evidence_refs.extend(
+                                    ref for ref in raw_refs if isinstance(ref, str) and ref not in evidence_refs
+                                )
+                    next_gate = (
+                        str(active.get("next_gate"))
+                        if isinstance(active, Mapping)
+                        else str(completed[-1]["next_gate"])
+                        if completed
+                        else "plan-candidate-preverification"
+                    )
+                    operations.append(
+                        {
+                            "operation_id": operation_id,
+                            "phase": journal["phase"],
+                            "active_stage": active.get("stage") if isinstance(active, Mapping) else None,
+                            "completed_stages": [item["stage"] for item in completed],
+                            "evidence_refs": [
+                                ref
+                                for item in completed
+                                if isinstance(item, Mapping) and isinstance(item.get("evidence_refs"), list)
+                                for ref in item["evidence_refs"]
+                            ],
+                            "next_gate": next_gate,
+                            "last_error": journal.get("last_error"),
+                        }
+                    )
+                    if journal.get("last_error"):
+                        blockers.append(f"lifecycle-stage-error:{operation_id}:{journal['last_error']}")
+                except LifecycleError as exc:
+                    blockers.append(f"lifecycle-stage-corrupt:{operation_id}:{exc}")
+    next_gate = (
+        "reconcile-lifecycle-stage"
+        if blockers
+        else str(operations[-1]["next_gate"])
+        if operations
+        else "plan-candidate-preverification"
+    )
+    return {
+        "schema_version": STAGE_STATUS_SCHEMA,
+        "registry_root": str(root),
+        "phase": "blocked" if blockers else "applying" if any(item["phase"] == "APPLYING" for item in operations) else "ready",
+        "has_history": bool(operations),
+        "operations": operations,
+        "evidence_refs": evidence_refs,
+        "blocking_reasons": blockers,
+        "next_gate": next_gate,
+        "pushed": False,
+    }
+
+
+def _stage_child_blockers(child: object) -> tuple[str, ...]:
+    raw = child.get("blockers", ()) if isinstance(child, Mapping) else getattr(child, "blockers", ())
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise LifecycleError("lifecycle child blockers are invalid")
+    blockers: list[str] = []
+    for item in raw:
+        code = getattr(item, "code", None)
+        message = getattr(item, "message", None)
+        if isinstance(code, str) and isinstance(message, str):
+            blockers.append(f"{code}:{message}")
+        else:
+            blockers.append(str(item))
+    return tuple(blockers)
+
+
+def _stage_iterations(subject: object) -> tuple[str, ...]:
+    direct = getattr(subject, "iteration", None)
+    if isinstance(direct, str):
+        return (_iteration(direct),)
+    raw = getattr(subject, "candidates", None)
+    if raw is None:
+        metadata = getattr(subject, "metadata", None)
+        raw = getattr(metadata, "candidate_bindings", None)
+    values: list[str] = []
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        for item in raw:
+            candidate = getattr(item, "iteration", None)
+            if isinstance(candidate, str):
+                number = _iteration(candidate)
+                if number not in values:
+                    values.append(number)
+    return tuple(values)
+
+
+def _stage_evidence_refs(value: object) -> tuple[str, ...]:
+    refs: list[str] = []
+    for name in (
+        "candidate_ref",
+        "candidate_evidence_ref",
+        "commit_ref",
+        "evidence_ref",
+        "operation_commit_ref",
+        "operation_evidence_ref",
+    ):
+        item = getattr(value, name, None)
+        if isinstance(item, str) and item.startswith("refs/") and item not in refs:
+            refs.append(item)
+    for name in ("iteration_evidence_refs", "updated_refs", "ref_updates"):
+        raw = getattr(value, name, ())
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+            continue
+        for item in raw:
+            ref: object = item
+            if hasattr(item, "ref_name"):
+                ref = getattr(item, "ref_name")
+            elif isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and item:
+                ref = item[0]
+            if isinstance(ref, str) and ref.startswith("refs/") and ref not in refs:
+                refs.append(ref)
+    return tuple(refs)
+
+
+def _build_stage_plan(
+    *,
+    project_root: str | Path,
+    lifecycle_operation_id: str,
+    stage: str,
+    subject: object,
+    child: object,
+    child_digest_attribute: str,
+    action_level: str,
+    confirmation_action: str | None,
+    evidence_refs: Sequence[str] = (),
+    child_operation_id: str | None = None,
+) -> LifecycleStagePlan:
+    if stage not in STAGE_NEXT_GATE:
+        raise LifecycleError(f"unsupported lifecycle stage: {stage}")
+    context = _context(project_root)
+    operation = _operation(lifecycle_operation_id)
+    child_operation = (
+        child_operation_id
+        if child_operation_id is not None
+        else child.get("operation_id")
+        if isinstance(child, Mapping)
+        else getattr(child, "operation_id", None)
+    )
+    if not isinstance(child_operation, str) or OPERATION_RE.fullmatch(child_operation) is None:
+        raise LifecycleError("lifecycle child operation identity is invalid")
+    snapshot = _public_object_snapshot(child)
+    child_digest = _stage_child_digest(child, child_digest_attribute)
+    if action_level not in {"silent", "notify", "confirm"}:
+        raise LifecycleError("lifecycle stage action level is invalid")
+    provisional = LifecycleStagePlan(
+        schema_version=STAGE_PLAN_SCHEMA,
+        operation_id=operation,
+        project_root=str(context.project_root),
+        stage=stage,
+        child_operation_id=child_operation,
+        child_schema_version=str(snapshot.get("schema_version", "")),
+        child_plan_digest=child_digest,
+        child_snapshot_digest=digest(snapshot),
+        subject_digest=_object_digest(subject),
+        iterations=_stage_iterations(subject),
+        action_level=action_level,
+        requires_confirmation=confirmation_action is not None,
+        confirmation_action=confirmation_action,
+        evidence_refs=tuple(dict.fromkeys((*evidence_refs, *_stage_evidence_refs(subject), *_stage_evidence_refs(child)))),
+        next_gate=STAGE_NEXT_GATE[stage],
+        blockers=_stage_child_blockers(child),
+        plan_digest="0" * 64,
+    )
+    return replace(provisional, plan_digest=digest(_stage_plan_payload(provisional)))
+
+
+def _validate_stage_plan(value: LifecycleStagePlan) -> None:
+    if not isinstance(value, LifecycleStagePlan) or value.schema_version != STAGE_PLAN_SCHEMA:
+        raise LifecycleError("lifecycle stage plan schema is invalid")
+    _operation(value.operation_id)
+    if value.stage not in STAGE_NEXT_GATE or value.next_gate != STAGE_NEXT_GATE[value.stage]:
+        raise LifecycleError("lifecycle stage plan transition is invalid")
+    if value.plan_digest != digest(_stage_plan_payload(value)):
+        raise LifecycleError("lifecycle stage plan digest changed")
+    if value.pushed:
+        raise LifecycleError("lifecycle stage plan cannot claim a push")
+
+
+def plan_candidate_preverification_stage(
+    registration_plan: object,
+    *,
+    lifecycle_operation_id: str,
+) -> LifecycleStagePlan:
+    train, _governance, _registry = _train_modules()
+    if not isinstance(registration_plan, train.CandidateRegistrationPlan):
+        raise LifecycleError("candidate preverification requires CandidateRegistrationPlan")
+    return _build_stage_plan(
+        project_root=registration_plan.project_root,
+        lifecycle_operation_id=lifecycle_operation_id,
+        stage="candidate-preverify",
+        subject=registration_plan,
+        child=registration_plan,
+        child_digest_attribute="plan_digest",
+        action_level="silent",
+        confirmation_action=None,
+    )
+
+
+def _local_main_release_components(
+    workspace_plan: object,
+    *,
+    session_id: str,
+    occurred_at: str,
+    causal_parent: str | None,
+) -> tuple[progress.ProgressEventV2, progress.ProgressAppendPlan, dict[str, object]]:
+    """Build the exact read-only workspace/progress composite child."""
+
+    if not isinstance(workspace_plan, workspace.WorkspacePlan):
+        raise LifecycleError("local main release requires WorkspacePlan")
+    if workspace_plan.action != "bind-local-branch":
+        raise LifecycleError("local main release requires bind-local-branch plan")
+    manifest = workspace_plan.manifest
+    branch = manifest.get("branch")
+    base = manifest.get("base")
+    preconditions = manifest.get("preconditions")
+    if not all(isinstance(item, Mapping) for item in (branch, base, preconditions)):
+        raise LifecycleError("local main release workspace manifest is malformed")
+    assert isinstance(branch, Mapping)
+    assert isinstance(base, Mapping)
+    assert isinstance(preconditions, Mapping)
+    source = preconditions.get("source_snapshot")
+    lease_after = preconditions.get("writer_lease_after")
+    if not isinstance(source, Mapping) or not isinstance(lease_after, Mapping):
+        raise LifecycleError("local main release lacks source or lease evidence")
+    event = progress.workspace_event(
+        workspace_state="main-released",
+        session_id=session_id,
+        iteration=workspace_plan.iteration,
+        occurred_at=occurred_at,
+        source_ref=str(branch["from_ref"]),
+        source_commit=str(source["head_oid"]),
+        operation_id=workspace_plan.operation_id,
+        causal_parent=causal_parent,
+        evidence_refs=(
+            f"workspace-plan:{workspace_plan.digest}",
+            f"branch-from:{branch['from_ref']}",
+            f"branch-to:{branch['to_ref']}",
+            f"allocation-base:{base['commit']}",
+            f"lease-generation:{manifest['lease_generation']}->{lease_after['generation']}",
+            f"source-snapshot:{digest(source)}",
+        ),
+        summary=(
+            f"PRD-{workspace_plan.iteration} released main by binding the Local checkout "
+            "in place; path, cwd, worktree bytes, index, commit and stash state are preserved."
+        ),
+    )
+    # Planning the progress append now binds the pre-bind progress bytes and
+    # source commit.  It remains read-only; apply happens only after the exact
+    # workspace child proves preservation.
+    common = Path(str(workspace_plan.manifest["git_common_dir"])).resolve()
+    durable_progress_path = progress.journal_path(
+        common,
+        event.operation_id,
+        event.event_id,
+    )
+    if durable_progress_path.exists():
+        progress_plan = progress.load_progress_append_plan(
+            common,
+            event.operation_id,
+            event.event_id,
+        )
+        if (
+            progress_plan.event != event
+            or progress_plan.project_root
+            != str(Path(str(workspace_plan.manifest["project_root"])).resolve())
+        ):
+            raise LifecycleError(
+                "durable Local main release progress plan differs from the accepted composite"
+            )
+    else:
+        progress_plan = progress.plan_progress_append(
+            project_root=workspace_plan.manifest["project_root"],
+            event=event,
+        )
+    child = {
+        "schema_version": "harness-lite.local-main-release-child/v1",
+        "operation_id": workspace_plan.operation_id,
+        "workspace_plan_digest": workspace_plan.digest,
+        "progress_plan_digest": progress_plan.plan_digest,
+        "event_id": event.event_id,
+        "blockers": [item.as_dict() for item in workspace_plan.blockers],
+        "pushed": False,
+    }
+    return event, progress_plan, child
+
+
+def plan_local_main_release_stage(
+    workspace_plan: object,
+    *,
+    lifecycle_operation_id: str,
+    session_id: str,
+    occurred_at: str,
+    causal_parent: str | None,
+) -> LifecycleStagePlan:
+    """Bind Local A in place and pre-bind its exactly-once progress event."""
+
+    event, _progress_plan, child = _local_main_release_components(
+        workspace_plan,
+        session_id=session_id,
+        occurred_at=occurred_at,
+        causal_parent=causal_parent,
+    )
+    assert isinstance(workspace_plan, workspace.WorkspacePlan)
+    return _build_stage_plan(
+        project_root=str(workspace_plan.manifest["project_root"]),
+        lifecycle_operation_id=lifecycle_operation_id,
+        stage="local-main-release",
+        subject=workspace_plan,
+        child=child,
+        child_digest_attribute="progress_plan_digest",
+        action_level="notify",
+        confirmation_action=None,
+        evidence_refs=(event.event_id, f"workspace-plan:{workspace_plan.digest}"),
+    )
+
+
+def plan_candidate_registration_stage(
+    seal_plan: object,
+    *,
+    lifecycle_operation_id: str,
+) -> LifecycleStagePlan:
+    train, _governance, _registry = _train_modules()
+    if not isinstance(seal_plan, train.CandidateSealPlan):
+        raise LifecycleError("candidate registration requires CandidateSealPlan")
+    return _build_stage_plan(
+        project_root=seal_plan.registration_plan.project_root,
+        lifecycle_operation_id=lifecycle_operation_id,
+        stage="candidate-register",
+        subject=seal_plan,
+        child=seal_plan,
+        child_digest_attribute="seal_plan_digest",
+        action_level="confirm",
+        confirmation_action="create-candidate-seal",
+        evidence_refs=(
+            seal_plan.registration_plan.candidate_ref,
+            seal_plan.registration_plan.candidate_evidence_ref,
+        ),
+        # CandidateSealPlan deliberately nests the canonical operation under
+        # its exact registration plan; it has no duplicate top-level field.
+        child_operation_id=seal_plan.registration_plan.operation_id,
+    )
+
+
+def _plan_integration_preparation_stage(
+    integration_plan: object,
+    *,
+    lifecycle_operation_id: str,
+    order_plan: object,
+) -> LifecycleStagePlan:
+    train, _governance, _registry = _train_modules()
+    if not isinstance(integration_plan, train.IntegrationPreparePlan):
+        raise LifecycleError("integration preparation requires IntegrationPreparePlan")
+    try:
+        from . import harness_merge_train as ordering
+    except ImportError:  # pragma: no cover - direct execution
+        import harness_merge_train as ordering
+    if not isinstance(order_plan, ordering.MergeTrainOrderPlan):
+        raise LifecycleError("integration preparation requires a public merge-train order plan")
+    order_blockers = ordering.merge_train_order_gate(order_plan)
+    if order_blockers:
+        raise LifecycleError(
+            "merge train ordering is blocked: "
+            + "; ".join(item.code for item in order_blockers)
+        )
+    if (
+        tuple(integration_plan.candidates) != tuple(order_plan.ordered_candidates)
+        or tuple(integration_plan.dependency_order) != tuple(order_plan.ordered_iterations)
+    ):
+        raise LifecycleError("integration preparation candidates differ from accepted merge-train order")
+    return _build_stage_plan(
+        project_root=integration_plan.project_root,
+        lifecycle_operation_id=lifecycle_operation_id,
+        stage="integration-prepare",
+        subject=integration_plan,
+        child=integration_plan,
+        child_digest_attribute="plan_digest",
+        action_level="confirm",
+        confirmation_action="prepare-integration",
+        evidence_refs=(f"merge-train-order:{order_plan.plan_digest}",),
+    )
+
+
+def plan_ordered_integration_preparation_stage(
+    project_root: str | Path,
+    *,
+    lifecycle_operation_id: str,
+    generation: str,
+    candidates: Sequence[object],
+    verify_commands: Sequence[object],
+    queue_metadata: Mapping[str, Mapping[str, object]] | None = None,
+    **integration_options: object,
+) -> OrderedIntegrationPreparationPlan:
+    """Derive a public, stable merge-train order before Git preparation.
+
+    Candidate readiness order is never trusted.  The order plan authenticates
+    each public candidate, applies the dependency DAG, and uses explicit queue
+    metadata plus deterministic tie breakers for independent candidates.
+    """
+
+    train, _governance, _registry = _train_modules()
+    try:
+        from . import harness_merge_train as ordering
+    except ImportError:  # pragma: no cover - direct execution
+        import harness_merge_train as ordering
+
+    repo = train.open_repository(project_root)
+    main_ref = str(integration_options.get("main_ref", train.DEFAULT_MAIN_REF))
+    current_main = train._resolve_ref(repo, main_ref)
+    if current_main is None:
+        raise LifecycleError("merge train main authority is missing")
+    principle_path = str(
+        integration_options.get("principle_path", train.DEFAULT_PRINCIPLE_PATH)
+    )
+    _principle_blob, principle_raw = train._blob_at(repo, current_main, principle_path)
+    principle_sha256 = hashlib.sha256(principle_raw).hexdigest()
+    order_plan = ordering.plan_merge_train_order(
+        repo.root,
+        candidates=candidates,
+        current_principle_sha256=principle_sha256,
+        queue_metadata=queue_metadata,
+    )
+    order_blockers = ordering.merge_train_order_gate(order_plan)
+    if order_blockers:
+        raise LifecycleError(
+            "merge train ordering is blocked: "
+            + "; ".join(item.code for item in order_blockers)
+        )
+    integration_plan = train.plan_prepare_integration(
+        repo.root,
+        generation=generation,
+        candidates=order_plan.ordered_candidates,
+        verify_commands=verify_commands,
+        **integration_options,
+    )
+    stage = _plan_integration_preparation_stage(
+        integration_plan,
+        lifecycle_operation_id=lifecycle_operation_id,
+        order_plan=order_plan,
+    )
+    provisional = OrderedIntegrationPreparationPlan(
+        schema_version=ORDERED_PREPARATION_SCHEMA,
+        order_plan=order_plan,
+        order_plan_digest=order_plan.plan_digest,
+        ordered_iterations=order_plan.ordered_iterations,
+        integration_plan=integration_plan,
+        lifecycle_plan=stage,
+        plan_digest="0" * 64,
+    )
+    return replace(provisional, plan_digest=digest({
+        "schema_version": provisional.schema_version,
+        "order_plan": _public_object_snapshot(provisional.order_plan),
+        "order_plan_digest": provisional.order_plan_digest,
+        "ordered_iterations": list(provisional.ordered_iterations),
+        "integration_plan": _public_object_snapshot(provisional.integration_plan),
+        "lifecycle_plan": provisional.lifecycle_plan.as_dict(),
+        "pushed": provisional.pushed,
+    }))
+
+
+def plan_integration_commit_stage(
+    commit_plan: object,
+    *,
+    lifecycle_operation_id: str,
+) -> LifecycleStagePlan:
+    train, _governance, _registry = _train_modules()
+    if not isinstance(commit_plan, train.IntegrationCommitPlan):
+        raise LifecycleError("integration commit requires IntegrationCommitPlan")
+    return _build_stage_plan(
+        project_root=commit_plan.project_root,
+        lifecycle_operation_id=lifecycle_operation_id,
+        stage="integration-commit",
+        subject=commit_plan,
+        child=commit_plan,
+        child_digest_attribute="commit_plan_digest",
+        action_level="confirm",
+        confirmation_action="create-integration-commit",
+    )
+
+
+def plan_integrated_evidence_stage(
+    integration_result: object,
+    *,
+    lifecycle_operation_id: str,
+    commit_confirmation_token: object,
+    progress_bindings: Sequence[object] = (),
+) -> LifecycleStagePlan:
+    train, _governance, registry = _train_modules()
+    if not isinstance(integration_result, train.IntegrationCommitResult):
+        raise LifecycleError("integrated evidence registration requires IntegrationCommitResult")
+    if not isinstance(commit_confirmation_token, train.ConfirmationToken):
+        raise LifecycleError("integrated evidence planning requires the exact commit confirmation token")
+    child = registry.plan_register_integrated_evidence(
+        integration_result,
+        commit_confirmation_token=commit_confirmation_token,
+        progress_bindings=progress_bindings,
+    )
+    return _build_stage_plan(
+        project_root=integration_result.project_root,
+        lifecycle_operation_id=lifecycle_operation_id,
+        stage="integrated-evidence-register",
+        subject=integration_result,
+        child=child,
+        child_digest_attribute="plan_digest",
+        action_level="silent",
+        confirmation_action=None,
+    )
+
+
+def plan_final_acceptance_stage(
+    registered_integrated_evidence: object,
+    *,
+    lifecycle_operation_id: str,
+    main_confirmation_token: object,
+    authorization_id: str | None = None,
+) -> LifecycleStagePlan:
+    """Plan the public final-acceptance registry, never an integrated shortcut."""
+
+    train, _governance, registry = _train_modules()
+    final_acceptance = _final_acceptance_module()
+    if not isinstance(registered_integrated_evidence, registry.RegisteredIntegratedEvidence):
+        raise LifecycleError("final acceptance requires RegisteredIntegratedEvidence")
+    if not isinstance(main_confirmation_token, train.ConfirmationToken):
+        raise LifecycleError("final acceptance requires an exact advance-main confirmation token")
+    if final_acceptance is None or not callable(getattr(final_acceptance, "plan_final_acceptance", None)):
+        raise LifecycleError("public final-acceptance registry is unavailable; integrated evidence is not final acceptance")
+    main_plan = train.plan_main_advance(registered_integrated_evidence)
+    child = final_acceptance.plan_final_acceptance(
+        registered_integrated_evidence.project_root,
+        main_plan=main_plan,
+        integrated=registered_integrated_evidence,
+        confirmation=main_confirmation_token,
+    )
+    return _build_stage_plan(
+        project_root=registered_integrated_evidence.project_root,
+        lifecycle_operation_id=lifecycle_operation_id,
+        stage="final-acceptance-register",
+        subject=registered_integrated_evidence,
+        child=child,
+        child_digest_attribute="plan_digest",
+        action_level="confirm",
+        confirmation_action="advance-main",
+    )
+
+
+def _final_acceptance_recovery_child(
+    registered_integrated_evidence: object,
+    *,
+    main_confirmation_token: object,
+) -> tuple[object, object]:
+    """Return the exact final child and its embedded main plan.
+
+    Once the final registry has written its pre-CAS journal, recovery must use
+    that immutable snapshot.  Replanning against already-advanced main would
+    make a successful atomic CAS look stale and strand cleanup evidence.
+    """
+
+    train, _governance, registry = _train_modules()
+    final_acceptance = _final_acceptance_module()
+    if final_acceptance is None:
+        raise LifecycleError("public final-acceptance registry is unavailable")
+    if not isinstance(registered_integrated_evidence, registry.RegisteredIntegratedEvidence):
+        raise LifecycleError("final acceptance requires RegisteredIntegratedEvidence")
+    if not isinstance(main_confirmation_token, train.ConfirmationToken):
+        raise LifecycleError("final acceptance requires an exact advance-main confirmation token")
+    load_plan = getattr(final_acceptance, "load_final_acceptance_plan", None)
+    durable = (
+        load_plan(
+            registered_integrated_evidence.project_root,
+            operation_id=registered_integrated_evidence.operation_id,
+        )
+        if callable(load_plan)
+        else None
+    )
+    if durable is None:
+        main_plan = train.plan_main_advance(registered_integrated_evidence)
+        durable = final_acceptance.plan_final_acceptance(
+            registered_integrated_evidence.project_root,
+            main_plan=main_plan,
+            integrated=registered_integrated_evidence,
+            confirmation=main_confirmation_token,
+        )
+    else:
+        main_plan = _decode_typed_json(
+            dict(durable.metadata.main_plan_snapshot),
+            train.MainAdvancePlan,
+        )
+    if not isinstance(main_plan, train.MainAdvancePlan):
+        raise LifecycleError("final acceptance recovery lacks its exact MainAdvancePlan")
+    if (
+        main_plan.operation_id != registered_integrated_evidence.operation_id
+        or durable.operation_id != registered_integrated_evidence.operation_id
+        or main_plan.plan_digest != train.main_advance_plan_digest(main_plan)
+        or durable.metadata.main_plan_digest != main_plan.plan_digest
+    ):
+        raise LifecycleError("final acceptance recovery plan identity differs from integrated evidence")
+    token_blockers = train.confirmation_token_gate(
+        main_confirmation_token,
+        action="advance-main",
+        subject_digest=main_plan.plan_digest,
+    )
+    if token_blockers or (
+        durable.metadata.confirmation_authorization_id
+        != main_confirmation_token.authorization_id
+        or durable.metadata.confirmation_token_digest
+        != main_confirmation_token.token_digest
+    ):
+        raise LifecycleError("final acceptance recovery confirmation identity differs")
+    return durable, main_plan
+
+
+def plan_main_advance_stage(
+    registered_final_acceptance: object,
+    *,
+    lifecycle_operation_id: str,
+) -> LifecycleStagePlan:
+    raise LifecycleError(
+        "main advance is part of final-acceptance-register; a second main mutation is forbidden"
+    )
+
+
+def plan_integration_cleanup_stage(
+    main_advance_result: object,
+    *,
+    lifecycle_operation_id: str,
+) -> LifecycleStagePlan:
+    train, _governance, _registry = _train_modules()
+    if not isinstance(main_advance_result, train.MainAdvanceResult):
+        raise LifecycleError("integration cleanup requires MainAdvanceResult")
+    child = train.plan_cleanup_integration(main_advance_result)
+    return _build_stage_plan(
+        project_root=main_advance_result.project_root,
+        lifecycle_operation_id=lifecycle_operation_id,
+        stage="integration-cleanup",
+        subject=main_advance_result,
+        child=child,
+        child_digest_attribute="plan_digest",
+        action_level="notify",
+        confirmation_action=None,
+        evidence_refs=main_advance_result.updated_refs,
+    )
+
+
+def _local_main_release_result(
+    workspace_plan: workspace.WorkspacePlan,
+    workspace_result: Mapping[str, object],
+    progress_plan: progress.ProgressAppendPlan,
+    progress_result: progress.ProgressAppendResult,
+) -> dict[str, object]:
+    """Project only stable, authority-bearing evidence from both children."""
+
+    if workspace_result.get("phase") != "succeeded" or workspace_result.get("journal_phase") != "READY":
+        reasons = workspace_result.get("blocking_reasons")
+        raise LifecycleError(f"Local main release workspace child did not succeed: {reasons}")
+    notification = workspace_result.get("notification")
+    if not isinstance(notification, Mapping):
+        raise LifecycleError("Local main release workspace child lacks its after evidence")
+    preservation = notification.get("preservation")
+    required_preservation = {
+        "workspace_path_unchanged",
+        "head_commit_unchanged",
+        "status_fingerprint_unchanged",
+        "index_bytes_unchanged",
+        "worktree_bytes_unchanged",
+    }
+    if (
+        not isinstance(preservation, Mapping)
+        or set(preservation) != required_preservation
+        or not all(value is True for value in preservation.values())
+    ):
+        raise LifecycleError("Local main release lacks complete source-preservation evidence")
+    if progress_result.phase != "APPLIED" or progress_result.result_sha256 != progress_plan.after_sha256:
+        raise LifecycleError("Local main release progress child did not reach its exact accepted bytes")
+    branch = workspace_plan.manifest.get("branch")
+    worktree = workspace_plan.manifest.get("worktree")
+    preconditions = workspace_plan.manifest.get("preconditions")
+    if not all(isinstance(value, Mapping) for value in (branch, worktree, preconditions)):
+        raise LifecycleError("Local main release manifest lost its bound workspace identity")
+    assert isinstance(branch, Mapping)
+    assert isinstance(worktree, Mapping)
+    assert isinstance(preconditions, Mapping)
+    lease_after = preconditions.get("writer_lease_after")
+    source = preconditions.get("source_snapshot")
+    if not isinstance(lease_after, Mapping) or not isinstance(source, Mapping):
+        raise LifecycleError("Local main release manifest lost its lease/source identity")
+    return {
+        "schema_version": "harness-lite.local-main-release-result/v1",
+        "operation_id": workspace_plan.operation_id,
+        "project_root": str(workspace_plan.manifest["project_root"]),
+        "iteration": workspace_plan.iteration,
+        "phase": "succeeded",
+        "workspace": {
+            "plan_digest": workspace_plan.digest,
+            "journal_phase": "READY",
+            "path": worktree.get("path"),
+            "branch_from_ref": branch.get("from_ref"),
+            "branch_to_ref": branch.get("to_ref"),
+            "head_commit": source.get("head_oid"),
+            "lease_generation_before": workspace_plan.manifest.get("lease_generation"),
+            "lease_generation_after": lease_after.get("generation"),
+            "preservation": dict(preservation),
+        },
+        "progress": {
+            "event_id": progress_plan.event.event_id,
+            "plan_digest": progress_plan.plan_digest,
+            "phase": "APPLIED",
+            "progress_path": progress_plan.progress_path,
+            "result_sha256": progress_result.result_sha256,
+            "journal_path": progress_result.journal_path,
+        },
+        "remote": {"involved": False, "pushed": False, "force": False},
+        "next_gate": STAGE_NEXT_GATE["local-main-release"],
+        "pushed": False,
+    }
+
+
+def apply_local_main_release_stage(
+    plan: LifecycleStagePlan,
+    workspace_plan: workspace.WorkspacePlan,
+    *,
+    accepted_plan_digest: str,
+    session_id: str,
+    occurred_at: str,
+    causal_parent: str | None,
+    notify: Callable[[object], None] | None = None,
+    failpoint: Failpoint | None = None,
+) -> LifecycleStageResult:
+    """Release main in place, then append its exact progress checkpoint once."""
+
+    event, progress_plan, _child = _local_main_release_components(
+        workspace_plan,
+        session_id=session_id,
+        occurred_at=occurred_at,
+        causal_parent=causal_parent,
+    )
+    replanned = plan_local_main_release_stage(
+        workspace_plan,
+        lifecycle_operation_id=plan.operation_id,
+        session_id=session_id,
+        occurred_at=occurred_at,
+        causal_parent=causal_parent,
+    )
+    manifest = workspace_plan.manifest
+    branch = manifest.get("branch")
+    base = manifest.get("base")
+    worktree = manifest.get("worktree")
+    if not all(isinstance(value, Mapping) for value in (branch, base, worktree)):
+        raise LifecycleError("Local main release workspace manifest is malformed")
+    assert isinstance(branch, Mapping)
+    assert isinstance(base, Mapping)
+    assert isinstance(worktree, Mapping)
+
+    def execute(proxy: Callable[[object], None]) -> dict[str, object]:
+        proxy(
+            {
+                "schema_version": "harness-lite.local-main-release-notification/v1",
+                "phase": "before",
+                "action": "bind-local-branch-and-record-progress",
+                "operation_id": workspace_plan.operation_id,
+                "iteration": workspace_plan.iteration,
+                "workspace_plan": workspace_plan.as_dict(),
+                "progress_plan": progress_plan.as_dict(),
+                "remote": {"involved": False, "pushed": False, "force": False},
+            }
+        )
+        workspace_result = workspace.apply_bind_local_branch(
+            manifest["project_root"],
+            iteration=workspace_plan.iteration,
+            owner=str(manifest["owner"]),
+            lease_generation=int(manifest["lease_generation"]),
+            worktree_path=str(worktree["path"]),
+            base_commit=str(base["commit"]),
+            new_branch_ref=str(branch["to_ref"]),
+            operation_id=workspace_plan.operation_id,
+            accepted_plan_digest=workspace_plan.digest,
+        )
+        if workspace_result.get("phase") != "succeeded":
+            raise LifecycleError(
+                "Local main release workspace child was blocked: "
+                + canonical_json(workspace_result.get("blocking_reasons", [])).decode("utf-8")
+            )
+        if failpoint is not None:
+            failpoint("local-main-release-after-workspace")
+        progress_result = progress.apply_progress_append(
+            progress_plan,
+            accept_plan_digest=progress_plan.plan_digest,
+            fault_injector=(
+                (lambda stage, _path: failpoint(f"local-main-release-progress:{stage}"))
+                if failpoint is not None
+                else None
+            ),
+        )
+        if failpoint is not None:
+            failpoint("local-main-release-after-progress")
+        result = _local_main_release_result(
+            workspace_plan,
+            workspace_result,
+            progress_plan,
+            progress_result,
+        )
+        proxy(
+            {
+                "schema_version": "harness-lite.local-main-release-notification/v1",
+                "phase": "after",
+                "action": "bind-local-branch-and-record-progress",
+                "operation_id": workspace_plan.operation_id,
+                "iteration": workspace_plan.iteration,
+                "facts": result,
+                "event_id": event.event_id,
+                "remote": {"involved": False, "pushed": False, "force": False},
+            }
+        )
+        return result
+
+    return _apply_stage_transaction(
+        plan,
+        accepted_plan_digest=accepted_plan_digest,
+        subject=workspace_plan,
+        replanned=replanned,
+        execute=execute,
+        notify=notify,
+        failpoint=failpoint,
+    )
+
+
+def apply_candidate_preverification_stage(
+    plan: LifecycleStagePlan,
+    registration_plan: object,
+    *,
+    accepted_plan_digest: str,
+    failpoint: Failpoint | None = None,
+) -> LifecycleStageResult:
+    train, _governance, _registry = _train_modules()
+    replanned = plan_candidate_preverification_stage(
+        registration_plan,
+        lifecycle_operation_id=plan.operation_id,
+    )
+    return _apply_stage_transaction(
+        plan,
+        accepted_plan_digest=accepted_plan_digest,
+        subject=registration_plan,
+        replanned=replanned,
+        execute=lambda _notify: train.prepare_candidate_registration(
+            registration_plan,
+            accepted_plan_digest=plan.child_plan_digest,
+        ),
+        failpoint=failpoint,
+    )
+
+
+def apply_candidate_registration_stage(
+    plan: LifecycleStagePlan,
+    seal_plan: object,
+    *,
+    accepted_plan_digest: str,
+    confirmation_token: object,
+    failpoint: Failpoint | None = None,
+) -> LifecycleStageResult:
+    train, _governance, _registry = _train_modules()
+    if not isinstance(confirmation_token, train.ConfirmationToken):
+        raise LifecycleError("candidate registration confirmation token is required")
+    replanned = plan_candidate_registration_stage(seal_plan, lifecycle_operation_id=plan.operation_id)
+    return _apply_stage_transaction(
+        plan,
+        accepted_plan_digest=accepted_plan_digest,
+        subject=seal_plan,
+        replanned=replanned,
+        execute=lambda _notify: train.apply_register_candidate(
+            seal_plan,
+            accepted_seal_plan_digest=plan.child_plan_digest,
+            confirmation_token=confirmation_token,
+            failpoint=failpoint,
+        ),
+        failpoint=failpoint,
+    )
+
+
+def _apply_integration_preparation_stage(
+    plan: LifecycleStagePlan,
+    integration_plan: object,
+    *,
+    accepted_plan_digest: str,
+    confirmation_token: object,
+    order_plan: object | None = None,
+    readme_authority: object | None = None,
+    principle_approvals: Mapping[str, object] | None = None,
+    principle_leases: Mapping[str, object] | None = None,
+    notify: Callable[[object], None] | None = None,
+    failpoint: Failpoint | None = None,
+) -> LifecycleStageResult:
+    train, governance, _registry = _train_modules()
+    if not isinstance(confirmation_token, train.ConfirmationToken):
+        raise LifecycleError("integration preparation confirmation token is required")
+    if order_plan is None:
+        raise LifecycleError("integration preparation requires the accepted public merge-train order plan")
+    replanned = _plan_integration_preparation_stage(
+        integration_plan,
+        lifecycle_operation_id=plan.operation_id,
+        order_plan=order_plan,
+    )
+
+    def execute(proxy: Callable[[object], None]) -> object:
+        callback = governance.build_governance_callback(
+            integration_plan,
+            readme_authority=readme_authority,
+            principle_approvals=principle_approvals,
+            principle_leases=principle_leases,
+        )
+        return train.apply_prepare_integration(
+            integration_plan,
+            accepted_plan_digest=plan.child_plan_digest,
+            confirmation_token=confirmation_token,
+            notify=proxy,
+            governance_callback=callback,
+            governance_conflict_normalizer=governance.build_conflict_normalizer(integration_plan),
+            failpoint=failpoint,
+        )
+
+    return _apply_stage_transaction(
+        plan,
+        accepted_plan_digest=accepted_plan_digest,
+        subject=integration_plan,
+        replanned=replanned,
+        execute=execute,
+        notify=notify,
+        failpoint=failpoint,
+    )
+
+
+def _ordered_preparation_payload(value: OrderedIntegrationPreparationPlan) -> dict[str, object]:
+    payload = value.as_dict()
+    payload.pop("plan_digest", None)
+    return payload
+
+
+def apply_ordered_integration_preparation_stage(
+    ordered_plan: OrderedIntegrationPreparationPlan,
+    *,
+    accepted_plan_digest: str,
+    confirmation_token: object,
+    readme_authority: object | None = None,
+    principle_approvals: Mapping[str, object] | None = None,
+    principle_leases: Mapping[str, object] | None = None,
+    notify: Callable[[object], None] | None = None,
+    failpoint: Failpoint | None = None,
+) -> LifecycleStageResult:
+    """Apply only an exact, publicly gated dependency/queue order."""
+
+    try:
+        from . import harness_merge_train as ordering
+    except ImportError:  # pragma: no cover - direct execution
+        import harness_merge_train as ordering
+    if not isinstance(ordered_plan, OrderedIntegrationPreparationPlan):
+        raise LifecycleError("ordered integration preparation plan type is invalid")
+    if (
+        ordered_plan.schema_version != ORDERED_PREPARATION_SCHEMA
+        or ordered_plan.plan_digest != digest(_ordered_preparation_payload(ordered_plan))
+        or accepted_plan_digest != ordered_plan.plan_digest
+        or ordered_plan.pushed
+    ):
+        raise LifecycleError("ordered integration preparation plan was not accepted exactly")
+    if not isinstance(ordered_plan.order_plan, ordering.MergeTrainOrderPlan):
+        raise LifecycleError("ordered integration preparation lacks its public order authority")
+    blockers = ordering.merge_train_order_gate(ordered_plan.order_plan)
+    if blockers:
+        raise LifecycleError(
+            "merge train ordering changed before apply: "
+            + "; ".join(item.code for item in blockers)
+        )
+    if (
+        ordered_plan.order_plan_digest != ordered_plan.order_plan.plan_digest
+        or ordered_plan.ordered_iterations != ordered_plan.order_plan.ordered_iterations
+        or tuple(getattr(ordered_plan.integration_plan, "candidates", ()))
+        != ordered_plan.order_plan.ordered_candidates
+    ):
+        raise LifecycleError("ordered integration preparation authority bindings differ")
+    expected_stage = _plan_integration_preparation_stage(
+        ordered_plan.integration_plan,
+        lifecycle_operation_id=ordered_plan.lifecycle_plan.operation_id,
+        order_plan=ordered_plan.order_plan,
+    )
+    if expected_stage != ordered_plan.lifecycle_plan:
+        raise LifecycleError("ordered integration lifecycle child differs from the public order plan")
+    return _apply_integration_preparation_stage(
+        ordered_plan.lifecycle_plan,
+        ordered_plan.integration_plan,
+        accepted_plan_digest=ordered_plan.lifecycle_plan.plan_digest,
+        confirmation_token=confirmation_token,
+        order_plan=ordered_plan.order_plan,
+        readme_authority=readme_authority,
+        principle_approvals=principle_approvals,
+        principle_leases=principle_leases,
+        notify=notify,
+        failpoint=failpoint,
+    )
+
+
+def apply_integration_commit_stage(
+    plan: LifecycleStagePlan,
+    commit_plan: object,
+    *,
+    accepted_plan_digest: str,
+    confirmation_token: object,
+    identity_rebindings: Sequence[object] = (),
+    failpoint: Failpoint | None = None,
+) -> LifecycleStageResult:
+    train, _governance, _registry = _train_modules()
+    if not isinstance(confirmation_token, train.ConfirmationToken):
+        raise LifecycleError("integration commit confirmation token is required")
+    replanned = plan_integration_commit_stage(commit_plan, lifecycle_operation_id=plan.operation_id)
+    return _apply_stage_transaction(
+        plan,
+        accepted_plan_digest=accepted_plan_digest,
+        subject=commit_plan,
+        replanned=replanned,
+        execute=lambda _notify: train.apply_integration_commit(
+            commit_plan,
+            accepted_commit_plan_digest=plan.child_plan_digest,
+            confirmation_token=confirmation_token,
+            identity_rebindings=identity_rebindings,
+            failpoint=failpoint,
+        ),
+        failpoint=failpoint,
+    )
+
+
+def apply_integrated_evidence_stage(
+    plan: LifecycleStagePlan,
+    integration_result: object,
+    *,
+    accepted_plan_digest: str,
+    commit_confirmation_token: object,
+    progress_bindings: Sequence[object] = (),
+    failpoint: Failpoint | None = None,
+) -> LifecycleStageResult:
+    train, _governance, registry = _train_modules()
+    child = registry.plan_register_integrated_evidence(
+        integration_result,
+        commit_confirmation_token=commit_confirmation_token,
+        progress_bindings=progress_bindings,
+    )
+    replanned = _build_stage_plan(
+        project_root=integration_result.project_root,
+        lifecycle_operation_id=plan.operation_id,
+        stage="integrated-evidence-register",
+        subject=integration_result,
+        child=child,
+        child_digest_attribute="plan_digest",
+        action_level="silent",
+        confirmation_action=None,
+    )
+    return _apply_stage_transaction(
+        plan,
+        accepted_plan_digest=accepted_plan_digest,
+        subject=integration_result,
+        replanned=replanned,
+        execute=lambda _notify: registry.apply_register_integrated_evidence(
+            child,
+            accepted_plan_digest=plan.child_plan_digest,
+            commit_confirmation_token=commit_confirmation_token,
+            failpoint=failpoint,
+        ),
+        failpoint=failpoint,
+    )
+
+
+def apply_final_acceptance_stage(
+    plan: LifecycleStagePlan,
+    registered_integrated_evidence: object,
+    *,
+    accepted_plan_digest: str,
+    main_confirmation_token: object,
+    authorization_id: str | None = None,
+    failpoint: Failpoint | None = None,
+) -> LifecycleStageResult:
+    train, _governance, _registry = _train_modules()
+    child, main_plan = _final_acceptance_recovery_child(
+        registered_integrated_evidence,
+        main_confirmation_token=main_confirmation_token,
+    )
+    replanned = _build_stage_plan(
+        project_root=registered_integrated_evidence.project_root,
+        lifecycle_operation_id=plan.operation_id,
+        stage="final-acceptance-register",
+        subject=registered_integrated_evidence,
+        child=child,
+        child_digest_attribute="plan_digest",
+        action_level="confirm",
+        confirmation_action="advance-main",
+    )
+    return _apply_stage_transaction(
+        plan,
+        accepted_plan_digest=accepted_plan_digest,
+        subject=registered_integrated_evidence,
+        replanned=replanned,
+        # The train compatibility entrypoint delegates to the public final
+        # registry and returns the cleanup-capable MainAdvanceResult.  Its one
+        # final-registry apply performs the main/ref CAS exactly once.
+        execute=lambda _notify: train.apply_main_advance(
+            main_plan,
+            accepted_plan_digest=main_plan.plan_digest,
+            accepted_integrated_evidence_digest=registered_integrated_evidence.registration_digest,
+            confirmation_token=main_confirmation_token,
+            failpoint=failpoint,
+        ),
+        failpoint=failpoint,
+    )
+
+
+def apply_main_advance_stage(
+    plan: LifecycleStagePlan,
+    registered_final_acceptance: object,
+    *,
+    accepted_plan_digest: str,
+    confirmation_token: object,
+    failpoint: Failpoint | None = None,
+) -> LifecycleStageResult:
+    raise LifecycleError(
+        "main advance is part of final-acceptance-register; a second main mutation is forbidden"
+    )
+
+
+def apply_integration_cleanup_stage(
+    plan: LifecycleStagePlan,
+    main_advance_result: object,
+    *,
+    accepted_plan_digest: str,
+    notify: Callable[[object], None] | None,
+    failpoint: Failpoint | None = None,
+) -> LifecycleStageResult:
+    train, _governance, _registry = _train_modules()
+    replanned = plan_integration_cleanup_stage(main_advance_result, lifecycle_operation_id=plan.operation_id)
+    cleanup_plan = train.plan_cleanup_integration(main_advance_result)
+    return _apply_stage_transaction(
+        plan,
+        accepted_plan_digest=accepted_plan_digest,
+        subject=main_advance_result,
+        replanned=replanned,
+        execute=lambda proxy: train.apply_cleanup_integration(
+            cleanup_plan,
+            accepted_plan_digest=plan.child_plan_digest,
+            notify=proxy,
+            failpoint=failpoint,
+        ),
+        notify=notify,
+        failpoint=failpoint,
+    )
 
 
 def _risk_vector(value: Mapping[str, object]) -> coordinator.RiskVector:
@@ -880,12 +2344,14 @@ def lifecycle_status(project_root: str | Path) -> dict[str, object]:
         except LifecycleError as exc:
             routes.append({"iteration": item["number"], "phase": "blocked", "blocking_reasons": [str(exc)]})
     train_snapshot = _train_status(context, core_snapshot)
+    stage_snapshot = lifecycle_stage_status(context.project_root)
     blockers: list[object] = []
     blockers.extend(core_snapshot.get("blocking_reasons", []))
     blockers.extend(workspace_snapshot.get("blocking_reasons", []))
     blockers.extend(governance_snapshot.get("blocking_reasons", []))
     blockers.extend(train_snapshot.get("blocking_reasons", []))
     blockers.extend(progress_snapshot.get("blocking_reasons", []))
+    blockers.extend(stage_snapshot.get("blocking_reasons", []))
     principle_audits = governance_snapshot.get("principle_audits", [])
     principle_drift = any(
         isinstance(item, Mapping) and bool(item.get("drift"))
@@ -905,6 +2371,7 @@ def lifecycle_status(project_root: str | Path) -> dict[str, object]:
         "workspace": workspace_snapshot,
         "progress": progress_snapshot,
         "train": train_snapshot,
+        "lifecycle_stages": stage_snapshot,
         "governance": governance_snapshot,
         "principle_drift": principle_drift,
         "blocking_reasons": blockers,
@@ -913,10 +2380,14 @@ def lifecycle_status(project_root: str | Path) -> dict[str, object]:
             if principle_gate_blocked
             else "reconcile-progress"
             if progress_snapshot.get("blocking_reasons")
+            else "reconcile-lifecycle-stage"
+            if stage_snapshot.get("blocking_reasons")
             else "reconcile"
             if blockers
             else "resume-progress-append"
             if progress_snapshot.get("pending_count")
+            else stage_snapshot["next_gate"]
+            if stage_snapshot.get("has_history")
             else workspace_snapshot["next_gate"]
         ),
         "exclusions": list(EXCLUSIONS),
@@ -933,6 +2404,93 @@ def _journal_path(context: workspace.RepositoryContext, operation_id: str) -> Pa
 
 def _lock_path(context: workspace.RepositoryContext, operation_id: str) -> Path:
     return _registry(context) / "locks" / f"{_operation(operation_id)}.lock"
+
+
+def _stage_journal_path(context: workspace.RepositoryContext, operation_id: str) -> Path:
+    return _registry(context) / "stage-journal" / f"{_operation(operation_id)}.json"
+
+
+def _new_stage_journal(plan: LifecycleStagePlan) -> dict[str, object]:
+    return {
+        "schema_version": STAGE_JOURNAL_SCHEMA,
+        "operation_id": plan.operation_id,
+        "project_root": plan.project_root,
+        "phase": "APPLYING",
+        "active_plan": plan.as_dict(),
+        "completed_stages": [],
+        "notification_receipts": [],
+        "last_error": None,
+    }
+
+
+def _load_stage_journal(
+    context: workspace.RepositoryContext,
+    operation_id: str,
+) -> dict[str, object] | None:
+    path = _stage_journal_path(context, operation_id)
+    if not path.exists():
+        return None
+    value = _read_json(path, label="lifecycle stage journal")
+    if set(value) != STAGE_JOURNAL_FIELDS or value.get("schema_version") != STAGE_JOURNAL_SCHEMA:
+        raise LifecycleError(f"lifecycle stage journal schema is invalid: {path}")
+    if value.get("operation_id") != operation_id or value.get("project_root") != str(context.project_root):
+        raise LifecycleError(f"lifecycle stage journal identity is invalid: {path}")
+    if value.get("phase") not in {"APPLYING", "STEPPED"}:
+        raise LifecycleError(f"lifecycle stage journal phase is invalid: {path}")
+    completed = value.get("completed_stages")
+    receipts = value.get("notification_receipts")
+    if not isinstance(completed, list) or not isinstance(receipts, list):
+        raise LifecycleError(f"lifecycle stage journal history is invalid: {path}")
+    previous_rank = -1
+    seen_plans: set[str] = set()
+    for item in completed:
+        fields = {
+            "stage", "plan_digest", "child_plan_digest", "subject_digest",
+            "result_digest", "result", "evidence_refs", "next_gate",
+        }
+        if not isinstance(item, Mapping) or set(item) != fields:
+            raise LifecycleError(f"lifecycle stage journal result schema is invalid: {path}")
+        stage = item.get("stage")
+        plan_digest = item.get("plan_digest")
+        if stage not in STAGE_NEXT_GATE or not isinstance(plan_digest, str) or DIGEST_RE.fullmatch(plan_digest) is None:
+            raise LifecycleError(f"lifecycle stage journal result identity is invalid: {path}")
+        rank = STAGE_ORDER.index(str(stage))
+        if rank <= previous_rank or plan_digest in seen_plans:
+            raise LifecycleError(f"lifecycle stage journal order is invalid: {path}")
+        previous_rank = rank
+        seen_plans.add(plan_digest)
+        result = item.get("result")
+        if not isinstance(result, Mapping) or item.get("result_digest") != digest(dict(result)):
+            raise LifecycleError(f"lifecycle stage journal result digest is invalid: {path}")
+    active = value.get("active_plan")
+    if active is not None:
+        if not isinstance(active, Mapping):
+            raise LifecycleError(f"lifecycle stage journal active plan is invalid: {path}")
+        try:
+            active_plan = LifecycleStagePlan(**dict(active))
+            _validate_stage_plan(active_plan)
+        except (TypeError, LifecycleError) as exc:
+            raise LifecycleError(f"lifecycle stage journal active plan is invalid: {path}") from exc
+    if (value["phase"] == "APPLYING") != (active is not None):
+        raise LifecycleError(f"lifecycle stage journal phase/active plan is inconsistent: {path}")
+    for receipt in receipts:
+        fields = {
+            "schema_version", "notification_id", "stage_plan_digest", "payload",
+            "payload_digest", "callback_state", "callback_error",
+        }
+        if not isinstance(receipt, Mapping) or set(receipt) != fields:
+            raise LifecycleError(f"lifecycle stage notification receipt is invalid: {path}")
+        payload = receipt.get("payload")
+        if (
+            receipt.get("schema_version") != STAGE_NOTIFICATION_RECEIPT_SCHEMA
+            or not isinstance(receipt.get("notification_id"), str)
+            or not str(receipt["notification_id"]).startswith("NT-")
+            or not isinstance(payload, Mapping)
+            or receipt.get("payload_digest") != digest(dict(payload))
+            or receipt.get("callback_state") not in {"pending", "returned", "raised"}
+        ):
+            raise LifecycleError(f"lifecycle stage notification receipt binding is invalid: {path}")
+    return value
 
 
 def _ensure_registry_path(context: workspace.RepositoryContext, path: Path) -> None:
@@ -971,6 +2529,56 @@ def _atomic_json(context: workspace.RepositoryContext, path: Path, value: Mappin
     finally:
         with contextlib.suppress(OSError):
             temporary.unlink()
+
+
+def _stage_notification_proxy(
+    context: workspace.RepositoryContext,
+    journal: dict[str, object],
+    *,
+    stage_plan_digest: str,
+    notify: Callable[[object], None] | None,
+) -> Callable[[object], None]:
+    def proxy(payload_value: object) -> None:
+        payload = _public_object_snapshot(payload_value)
+        payload_digest = digest(payload)
+        notification_id = "NT-" + hashlib.sha256(
+            canonical_json({"stage_plan_digest": stage_plan_digest, "payload_digest": payload_digest})
+        ).hexdigest()[:32]
+        receipts = journal["notification_receipts"]
+        assert isinstance(receipts, list)
+        existing = next(
+            (item for item in receipts if isinstance(item, Mapping) and item.get("notification_id") == notification_id),
+            None,
+        )
+        if existing is not None:
+            if existing.get("payload") != payload or existing.get("stage_plan_digest") != stage_plan_digest:
+                raise LifecycleError("lifecycle stage notification identity collided with different bytes")
+            return
+        receipt: dict[str, object] = {
+            "schema_version": STAGE_NOTIFICATION_RECEIPT_SCHEMA,
+            "notification_id": notification_id,
+            "stage_plan_digest": stage_plan_digest,
+            "payload": payload,
+            "payload_digest": payload_digest,
+            "callback_state": "pending",
+            "callback_error": None,
+        }
+        receipts.append(receipt)
+        path = _stage_journal_path(context, str(journal["operation_id"]))
+        _atomic_json(context, path, journal)
+        if notify is None:
+            return
+        try:
+            notify(payload_value)
+        except BaseException as exc:
+            receipt["callback_state"] = "raised"
+            receipt["callback_error"] = {"type": type(exc).__name__, "message": str(exc)[:1000]}
+            _atomic_json(context, path, journal)
+            raise
+        receipt["callback_state"] = "returned"
+        _atomic_json(context, path, journal)
+
+    return proxy
 
 
 @contextlib.contextmanager
@@ -1018,6 +2626,141 @@ def _operation_lock(context: workspace.RepositoryContext, operation_id: str, tim
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
+
+
+def _apply_stage_transaction(
+    plan: LifecycleStagePlan,
+    *,
+    accepted_plan_digest: str,
+    subject: object,
+    replanned: LifecycleStagePlan,
+    execute: Callable[[Callable[[object], None]], object],
+    notify: Callable[[object], None] | None = None,
+    failpoint: Failpoint | None = None,
+) -> LifecycleStageResult:
+    _validate_stage_plan(plan)
+    _validate_stage_plan(replanned)
+    accepted = accepted_plan_digest.strip()
+    if accepted != plan.plan_digest:
+        raise LifecycleError("accepted lifecycle stage digest differs from the exact plan")
+    if _object_digest(subject) != plan.subject_digest:
+        raise LifecycleError("lifecycle stage subject changed after planning")
+    if plan.blockers:
+        raise LifecycleError("blocked lifecycle stage cannot be applied: " + "; ".join(plan.blockers))
+    context = _context(plan.project_root)
+    path = _stage_journal_path(context, plan.operation_id)
+    with _operation_lock(context, plan.operation_id):
+        journal = _load_stage_journal(context, plan.operation_id)
+        if journal is None:
+            if replanned != plan:
+                raise LifecycleError("lifecycle stage child plan changed; create and accept a new stage plan")
+            journal = _new_stage_journal(plan)
+            replay = False
+        else:
+            if replanned != plan:
+                raise LifecycleError(
+                    "lifecycle stage child plan changed; recover or accept a new exact stage plan"
+                )
+            completed = journal["completed_stages"]
+            assert isinstance(completed, list)
+            existing = next(
+                (item for item in completed if isinstance(item, Mapping) and item.get("plan_digest") == plan.plan_digest),
+                None,
+            )
+            replay = existing is not None
+            active = journal.get("active_plan")
+            if replay:
+                if active is not None:
+                    raise LifecycleError(
+                        "a completed lifecycle stage cannot replay while another stage is active"
+                    )
+            else:
+                if completed:
+                    prior_stage = str(completed[-1]["stage"])
+                    if STAGE_ORDER.index(plan.stage) <= STAGE_ORDER.index(prior_stage):
+                        raise LifecycleError("lifecycle stage would move backward or replace completed evidence")
+                if active is not None and digest(dict(active)) != digest(plan.as_dict()):
+                    raise LifecycleError("another lifecycle stage plan is already active")
+                journal["phase"] = "APPLYING"
+                journal["active_plan"] = plan.as_dict()
+                journal["last_error"] = None
+        if not replay:
+            _atomic_json(context, path, journal)
+        proxy = _stage_notification_proxy(context, journal, stage_plan_digest=plan.plan_digest, notify=notify)
+        try:
+            child_result = execute(proxy)
+            result_snapshot = _public_object_snapshot(child_result)
+            result_digest = digest(result_snapshot)
+            if failpoint is not None:
+                failpoint("after-child-before-stage-journal")
+        except BaseException as exc:
+            if not replay:
+                journal["last_error"] = str(exc)[:1000]
+                _atomic_json(context, path, journal)
+            raise
+        completed = journal["completed_stages"]
+        assert isinstance(completed, list)
+        existing = next(
+            (item for item in completed if isinstance(item, Mapping) and item.get("plan_digest") == plan.plan_digest),
+            None,
+        )
+        evidence_refs = tuple(dict.fromkeys((*plan.evidence_refs, *_stage_evidence_refs(child_result))))
+        if existing is not None:
+            durable_result = existing.get("result")
+            if (
+                not isinstance(durable_result, Mapping)
+                or digest(_stage_result_identity(durable_result))
+                != digest(_stage_result_identity(result_snapshot))
+                or tuple(existing.get("evidence_refs", ())) != evidence_refs
+            ):
+                raise LifecycleError("idempotent lifecycle child result differs from durable evidence")
+            # A completed replay returns the exact durable public result.  The
+            # just-executed child is used only to revalidate live authority;
+            # its transient replay flags must not rewrite accepted evidence.
+            child_result = (
+                _decode_typed_json(dict(durable_result), type(child_result))
+                if dataclasses.is_dataclass(child_result)
+                else dict(durable_result)
+            )
+            result_snapshot = dict(durable_result)
+            result_digest = str(existing["result_digest"])
+        else:
+            completed.append(
+                {
+                    "stage": plan.stage,
+                    "plan_digest": plan.plan_digest,
+                    "child_plan_digest": plan.child_plan_digest,
+                    "subject_digest": plan.subject_digest,
+                    "result_digest": result_digest,
+                    "result": result_snapshot,
+                    "evidence_refs": list(evidence_refs),
+                    "next_gate": plan.next_gate,
+                }
+            )
+        if not replay:
+            journal["phase"] = "STEPPED"
+            journal["active_plan"] = None
+            journal["last_error"] = None
+            _atomic_json(context, path, journal)
+        receipts = tuple(
+            dict(item)
+            for item in journal["notification_receipts"]
+            if isinstance(item, Mapping) and item.get("stage_plan_digest") == plan.plan_digest
+        )
+        return LifecycleStageResult(
+            schema_version=STAGE_RESULT_SCHEMA,
+            operation_id=plan.operation_id,
+            project_root=plan.project_root,
+            stage=plan.stage,
+            accepted_plan_digest=accepted,
+            child_result=child_result,
+            child_result_digest=result_digest,
+            evidence_refs=evidence_refs,
+            notification_receipts=receipts,
+            next_gate=plan.next_gate,
+            idempotent_replay=replay,
+            journal_path=str(path),
+        )
 
 
 JOURNAL_FIELDS = {
@@ -1676,6 +3419,49 @@ def _committed_authority_blockers(
     return blockers
 
 
+def _route_dependency_bindings(route: Mapping[str, object]) -> tuple[dict[str, str], ...]:
+    """Extract the coordinator-authenticated ordered dependency identity.
+
+    The coordinator deliberately publishes this evidence inside its exact
+    workspace-plan step.  The lifecycle must not independently choose a
+    candidate generation or trust dependency data supplied by the request.
+    """
+
+    coordinator_plan = route.get("coordinator")
+    if not isinstance(coordinator_plan, Mapping):
+        raise LifecycleError("stacked workspace route lacks its coordinator plan")
+    steps = coordinator_plan.get("planned_steps")
+    if not isinstance(steps, (list, tuple)):
+        raise LifecycleError("stacked workspace route lacks coordinator steps")
+    workspace_steps = [
+        item
+        for item in steps
+        if isinstance(item, Mapping) and item.get("step") == "workspace-plan"
+    ]
+    if len(workspace_steps) != 1:
+        raise LifecycleError("stacked workspace route lacks one exact workspace plan")
+    step = workspace_steps[0]
+    raw = step.get("dependency_bindings")
+    expected_digest = step.get("dependency_bindings_digest")
+    if not isinstance(raw, list) or not raw:
+        raise LifecycleError("stacked workspace route lacks stable dependency bindings")
+    try:
+        normalized = workspace.normalize_dependency_bindings(raw)
+    except workspace.WorkspaceError as exc:
+        raise LifecycleError(f"stacked dependency bindings are invalid: {exc}") from exc
+    actual_digest = workspace.dependency_bindings_digest(normalized)
+    if expected_digest != actual_digest:
+        raise LifecycleError("stacked dependency binding digest differs from coordinator evidence")
+    implementation_ref = step.get("implementation_ref")
+    implementation_commit = step.get("implementation_commit")
+    if (
+        implementation_ref != normalized[-1]["candidate_ref"]
+        or implementation_commit != normalized[-1]["candidate_commit"]
+    ):
+        raise LifecycleError("stacked implementation start differs from its last dependency candidate")
+    return tuple(dict(item) for item in normalized)
+
+
 def plan_start(
     project_root: str | Path,
     request: Mapping[str, object],
@@ -1897,12 +3683,18 @@ def plan_start(
         )
 
     topology = str(route["axes"]["execution_topology"])
+    dependency_bindings: tuple[dict[str, str], ...] = ()
     if topology == "local":
         workspace_topology = "local"
         branch_ref = str(normalized.get("branch_ref") or state.base_branch or "refs/heads/main")
         target = context.project_root
     elif topology == "independent-worktree":
         workspace_topology = "worktree"
+        branch_ref = str(normalized.get("branch_ref") or f"refs/heads/harness/prd-{number}")
+        target = _workspace_target(context, number, normalized)
+    elif topology == "stacked-worktree":
+        workspace_topology = "worktree"
+        dependency_bindings = _route_dependency_bindings(route)
         branch_ref = str(normalized.get("branch_ref") or f"refs/heads/harness/prd-{number}")
         target = _workspace_target(context, number, normalized)
     else:
@@ -1930,19 +3722,33 @@ def plan_start(
             worktree_path=target,
             owner=str(normalized["owner"]),
             lease_generation=1,
+            dependency_bindings=dependency_bindings,
             operation_id=workspace_operation,
         )
     except workspace.WorkspaceError as exc:
         raise LifecycleError(str(exc)) from exc
     activation_base = child_plan.manifest.get("base")
+    expected_implementation_ref = (
+        dependency_bindings[-1]["candidate_ref"]
+        if dependency_bindings
+        else "refs/heads/main"
+    )
+    expected_implementation_commit = (
+        dependency_bindings[-1]["candidate_commit"]
+        if dependency_bindings
+        else authority.get("governance_commit")
+    )
     if (
         not isinstance(activation_base, Mapping)
-        or activation_base.get("implementation_ref") != "refs/heads/main"
+        or activation_base.get("implementation_ref") != expected_implementation_ref
         or not isinstance(activation_base.get("implementation_commit"), str)
         or not re.fullmatch(r"[0-9a-f]{40,64}", str(activation_base["implementation_commit"]))
-        or activation_base.get("implementation_commit") != authority.get("governance_commit")
+        or activation_base.get("implementation_commit") != expected_implementation_commit
+        or activation_base.get("dependency_bindings") != [dict(item) for item in dependency_bindings]
+        or activation_base.get("dependency_bindings_digest")
+        != workspace.dependency_bindings_digest(dependency_bindings)
     ):
-        raise LifecycleError("workspace plan did not bind an exact latest-main implementation start")
+        raise LifecycleError("workspace plan did not bind its exact approved implementation start")
     progress_binding = _activation_progress_binding(
         context,
         iteration=number,
@@ -1966,6 +3772,8 @@ def plan_start(
             "base_commit": state.base_commit,
             "implementation_ref": activation_base["implementation_ref"],
             "implementation_commit": activation_base["implementation_commit"],
+            "dependency_bindings": [dict(item) for item in dependency_bindings],
+            "dependency_bindings_digest": workspace.dependency_bindings_digest(dependency_bindings),
             "branch_ref": branch_ref,
             "worktree_path": str(target),
             "owner": normalized["owner"],
@@ -2108,6 +3916,7 @@ def _workspace_interaction(child: Mapping[str, object], phase: str) -> dict[str,
     ):
         raise LifecycleError("workspace interaction commits are invalid")
     action = "create-worktree" if topology == "worktree" else "activate-local"
+    stacked = topology == "worktree" and implementation_ref != "refs/heads/main"
     facts = {
         "iteration": number,
         "operation_id": child_operation_id,
@@ -2119,7 +3928,13 @@ def _workspace_interaction(child: Mapping[str, object], phase: str) -> dict[str,
         },
         "branch": {"ref": branch_ref, "will_create": topology == "worktree"},
         "worktree": {"path": worktree_path, "will_create": topology == "worktree"},
-        "reason_code": "parallel-prd-lazy-worktree" if topology == "worktree" else "single-active-prd-local",
+        "reason_code": (
+            "stable-dependency-stacked-worktree"
+            if stacked
+            else "parallel-prd-lazy-worktree"
+            if topology == "worktree"
+            else "single-active-prd-local"
+        ),
         "effect_on_existing_prds": {
             "strategy": "add-only" if topology == "worktree" else "stay-local",
             "moved": False,
@@ -2157,7 +3972,8 @@ def _workspace_interaction(child: Mapping[str, object], phase: str) -> dict[str,
         "action_level": "notify" if topology == "worktree" else "silent",
         "phase": phase,
         "summary": (
-            f"Harness {'will create' if phase == 'before' else 'created'} an isolated worktree for PRD-{facts['iteration']}"
+            f"Harness {'will create' if phase == 'before' else 'created'} a "
+            f"{'dependency-stacked' if stacked else 'parallel'} worktree for PRD-{facts['iteration']}"
             if topology == "worktree"
             else f"Harness {'will activate' if phase == 'before' else 'activated'} PRD-{facts['iteration']} locally"
         ),
@@ -2342,11 +4158,49 @@ def _revalidate_workspace_authority(
     }
     if dict(planned) != current_projection:
         raise LifecycleError("workspace authority changed after planning; create and accept a new plan")
+    raw_bindings = parameters.get("dependency_bindings")
+    binding_digest = parameters.get("dependency_bindings_digest")
+    if not isinstance(raw_bindings, list):
+        raise LifecycleError("workspace child lacks exact dependency bindings")
+    try:
+        dependency_bindings = workspace.normalize_dependency_bindings(raw_bindings)
+    except workspace.WorkspaceError as exc:
+        raise LifecycleError(f"workspace dependency bindings are invalid: {exc}") from exc
+    if binding_digest != workspace.dependency_bindings_digest(dependency_bindings):
+        raise LifecycleError("workspace dependency binding digest changed after planning")
+    if tuple(item["iteration"] for item in dependency_bindings) != current.depends_on:
+        raise LifecycleError("workspace dependency bindings differ from approved PRD authority")
+    for binding in dependency_bindings:
+        try:
+            dependency = coordinator.derive_iteration_authority(
+                context.project_root,
+                binding["iteration"],
+            )
+        except (coordinator.CoordinatorError, core.HarnessError, workspace.WorkspaceError) as exc:
+            raise LifecycleError(f"workspace dependency authority cannot be revalidated: {exc}") from exc
+        if not dependency.stable_candidate_bindings or dict(
+            dependency.stable_candidate_bindings[-1]
+        ) != dict(binding):
+            raise LifecycleError(
+                f"workspace dependency PRD-{binding['iteration']} stable candidate changed after planning"
+            )
+    live_dependency_blockers = workspace.dependency_order_blockers(context, dependency_bindings)
+    if live_dependency_blockers:
+        raise LifecycleError(
+            "workspace dependency baseline is no longer live: "
+            + "; ".join(item.code for item in live_dependency_blockers)
+        )
+    expected_ref = dependency_bindings[-1]["candidate_ref"] if dependency_bindings else "refs/heads/main"
+    expected_commit = (
+        dependency_bindings[-1]["candidate_commit"]
+        if dependency_bindings
+        else current.governance_commit
+    )
     if (
-        parameters.get("implementation_ref") != "refs/heads/main"
-        or parameters.get("implementation_commit") != current.governance_commit
+        parameters.get("implementation_ref") != expected_ref
+        or parameters.get("implementation_commit") != expected_commit
     ):
-        raise LifecycleError("workspace implementation start no longer matches canonical approved main")
+        raise LifecycleError("workspace implementation start no longer matches approved authority")
     blockers = _committed_authority_blockers(
         context,
         number,
@@ -2687,6 +4541,7 @@ def start_lifecycle(
                     lease_generation=int(parameters["lease_generation"]),
                     operation_id=str(child["operation_id"]),
                     accepted_plan_digest=str(child["plan_digest"]),
+                    dependency_bindings=parameters.get("dependency_bindings", ()),
                 )
                 if child_result.get("phase") != "succeeded":
                     raise LifecycleError("workspace child did not succeed: " + json.dumps(child_result.get("blocking_reasons", []), ensure_ascii=False))
@@ -2757,6 +4612,106 @@ def start_lifecycle(
         }
 
 
+def plan_lifecycle_stage(
+    project_root: str | Path,
+    *,
+    stage: str,
+    artifact: object,
+    lifecycle_operation_id: str,
+    confirmation_token: object | None = None,
+    authorization_id: str | None = None,
+) -> LifecycleStagePlan:
+    """Dispatch one zero-write post-implementation stage plan."""
+
+    expected_type = _stage_artifact_type(stage)
+    if not isinstance(artifact, expected_type):
+        raise LifecycleError(f"{stage} artifact has an unsupported public type")
+    context = _context(project_root)
+    artifact_root = getattr(artifact, "project_root", None)
+    if artifact_root is None and hasattr(artifact, "registration_plan"):
+        artifact_root = getattr(artifact.registration_plan, "project_root", None)
+    if isinstance(artifact_root, str) and os.path.normcase(str(Path(artifact_root).resolve())) != os.path.normcase(str(context.project_root)):
+        raise LifecycleError("lifecycle stage artifact belongs to another project root")
+    dispatch = {
+        "candidate-preverify": lambda: plan_candidate_preverification_stage(artifact, lifecycle_operation_id=lifecycle_operation_id),
+        "candidate-register": lambda: plan_candidate_registration_stage(artifact, lifecycle_operation_id=lifecycle_operation_id),
+        "integration-commit": lambda: plan_integration_commit_stage(artifact, lifecycle_operation_id=lifecycle_operation_id),
+        "integrated-evidence-register": lambda: plan_integrated_evidence_stage(
+            artifact,
+            lifecycle_operation_id=lifecycle_operation_id,
+            commit_confirmation_token=confirmation_token,
+        ),
+        "final-acceptance-register": lambda: plan_final_acceptance_stage(
+            artifact,
+            lifecycle_operation_id=lifecycle_operation_id,
+            main_confirmation_token=confirmation_token,
+            authorization_id=authorization_id or "",
+        ),
+        "integration-cleanup": lambda: plan_integration_cleanup_stage(artifact, lifecycle_operation_id=lifecycle_operation_id),
+    }
+    return dispatch[stage]()
+
+
+def apply_lifecycle_stage(
+    plan: LifecycleStagePlan,
+    artifact: object,
+    *,
+    accepted_plan_digest: str,
+    confirmation_token: object | None = None,
+    authorization_id: str | None = None,
+    notify: Callable[[object], None] | None = None,
+    failpoint: Failpoint | None = None,
+) -> LifecycleStageResult:
+    """Dispatch one exact stage apply without inferring any confirmation."""
+
+    _validate_stage_plan(plan)
+    expected_type = _stage_artifact_type(plan.stage)
+    if not isinstance(artifact, expected_type):
+        raise LifecycleError(f"{plan.stage} artifact has an unsupported public type")
+    dispatch = {
+        "candidate-preverify": lambda: apply_candidate_preverification_stage(
+            plan, artifact, accepted_plan_digest=accepted_plan_digest, failpoint=failpoint
+        ),
+        "candidate-register": lambda: apply_candidate_registration_stage(
+            plan,
+            artifact,
+            accepted_plan_digest=accepted_plan_digest,
+            confirmation_token=confirmation_token,
+            failpoint=failpoint,
+        ),
+        "integration-commit": lambda: apply_integration_commit_stage(
+            plan,
+            artifact,
+            accepted_plan_digest=accepted_plan_digest,
+            confirmation_token=confirmation_token,
+            failpoint=failpoint,
+        ),
+        "integrated-evidence-register": lambda: apply_integrated_evidence_stage(
+            plan,
+            artifact,
+            accepted_plan_digest=accepted_plan_digest,
+            commit_confirmation_token=confirmation_token,
+            failpoint=failpoint,
+        ),
+        "final-acceptance-register": lambda: apply_final_acceptance_stage(
+            plan,
+            artifact,
+            accepted_plan_digest=accepted_plan_digest,
+            main_confirmation_token=confirmation_token,
+            authorization_id=authorization_id or "",
+            failpoint=failpoint,
+        ),
+        "integration-cleanup": lambda: apply_integration_cleanup_stage(
+            plan,
+            artifact,
+            accepted_plan_digest=accepted_plan_digest,
+            notify=notify,
+            failpoint=failpoint,
+        ),
+    }
+    return dispatch[plan.stage]()
+
+
 def _print(value: Mapping[str, object], *, as_json: bool) -> None:
     if as_json:
         print(canonical_json(dict(value)).decode("utf-8"))
@@ -2794,6 +4749,21 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--operation-id", required=True)
     start.add_argument("--accept-plan-digest", required=True)
     start.add_argument("--json", action="store_true")
+    stage_plan = sub.add_parser("plan-stage")
+    stage_plan.add_argument("--project-root", required=True)
+    stage_plan.add_argument("--stage", required=True, choices=GENERIC_STAGE_ORDER)
+    stage_plan.add_argument("--operation-id", required=True)
+    stage_plan.add_argument("--artifact", required=True, help="Exact public artifact JSON; never a private journal")
+    stage_plan.add_argument("--token", help="Exact confirmation-token JSON when this planning boundary requires it")
+    stage_plan.add_argument("--authorization-id")
+    stage_plan.add_argument("--json", action="store_true")
+    stage_apply = sub.add_parser("apply-stage")
+    stage_apply.add_argument("--plan", required=True, help="Exact LifecycleStagePlan JSON")
+    stage_apply.add_argument("--artifact", required=True, help="Same exact public artifact JSON used for planning")
+    stage_apply.add_argument("--accept-plan-digest", required=True)
+    stage_apply.add_argument("--token", help="Exact confirmation-token JSON; never inferred")
+    stage_apply.add_argument("--authorization-id")
+    stage_apply.add_argument("--json", action="store_true")
     return parser
 
 
@@ -2802,6 +4772,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "status":
             payload = lifecycle_status(args.project_root)
+        elif args.command == "plan-stage":
+            artifact_type = _stage_artifact_type(args.stage)
+            artifact = _decode_public_artifact(args.artifact, artifact_type)
+            token = _load_confirmation_token(args.token) if args.token else None
+            plan = plan_lifecycle_stage(
+                args.project_root,
+                stage=args.stage,
+                artifact=artifact,
+                lifecycle_operation_id=args.operation_id,
+                confirmation_token=token,
+                authorization_id=args.authorization_id,
+            )
+            payload = {"command": "plan-stage", "phase": "planned" if plan.ready else "blocked", **plan.as_dict()}
+        elif args.command == "apply-stage":
+            plan = _decode_public_artifact(args.plan, LifecycleStagePlan)
+            assert isinstance(plan, LifecycleStagePlan)
+            artifact = _decode_public_artifact(args.artifact, _stage_artifact_type(plan.stage))
+            token_stages = {
+                "candidate-register",
+                "integration-commit",
+                "integrated-evidence-register",
+                "final-acceptance-register",
+            }
+            token = _load_confirmation_token(args.token) if plan.stage in token_stages else None
+            interactions: list[dict[str, object]] = []
+            result = apply_lifecycle_stage(
+                plan,
+                artifact,
+                accepted_plan_digest=args.accept_plan_digest,
+                confirmation_token=token,
+                authorization_id=args.authorization_id,
+                notify=lambda item: interactions.append(_public_object_snapshot(item)),
+            )
+            payload = {"command": "apply-stage", "phase": "progressed", **result.as_dict(), "interaction_events": interactions}
         else:
             request = load_request(args.request)
             if args.command == "route":
@@ -2821,7 +4825,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     operation_id=args.operation_id,
                     accepted_plan_digest=args.accept_plan_digest,
                 )
-    except (LifecycleError, core.HarnessError, bundle.BundleError, coordinator.CoordinatorError, workspace.WorkspaceError, ValueError) as exc:
+    except Exception as exc:
         payload = {
             "schema_version": RESULT_SCHEMA,
             "command": args.command,
@@ -2843,12 +4847,40 @@ __all__ = [
     "ROUTE_SCHEMA",
     "PLAN_SCHEMA",
     "RESULT_SCHEMA",
+    "STAGE_PLAN_SCHEMA",
+    "STAGE_RESULT_SCHEMA",
+    "STAGE_STATUS_SCHEMA",
+    "LifecycleStagePlan",
+    "LifecycleStageResult",
+    "OrderedIntegrationPreparationPlan",
+    "ORDERED_PREPARATION_SCHEMA",
     "validate_request",
     "load_request",
     "route_request",
     "lifecycle_status",
+    "lifecycle_stage_status",
     "plan_start",
     "start_lifecycle",
+    "plan_lifecycle_stage",
+    "apply_lifecycle_stage",
+    "plan_candidate_preverification_stage",
+    "apply_candidate_preverification_stage",
+    "plan_local_main_release_stage",
+    "apply_local_main_release_stage",
+    "plan_candidate_registration_stage",
+    "apply_candidate_registration_stage",
+    "plan_ordered_integration_preparation_stage",
+    "apply_ordered_integration_preparation_stage",
+    "plan_integration_commit_stage",
+    "apply_integration_commit_stage",
+    "plan_integrated_evidence_stage",
+    "apply_integrated_evidence_stage",
+    "plan_final_acceptance_stage",
+    "apply_final_acceptance_stage",
+    "plan_main_advance_stage",
+    "apply_main_advance_stage",
+    "plan_integration_cleanup_stage",
+    "apply_integration_cleanup_stage",
     "main",
 ]
 

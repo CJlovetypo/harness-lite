@@ -11,6 +11,7 @@ import unittest
 import uuid
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from scripts import harness_workspace as workspace
 
@@ -273,6 +274,33 @@ class WorkspaceOrchestratorTests(unittest.TestCase):
             "--json",
         )
 
+    def apply_activate_direct(
+        self,
+        plan: dict[str, Any],
+        topology: str,
+        branch: str,
+        path: Path,
+        owner: str,
+        *,
+        failure_injector: Any = None,
+    ) -> dict[str, object]:
+        # Direct invocation exposes the recovery-only failure injector while
+        # preserving the same isolated Git environment used by the CLI tests.
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            return workspace.apply_activation(
+                self.root,
+                iteration=str(plan["iteration"]),
+                execution_topology=topology,
+                base_ref=self.allocations[str(plan["iteration"])]["base_ref"],
+                branch_ref=branch,
+                worktree_path=path,
+                owner=owner,
+                lease_generation=1,
+                operation_id=str(plan["operation_id"]),
+                accepted_plan_digest=str(plan["plan_digest"]),
+                failure_injector=failure_injector,
+            )
+
     def activate_local(self, iteration: str = "001", owner: str = "task-a") -> dict[str, Any]:
         self.reserve(iteration)
         result, plan = self.plan_activate(iteration, "local", "refs/heads/main", self.root, owner)
@@ -296,6 +324,171 @@ class WorkspaceOrchestratorTests(unittest.TestCase):
         (self.root / "a-staged.txt").write_text("A staged state\n", encoding="utf-8")
         self.git("add", "--", "a-staged.txt")
         (self.root / "a-untracked.txt").write_text("A untracked state\n", encoding="utf-8")
+
+    def dirty_a_for_crash_recovery(self) -> None:
+        (self.root / ".gitignore").write_bytes(b"*.ignored\n")
+        (self.root / "a-staged.bin").write_bytes(b"A staged bytes\x00v1\r\n")
+        self.git("add", "--", ".gitignore", "a-staged.bin")
+        (self.root / "a-staged.bin").write_bytes(b"A staged bytes\x00v1\r\nA unstaged tail\xff")
+        (self.root / "app.txt").write_bytes(b"A tracked dirty bytes\x00\xfe\r\n")
+        (self.root / "a-untracked.bin").write_bytes(b"A untracked bytes\x00\xfd\r\n")
+        (self.root / "a-runtime.ignored").write_bytes(b"A ignored runtime bytes\x00\xfc\r\n")
+
+    def local_a_byte_snapshot(self) -> dict[str, object]:
+        index_path = Path(self.git("rev-parse", "--git-path", "index").stdout.strip())
+        if not index_path.is_absolute():
+            index_path = self.root / index_path
+        names = (
+            ".gitignore",
+            "app.txt",
+            "governance.txt",
+            "a-staged.bin",
+            "a-untracked.bin",
+            "a-runtime.ignored",
+        )
+        return {
+            "head": self.git("rev-parse", "HEAD").stdout,
+            "head_tree": self.git("rev-parse", "HEAD^{tree}").stdout,
+            "branch": self.git("symbolic-ref", "-q", "HEAD").stdout,
+            "index_bytes": index_path.read_bytes(),
+            "index_entries": self.git("ls-files", "--stage", "-z").stdout,
+            "status": self.git(
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+                "--ignored=matching",
+                "--ignore-submodules=none",
+            ).stdout,
+            "cached_diff": self.git("diff", "--cached", "--binary").stdout,
+            "working_diff": self.git("diff", "--binary").stdout,
+            "stash": self.git("stash", "list").stdout,
+            "files": {name: (self.root / name).read_bytes() for name in names},
+        }
+
+    @staticmethod
+    def path_byte_snapshot(root: Path) -> dict[str, bytes]:
+        return {
+            path.relative_to(root).as_posix(): path.read_bytes()
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
+
+    def assert_activation_crash_recovery(
+        self,
+        *,
+        failpoint: str,
+        crash_phase: str,
+        worktree_exists_at_crash: bool,
+    ) -> None:
+        self.activate_local()
+        self.dirty_a_for_crash_recovery()
+        plan, target, branch = self.create_b_plan()
+        a_before = self.local_a_byte_snapshot()
+        self.assertIn("? a-untracked.bin", str(a_before["status"]))
+        self.assertIn("! a-runtime.ignored", str(a_before["status"]))
+        context = workspace.resolve_repository(self.root)
+        observed_failpoints: list[str] = []
+
+        class InjectedActivationCrash(RuntimeError):
+            pass
+
+        def inject(name: str) -> None:
+            observed_failpoints.append(name)
+            if name == failpoint:
+                raise InjectedActivationCrash(name)
+
+        with self.assertRaisesRegex(InjectedActivationCrash, failpoint):
+            self.apply_activate_direct(
+                plan,
+                "worktree",
+                branch,
+                target,
+                "task-b",
+                failure_injector=inject,
+            )
+
+        self.assertIn(failpoint, observed_failpoints)
+        self.assertEqual(self.local_a_byte_snapshot(), a_before)
+        crashed_journal = workspace.load_journal(context, str(plan["operation_id"]))
+        self.assertIsNotNone(crashed_journal)
+        assert crashed_journal is not None
+        self.assertEqual(crashed_journal["phase"], crash_phase)
+        self.assertEqual(crashed_journal["plan_digest"], plan["plan_digest"])
+        durable_manifest = json.dumps(
+            crashed_journal["manifest"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        lease_file = workspace.lease_path(context, "002")
+        self.assertTrue(lease_file.is_file())
+        lease_bytes = lease_file.read_bytes()
+        lease = workspace.load_lease(context, "002")
+        self.assertIsNotNone(lease)
+        assert lease is not None
+        self.assertEqual(lease["operation_id"], plan["operation_id"])
+        self.assertEqual(lease["generation"], 1)
+        self.assertEqual(self.branches().get(branch), self.base_commit)
+        branch_reflog = self.git("reflog", "show", "--format=%H%x00%gs", branch).stdout
+        matching_at_crash = [
+            item
+            for item in workspace.list_worktrees(context, include_status=True)
+            if workspace.same_path(str(item["path"]), target)
+        ]
+        self.assertEqual(len(matching_at_crash), 1 if worktree_exists_at_crash else 0)
+        target_before_retry = self.path_byte_snapshot(target) if worktree_exists_at_crash else None
+
+        recovered = self.apply_activate_direct(plan, "worktree", branch, target, "task-b")
+
+        self.assertEqual(recovered["phase"], "succeeded", recovered)
+        self.assertEqual(recovered["journal_phase"], "READY")
+        self.assertEqual(self.local_a_byte_snapshot(), a_before)
+        ready_journal = workspace.load_journal(context, str(plan["operation_id"]))
+        self.assertIsNotNone(ready_journal)
+        assert ready_journal is not None
+        self.assertEqual(
+            [entry["phase"] for entry in ready_journal["history"]],
+            ["PLANNED", "LEASED", "BRANCH_READY", "WORKTREE_READY", "READY"],
+        )
+        self.assertEqual(ready_journal["plan_digest"], plan["plan_digest"])
+        self.assertEqual(
+            json.dumps(
+                ready_journal["manifest"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            durable_manifest,
+        )
+        self.assertEqual(lease_file.read_bytes(), lease_bytes)
+        self.assertEqual(self.git("reflog", "show", "--format=%H%x00%gs", branch).stdout, branch_reflog)
+        self.assertEqual(self.branches().get(branch), self.base_commit)
+        matching_after = [
+            item
+            for item in workspace.list_worktrees(context, include_status=True)
+            if workspace.same_path(str(item["path"]), target)
+        ]
+        self.assertEqual(len(matching_after), 1)
+        if target_before_retry is not None:
+            self.assertEqual(self.path_byte_snapshot(target), target_before_retry)
+        active_leases, lease_blockers = workspace.load_active_leases(context)
+        self.assertEqual(lease_blockers, [])
+        self.assertEqual(len([item for item in active_leases if item["iteration"] == "002"]), 1)
+
+    def test_crash_after_branch_creation_before_worktree_recovers_exactly_once(self) -> None:
+        self.assert_activation_crash_recovery(
+            failpoint=workspace.ACTIVATION_FAILPOINT_BRANCH_CREATED,
+            crash_phase="LEASED",
+            worktree_exists_at_crash=False,
+        )
+
+    def test_crash_after_worktree_creation_before_journal_advance_recovers_exactly_once(self) -> None:
+        self.assert_activation_crash_recovery(
+            failpoint=workspace.ACTIVATION_FAILPOINT_WORKTREE_CREATED,
+            crash_phase="BRANCH_READY",
+            worktree_exists_at_crash=True,
+        )
 
     def plan_bind_local_branch(
         self,

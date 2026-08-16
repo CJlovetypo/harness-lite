@@ -2,7 +2,39 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Harness Lite 是一个面向 Codex 的轻量级 Git 项目治理 Skill。它把产品意图、实施设计、实际偏差、决策和验收证据连接起来，同时避免把每项工作都变成繁重流程。
+Harness Lite 是一个面向 Codex 的轻量级 Git 产品治理 Skill。用户只需用自然语言描述产品工作；Harness 会自动路由需求，只在并发真正需要时隔离各 PRD 的实现，并保留从全局原则到最终进入 main 的精确结果之间的完整证据链。
+
+## 用户实际体验
+
+用户通常始终停留在同一个 Codex 项目里，以需求而不是路径或 Git 命令来工作：
+
+1. Harness 检查仓库，并分别判断治理路径、执行拓扑和当前授权门禁。
+2. 只有一个实施中的 PRD 时，直接在主工程 checkout 中以 **Local** 模式工作，不创建额外 linked worktree。
+3. 第二个 PRD 成为 active writer 时，Harness 会先告知，再从其精确 committed implementation start 创建 sibling linked worktree。第一个 PRD 的 cwd、文件、index、untracked 状态和运行环境保持不变。
+4. 第三个及后续 PRD 各自获得独立任务、worktree、writer lease 和运行时 namespace；依赖或独占资源也可能要求 stacked 或串行。
+5. 并发数量下降后，幸存 PRD 原地完成，不会为了恢复单工作区形态而被搬迁。
+6. 每个 PRD 独立通过 PRD/SPEC 批准、实施授权、验收证据、偏差处置和 feature candidate 门禁。
+7. 单一 merge train 在精确 latest main 上重建治理、执行跨 PRD 验证，并把 exact integrated result 交给用户做最终确认。
+
+只读、路由、验证和恢复尽量低噪声。worktree 创建/移除和 branch 绑定会在执行前后告知。每次 commit 都明确展示 exact scope、message、验证、排除项、结果 hash 和 `pushed=false`。本生命周期版本不实现 push。
+
+## 治理模型
+
+```text
+committed 全局 principle
+  -> 已批准 PRD
+  -> 已批准 SPEC
+  -> 已授权实现
+  -> feature candidate evidence
+  -> latest-main integrated evidence
+  -> exact-result acceptance
+```
+
+- main 上 committed `harness/principle.md` 是所有 PRD/worktree 唯一的全局原则权威。principle drift 必须先完成影响审计，才能 candidate 或 integration。
+- `harness/progress.md` 是不可改写的事件历史。并行分支按事件 ID 和 exact bytes 做 union；纠错与冲突解决通过追加事件完成。
+- L0/L1 README 是派生路由，从权威文档、事件、refs 和受限本机事实中重建。
+- deviation 只记录实施完成后的 as-built 事实，不批准范围、不授权实施，也不提供原则例外。
+- 默认使用 `merge --no-ff` 集成。若项目声明的其他策略改变 candidate commit identity，Harness 必须生成新的 integrated candidate、重新验证并重新绑定证据。
 
 ## 生成的结构
 
@@ -20,18 +52,23 @@ harness/
         └── deviation-NNN.md
 ```
 
-每个编号迭代都把 PRD、SPEC、如实记录实施结果的偏差台账和路由摘要集中在同一目录中。
+Lifecycle-v2 还会在 Git common directory 下保存可重建的本机 journal、lease、workspace 路由和证据 receipt。绝对 worktree 路径与本机运行时细节不会作为规范治理内容提交。
+
+每个迭代绑定两个不同的基线：
+
+- **allocation base**：用于预留 PRD 身份和证明 ancestry 的不可变基线；
+- **implementation start**：实现真正开始时的精确 committed snapshot，通常晚于包含已批准治理四件套的提交。
 
 ## 核心保证
 
-- 初始化基础结构时不会创建虚假的产品迭代。
-- 无 Git 的项目会在 `main` 上得到一个经过审阅的基线提交；dry-run 清单通过 `BASELINE_PLAN_TOKEN` 与实际执行绑定。
-- 已有 Git 仓库初始化时不会暂存或提交当前改动。
-- 起草路径会随需求调整但不降低治理门槛：存在实质性歧义时定向 grill 用户，只有小且明确的改动可联合起草 PRD/SPEC，明确但较大的改动仍由 PRD 先行。
-- deviation 只记录实施完成后的 as-built 事实与已批准 PRD/SPEC 之间的差异，不提供批准或实施授权。
-- 只有用户明确验收已完成结果后，迭代才能获得唯一的最终提交。
-- 无关改动、被忽略的治理文件、密钥、超大文件、畸形四件套、含糊证据和中间提交都会被阻断。
-- Harness Lite 永远不会自动推送。
+- 初始化不会创建虚假的产品迭代。无 Git 项目只会创建一次由 `BASELINE_PLAN_TOKEN` 绑定的已审阅 baseline commit；已有仓库初始化不会暂存或提交现有改动。
+- 三轴独立判断避免用“需求很小”同时推断 worktree 策略或实施授权。
+- 第一个 writer 使用 Local；只有 writer 2+ 才创建 linked worktree。新增 B 不会 commit、stash、复制或移动 dirty A。
+- 每个 PRD 只有一个 writer lease，并在写入前校验 exact root/path/branch/base。worktree 是 checkout 隔离，不是权限或运行时沙箱。
+- Candidate 与 integrated evidence 绑定精确 commit/tree、原则、依赖、验证和权威 receipt；只有 ref 不构成证据。
+- Journal 与 compare-and-swap 让 ID 分配、worktree 创建、治理 reconciliation 和 main advance 可恢复，不重复 ID、事件、worktree 或 commit。
+- 清理采取保守策略：dirty、staged、untracked、ignored、链接/junction、活动进程/lease 或未知状态一律保留并进入 reconcile。
+- 不自动 stash/reset/clean/force，不隐藏 main 推进，也不提供 push 命令。
 
 ## 安装
 
@@ -41,45 +78,29 @@ harness/
 <CODEX_HOME>/skills/harness-lite
 ```
 
-然后使用以下方式调用：
+然后使用 `$harness-lite` 调用，例如：
 
 ```text
-$harness-lite
+使用 $harness-lite 治理这个产品变更。自动隔离并行 PRD，只向我展示产品决策和有意义的 Git 状态变化。
 ```
 
-示例提示词：
+## CLI 与兼容性
+
+通常由 Skill 自动编排内置工具。如需检查入口：
 
 ```text
-使用 $harness-lite 在当前项目中初始化轻量级 PRD/SPEC 治理结构。
-```
-
-### 升级已有受管项目
-
-安装新版 Skill 后，新的 `$harness-lite` 调用会立即遵循新版行为；但 `init` 会刻意保留已有且非空的 `AGENTS.md` 受管区块。若要把三路起草策略等新版控制规则持久化到旧项目，应先审阅差异，只替换带边界标记的 Harness Lite 区块，并完整保留区块外的项目指令。
-
-## CLI
-
-通常由 Skill 自动调用内置 CLI。如需直接查看命令：
-
-```text
-python scripts/project_harness.py --help
 python scripts/project_harness.py init --help
-python scripts/project_harness.py new-iteration --help
 python scripts/project_harness.py validate --help
-python scripts/project_harness.py commit-iteration --help
+python scripts/harness_lifecycle.py status --help
+python scripts/harness_lifecycle.py route --help
+python scripts/harness_lifecycle.py plan-start --help
+python scripts/harness_lifecycle.py start --help
+python scripts/harness_upgrade.py --help
 ```
 
-主要工作流：
+已完成的 legacy serial 迭代继续可读、可验证。升级使用 exact dry-run plan，保留旧 principle、事件、deviation 和 refs，只替换 `AGENTS.md` 的 bounded managed block。Legacy `new-iteration` 与 `commit-iteration` 仅作为未升级迭代的兼容工具；其“单 active iteration / 单 final commit”规则不适用于 lifecycle-v2。
 
-1. 运行 `init --dry-run`，审阅每个计划路径和哈希。
-2. 初始化全局 Harness，不虚构产品迭代。
-3. 只有出现具体产品目标时才创建编号迭代。
-4. 检查项目上下文并选择起草路径：有未决产品问题则 grill，只有小且明确时联合起草，明确但不小则保持 PRD 先行。
-5. 明确批准指定的 PRD/SPEC 基线，并单独授权实施；随后完成实施并核对 as-built 事实。
-6. 校验证据并取得用户明确验收。
-7. 预览并创建该迭代唯一的最终提交。
-
-操作说明参见 [SKILL.md](SKILL.md)，文档模型和生命周期规则参见 [Harness contract](references/harness-contract.md)。
+操作说明参见 [SKILL.md](SKILL.md)，完整权威、拓扑、证据与恢复契约参见 [Harness contract](references/harness-contract.md)。
 
 ## 测试
 
@@ -87,6 +108,4 @@ python scripts/project_harness.py commit-iteration --help
 python -m unittest discover -s scripts/tests -v
 ```
 
-测试套件覆盖初始化安全、Git 状态保留、路径边界、密钥和文件大小门禁、偏差校验、验收证据、确定性最终提交与回滚行为。
-
-[`evals/evals.json`](evals/evals.json) 中的 agent 行为场景覆盖小且明确的联合起草路径、存在歧义的 grill 路径，以及明确但不小的 PRD 先行路径。
+测试覆盖初始化与 legacy 兼容、三轴路由、原子 ID 分配、Local/worktree 转换（包括 dirty-A 与 B-first）、principle/progress reconciliation、candidate/integrated evidence、merge-train identity、透明交互、并发与崩溃恢复。[`evals/evals.json`](evals/evals.json) 还覆盖相同的用户行为场景。
