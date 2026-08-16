@@ -546,9 +546,25 @@ class HarnessTrainTests(unittest.TestCase):
         )
 
     def register_integration(self, committed):
+        progress_bindings = tuple(
+            (
+                "EV-"
+                + hashlib.sha256(
+                    (
+                        "final-acceptance:"
+                        + candidate.iteration
+                        + ":"
+                        + candidate.candidate_evidence.evidence_digest
+                    ).encode("utf-8")
+                ).hexdigest(),
+                integrated_registry.iteration_final_evidence_ref(candidate.iteration),
+            )
+            for candidate in committed.commit_plan.candidates
+        )
         plan = integrated_registry.plan_register_integrated_evidence(
             committed,
             commit_confirmation_token=committed.commit_confirmation_token,
+            progress_bindings=progress_bindings,
         )
         self.assertEqual(plan.blockers, ())
         return integrated_registry.apply_register_integrated_evidence(
@@ -1334,19 +1350,23 @@ class HarnessTrainTests(unittest.TestCase):
             )
 
     def test_prepare_derives_dependency_order_from_committed_prd_authority(self) -> None:
-        prd = self.feature_b / "harness" / "iterations" / "002" / "prd-002.md"
-        prd.write_text(
-            prd.read_text(encoding="utf-8") + "\n- 依赖 PRD：PRD-001\n",
-            encoding="utf-8",
-        )
-        self.git("add", "--", "harness/iterations/002/prd-002.md", cwd=self.feature_b)
-        self.git("commit", "--no-gpg-sign", "-m", "declare B dependency", cwd=self.feature_b)
         a = self.register("001", "refs/heads/feature/001", self.feature_a)
-        b = self.register("002", "refs/heads/feature/002", self.feature_b)
+        self.activate_workspace(
+            "003",
+            "worktree",
+            "refs/heads/feature/003",
+            self.feature_c,
+            "task-c",
+            dependency_bindings=(self.dependency_binding(a),),
+        )
+        (self.feature_c / "c.txt").write_text("feature C on A\n", encoding="utf-8")
+        self.git("add", "--", "c.txt", cwd=self.feature_c)
+        self.git("commit", "--no-gpg-sign", "-m", "feature C on A", cwd=self.feature_c)
+        c = self.register("003", "refs/heads/feature/003", self.feature_c)
 
-        reversed_plan = self.prepare_plan((b, a))
-        ordered_plan = self.prepare_plan((a, b), generation="i2")
-        tampered = self.prepare_plan((a, replace(b, depends_on=())), generation="i3")
+        reversed_plan = self.prepare_plan((c, a))
+        ordered_plan = self.prepare_plan((a, c), generation="i2")
+        tampered = self.prepare_plan((a, replace(c, depends_on=())), generation="i3")
 
         self.assertIn(
             "integration-dependency-order-invalid",
@@ -1390,7 +1410,10 @@ class HarnessTrainTests(unittest.TestCase):
         _plan, result, _notifications = self.prepare((a, b))
 
         self.assertFalse(result.ready_for_commit)
-        self.assertIn("integration-merge-conflict", {item.code for item in result.blockers})
+        self.assertIn(
+            "governance-conflict-normalization-failed",
+            {item.code for item in result.blockers},
+        )
         self.assertEqual(self.snapshot_primary(), before)
         conflict_path = Path(result.worktree_path) / "a.txt"
         self.assertEqual(conflict_path.read_text(encoding="utf-8"), "feature A\n")
@@ -1778,7 +1801,7 @@ class HarnessTrainTests(unittest.TestCase):
         self.git("update-ref", "refs/heads/main", self.a_commit, self.base)
         evidence = committed.integrated_candidate
         assert evidence is not None
-        with self.assertRaisesRegex(TrainError, "main drifted"):
+        with self.assertRaisesRegex(TrainError, "final-acceptance-ref-state"):
             apply_main_advance(
                 planned,
                 accepted_plan_digest=planned.plan_digest,

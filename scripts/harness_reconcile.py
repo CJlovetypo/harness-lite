@@ -30,18 +30,32 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from harness_governance import (  # noqa: E402
-    FOCUS_END,
-    FOCUS_START,
-    ITERATIONS_END,
-    ITERATIONS_START,
-    Blocker as SemanticBlocker,
-    ManagedSection,
-    PrincipleApproval,
-    plan_principle_reconciliation,
-    plan_progress_union,
-    preview_managed_markdown,
-)
+try:
+    from .harness_governance import (  # type: ignore[import-not-found]
+        FOCUS_END,
+        FOCUS_START,
+        ITERATIONS_END,
+        ITERATIONS_START,
+        Blocker as SemanticBlocker,
+        ManagedSection,
+        PrincipleApproval,
+        plan_principle_reconciliation,
+        plan_progress_union,
+        preview_managed_markdown,
+    )
+except ImportError:  # pragma: no cover - direct script execution
+    from harness_governance import (  # noqa: E402
+        FOCUS_END,
+        FOCUS_START,
+        ITERATIONS_END,
+        ITERATIONS_START,
+        Blocker as SemanticBlocker,
+        ManagedSection,
+        PrincipleApproval,
+        plan_principle_reconciliation,
+        plan_progress_union,
+        preview_managed_markdown,
+    )
 
 
 PLAN_SCHEMA = "harness-lite.governance-reconcile-apply-plan/v1"
